@@ -1,4 +1,4 @@
-"""DeepSeek V4 Flash bf16 RMSNorm PyPTO kernel."""
+"""DeepSeek V4 Flash bf16 RMSNorm PyPTO kernels."""
 
 import pypto.language as pl
 
@@ -8,91 +8,274 @@ from models.config import FLASH_CONFIG as M
 
 B = 1
 S_DYN = pl.dynamic("S_DYN")
-D = M.dim
+
+D_4096 = M.dim
+D_1024 = M.q_lora_rank
+D_512 = M.head_dim
+D_128 = M.index_head_dim
 EPS = M.rms_norm_eps
 
 D_TILE = 128
 T_TILE = 8
 DEFAULT_SEQ_LEN = 8
 
-assert_divisible(D, D_TILE, "RMSNorm hidden size")
-HIDDEN_BLOCKS = D // D_TILE
-HIDDEN_INV = 1.0 / D
+assert_divisible(D_4096, D_TILE, "4096 RMSNorm hidden size")
+assert_divisible(D_1024, D_TILE, "1024 RMSNorm hidden size")
+assert_divisible(D_512, D_TILE, "512 RMSNorm hidden size")
+assert_divisible(D_128, D_TILE, "128 RMSNorm hidden size")
+
+BLOCKS_4096 = D_4096 // D_TILE
+BLOCKS_1024 = D_1024 // D_TILE
+BLOCKS_512 = D_512 // D_TILE
+BLOCKS_128 = D_128 // D_TILE
+
+INV_4096 = 1.0 / D_4096
+INV_1024 = 1.0 / D_1024
+INV_512 = 1.0 / D_512
+INV_128 = 1.0 / D_128
 
 
 @pl.jit.inline
-def hidden_rmsnorm(
-    x: pl.Tensor[[B, S_DYN, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.BF16],
-    out: pl.Tensor[[B, S_DYN, D], pl.BF16],
+def rmsnorm_4096(
+    x: pl.Tensor[[B, S_DYN, D_4096], pl.BF16],
+    norm_w: pl.Tensor[[D_4096], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, D_4096], pl.BF16],
 ):
-    """Two-pass hidden RMSNorm over the last dimension.
-
-    Semantics match ``../deepseek_v4_flash/inference/model.py::RMSNorm``:
-    cast activations and bf16 checkpoint weight to fp32, compute row-wise RMS,
-    multiply the fp32 values, and cast the output back to bf16.
-    """
+    """Compute bf16 RMSNorm over 4096 hidden channels."""
     x.bind_dynamic(1, S_DYN)
     out.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
-    x_flat = pl.reshape(x, [tokens, D])
-    out_flat = pl.reshape(out, [tokens, D])
+    x_flat = pl.reshape(x, [tokens, D_4096])
+    out_flat = pl.reshape(out, [tokens, D_4096])
     token_blocks = (tokens + T_TILE - 1) // T_TILE
 
     for tb in pl.range(token_blocks):
         t0 = tb * T_TILE
         valid_tok = pl.min(T_TILE, tokens - t0)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hidden_rmsnorm"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_4096"):
             partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HIDDEN_BLOCKS):
+            for kb in pl.range(BLOCKS_4096):
                 k0 = kb * D_TILE
-                x_chunk_bf16 = pl.slice(
-                    x_flat,
-                    [T_TILE, D_TILE],
-                    [t0, k0],
-                    valid_shape=[valid_tok, D_TILE],
-                )
-                x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
+                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
                 partial_sq = pl.add(
                     partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]),
+                    pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
                 )
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [T_TILE, 1])
+            variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_4096), EPS), [T_TILE, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
 
-            for kb in pl.range(HIDDEN_BLOCKS):
+            for kb in pl.range(BLOCKS_4096):
                 k0 = kb * D_TILE
-                x_chunk_bf16 = pl.slice(
-                    x_flat,
-                    [T_TILE, D_TILE],
+                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+                weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
+                weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
+                normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
+                out_flat = pl.assemble(
+                    out_flat,
+                    pl.cast(normed, target_type=pl.BF16, mode="rint"),
                     [t0, k0],
-                    valid_shape=[valid_tok, D_TILE],
                 )
-                x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                weight_chunk_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
-                weight_chunk = pl.cast(weight_chunk_bf16, target_type=pl.FP32)
-                normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), weight_chunk)
-                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
-                out_flat = pl.assemble(out_flat, normed_bf16, [t0, k0])
 
-    out = pl.reshape(out_flat, [B, tokens, D])
+    return pl.reshape(out_flat, [B, tokens, D_4096])
+
+
+@pl.jit.inline
+def rmsnorm_1024(
+    x: pl.Tensor[[B, S_DYN, D_1024], pl.BF16],
+    norm_w: pl.Tensor[[D_1024], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, D_1024], pl.BF16],
+):
+    """Compute bf16 RMSNorm over 1024 q-lora channels."""
+    x.bind_dynamic(1, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, D_1024])
+    out_flat = pl.reshape(out, [tokens, D_1024])
+    token_blocks = (tokens + T_TILE - 1) // T_TILE
+
+    for tb in pl.range(token_blocks):
+        t0 = tb * T_TILE
+        valid_tok = pl.min(T_TILE, tokens - t0)
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_1024"):
+            partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for kb in pl.range(BLOCKS_1024):
+                k0 = kb * D_TILE
+                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+                partial_sq = pl.add(
+                    partial_sq,
+                    pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
+                )
+
+            variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_1024), EPS), [T_TILE, 1])
+            inv_rms = pl.recip(pl.sqrt(variance))
+
+            for kb in pl.range(BLOCKS_1024):
+                k0 = kb * D_TILE
+                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+                weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
+                weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
+                normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
+                out_flat = pl.assemble(
+                    out_flat,
+                    pl.cast(normed, target_type=pl.BF16, mode="rint"),
+                    [t0, k0],
+                )
+
+    return pl.reshape(out_flat, [B, tokens, D_1024])
+
+
+@pl.jit.inline
+def rmsnorm_512(
+    x: pl.Tensor[[B, S_DYN, D_512], pl.BF16],
+    norm_w: pl.Tensor[[D_512], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, D_512], pl.BF16],
+):
+    """Compute bf16 RMSNorm over 512 head channels."""
+    x.bind_dynamic(1, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, D_512])
+    out_flat = pl.reshape(out, [tokens, D_512])
+    token_blocks = (tokens + T_TILE - 1) // T_TILE
+
+    for tb in pl.range(token_blocks):
+        t0 = tb * T_TILE
+        valid_tok = pl.min(T_TILE, tokens - t0)
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_512"):
+            partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for kb in pl.range(BLOCKS_512):
+                k0 = kb * D_TILE
+                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+                partial_sq = pl.add(
+                    partial_sq,
+                    pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
+                )
+
+            variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_512), EPS), [T_TILE, 1])
+            inv_rms = pl.recip(pl.sqrt(variance))
+
+            for kb in pl.range(BLOCKS_512):
+                k0 = kb * D_TILE
+                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+                weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
+                weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
+                normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
+                out_flat = pl.assemble(
+                    out_flat,
+                    pl.cast(normed, target_type=pl.BF16, mode="rint"),
+                    [t0, k0],
+                )
+
+    return pl.reshape(out_flat, [B, tokens, D_512])
+
+
+@pl.jit.inline
+def rmsnorm_128(
+    x: pl.Tensor[[B, S_DYN, D_128], pl.BF16],
+    norm_w: pl.Tensor[[D_128], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, D_128], pl.BF16],
+):
+    """Compute bf16 RMSNorm over 128 indexer-head channels."""
+    x.bind_dynamic(1, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, D_128])
+    out_flat = pl.reshape(out, [tokens, D_128])
+    token_blocks = (tokens + T_TILE - 1) // T_TILE
+
+    for tb in pl.range(token_blocks):
+        t0 = tb * T_TILE
+        valid_tok = pl.min(T_TILE, tokens - t0)
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_128"):
+            partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for kb in pl.range(BLOCKS_128):
+                k0 = kb * D_TILE
+                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+                partial_sq = pl.add(
+                    partial_sq,
+                    pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
+                )
+
+            variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_128), EPS), [T_TILE, 1])
+            inv_rms = pl.recip(pl.sqrt(variance))
+
+            for kb in pl.range(BLOCKS_128):
+                k0 = kb * D_TILE
+                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+                weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
+                weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
+                normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
+                out_flat = pl.assemble(
+                    out_flat,
+                    pl.cast(normed, target_type=pl.BF16, mode="rint"),
+                    [t0, k0],
+                )
+
+    return pl.reshape(out_flat, [B, tokens, D_128])
+
+
+@pl.jit
+def rmsnorm_4096_test(
+    x: pl.Tensor[[B, S_DYN, D_4096], pl.BF16],
+    norm_w: pl.Tensor[[D_4096], pl.BF16],
+    out: pl.Out[pl.Tensor[[B, S_DYN, D_4096], pl.BF16]],
+):
+    out = rmsnorm_4096(x, norm_w, out)
     return out
 
 
 @pl.jit
-def hidden_rmsnorm_test(
-    x: pl.Tensor[[B, S_DYN, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.BF16],
-    out: pl.Out[pl.Tensor[[B, S_DYN, D], pl.BF16]],
+def rmsnorm_1024_test(
+    x: pl.Tensor[[B, S_DYN, D_1024], pl.BF16],
+    norm_w: pl.Tensor[[D_1024], pl.BF16],
+    out: pl.Out[pl.Tensor[[B, S_DYN, D_1024], pl.BF16]],
 ):
-    out = hidden_rmsnorm(x, norm_w, out)
+    out = rmsnorm_1024(x, norm_w, out)
     return out
 
 
-def golden_hidden_rmsnorm(tensors):
+@pl.jit
+def rmsnorm_512_test(
+    x: pl.Tensor[[B, S_DYN, D_512], pl.BF16],
+    norm_w: pl.Tensor[[D_512], pl.BF16],
+    out: pl.Out[pl.Tensor[[B, S_DYN, D_512], pl.BF16]],
+):
+    out = rmsnorm_512(x, norm_w, out)
+    return out
+
+
+@pl.jit
+def rmsnorm_128_test(
+    x: pl.Tensor[[B, S_DYN, D_128], pl.BF16],
+    norm_w: pl.Tensor[[D_128], pl.BF16],
+    out: pl.Out[pl.Tensor[[B, S_DYN, D_128], pl.BF16]],
+):
+    out = rmsnorm_128(x, norm_w, out)
+    return out
+
+
+hidden_rmsnorm = rmsnorm_4096
+hidden_rmsnorm_test = rmsnorm_4096_test
+
+
+def golden_rmsnorm(tensors):
     import torch
 
     x = tensors["x"].float()
@@ -101,22 +284,41 @@ def golden_hidden_rmsnorm(tensors):
     tensors["out"][:] = (x * inv_rms * norm_w).to(torch.bfloat16)
 
 
-def build_tensor_specs(seq_len: int = DEFAULT_SEQ_LEN):
+golden_hidden_rmsnorm = golden_rmsnorm
+
+
+def _build_tensor_specs(dim: int, seq_len: int):
     import torch
 
     from models.golden import TensorSpec
 
     def init_x():
-        return torch.randn(B, seq_len, D) - 0.5
+        return torch.randn(B, seq_len, dim) - 0.5
 
     def init_norm_w():
-        return torch.randn(D) * 0.1 + 1.0
+        return torch.randn(dim) * 0.1 + 1.0
 
     return [
-        TensorSpec("x", [B, seq_len, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("norm_w", [D], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("out", [B, seq_len, D], torch.bfloat16, is_output=True),
+        TensorSpec("x", [B, seq_len, dim], torch.bfloat16, init_value=init_x),
+        TensorSpec("norm_w", [dim], torch.bfloat16, init_value=init_norm_w),
+        TensorSpec("out", [B, seq_len, dim], torch.bfloat16, is_output=True),
     ]
+
+
+def build_4096_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(D_4096, seq_len)
+
+
+def build_1024_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(D_1024, seq_len)
+
+
+def build_512_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(D_512, seq_len)
+
+
+def build_128_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(D_128, seq_len)
 
 
 def main() -> int:
@@ -124,7 +326,7 @@ def main() -> int:
 
     from models.golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 Flash hidden RMSNorm validation.")
+    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 Flash bf16 RMSNorm validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-s", "--seq-len", type=int, default=DEFAULT_SEQ_LEN)
@@ -132,25 +334,38 @@ def main() -> int:
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
-        fn=hidden_rmsnorm_test,
-        specs=build_tensor_specs(args.seq_len),
-        golden_fn=golden_hidden_rmsnorm,
-        runtime_cfg={
-            "platform": args.platform,
-            "device_id": args.device,
-            "enable_l2_swimlane": args.enable_l2_swimlane,
-        },
-        compile_only=args.compile_only,
-        compare_fn={
-            "out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        return 1
-    return 0
+    cases = [
+        ("rmsnorm-4096", rmsnorm_4096_test, build_4096_specs),
+        ("rmsnorm-1024", rmsnorm_1024_test, build_1024_specs),
+        ("rmsnorm-512", rmsnorm_512_test, build_512_specs),
+        ("rmsnorm-128", rmsnorm_128_test, build_128_specs),
+    ]
+    runtime_cfg = {
+        "platform": args.platform,
+        "device_id": args.device,
+        "enable_l2_swimlane": args.enable_l2_swimlane,
+    }
+    compare_fn = {
+        "out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+    }
+
+    failed = False
+    for name, fn, build_specs in cases:
+        print(f"[CASE] {name}", flush=True)
+        result = run_jit(
+            fn=fn,
+            specs=build_specs(args.seq_len),
+            golden_fn=golden_rmsnorm,
+            runtime_cfg=runtime_cfg,
+            compile_only=args.compile_only,
+            compare_fn=compare_fn,
+        )
+        if not result.passed:
+            failed = True
+            if result.error:
+                print(result.error)
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
@@ -160,15 +375,36 @@ if __name__ == "__main__":
 __all__ = [
     "B",
     "S_DYN",
-    "D",
+    "D_4096",
+    "D_1024",
+    "D_512",
+    "D_128",
     "EPS",
     "D_TILE",
     "T_TILE",
-    "HIDDEN_BLOCKS",
-    "HIDDEN_INV",
+    "BLOCKS_4096",
+    "BLOCKS_1024",
+    "BLOCKS_512",
+    "BLOCKS_128",
+    "INV_4096",
+    "INV_1024",
+    "INV_512",
+    "INV_128",
     "DEFAULT_SEQ_LEN",
+    "rmsnorm_4096",
+    "rmsnorm_1024",
+    "rmsnorm_512",
+    "rmsnorm_128",
     "hidden_rmsnorm",
+    "rmsnorm_4096_test",
+    "rmsnorm_1024_test",
+    "rmsnorm_512_test",
+    "rmsnorm_128_test",
     "hidden_rmsnorm_test",
+    "golden_rmsnorm",
     "golden_hidden_rmsnorm",
-    "build_tensor_specs",
+    "build_4096_specs",
+    "build_1024_specs",
+    "build_512_specs",
+    "build_128_specs",
 ]

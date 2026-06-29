@@ -144,40 +144,30 @@ def golden_linear(tensors):
     tensors["out"][:] = torch.matmul(x, weight_t).to(torch.bfloat16)
 
 
-def build_4096_to_512_specs(seq_len: int = DEFAULT_SEQ_LEN):
+def _build_tensor_specs(in_dim: int, out_dim: int, seq_len: int):
     import torch
 
     from models.golden import TensorSpec
 
     def init_x():
-        return torch.randn(B, seq_len, HIDDEN) * 0.1
+        return torch.randn(B, seq_len, in_dim) * 0.1
 
     def init_weight_t():
-        return torch.randn(HIDDEN, HEAD_DIM) * 0.02
+        return torch.randn(in_dim, out_dim) * 0.02
 
     return [
-        TensorSpec("x", [B, seq_len, HIDDEN], torch.bfloat16, init_value=init_x),
-        TensorSpec("weight_t", [HIDDEN, HEAD_DIM], torch.bfloat16, init_value=init_weight_t),
-        TensorSpec("out", [B, seq_len, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("x", [B, seq_len, in_dim], torch.bfloat16, init_value=init_x),
+        TensorSpec("weight_t", [in_dim, out_dim], torch.bfloat16, init_value=init_weight_t),
+        TensorSpec("out", [B, seq_len, out_dim], torch.bfloat16, is_output=True),
     ]
+
+
+def build_4096_to_512_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(HIDDEN, HEAD_DIM, seq_len)
 
 
 def build_4096_to_1024_specs(seq_len: int = DEFAULT_SEQ_LEN):
-    import torch
-
-    from models.golden import TensorSpec
-
-    def init_x():
-        return torch.randn(B, seq_len, HIDDEN) * 0.1
-
-    def init_weight_t():
-        return torch.randn(HIDDEN, Q_LORA_RANK) * 0.02
-
-    return [
-        TensorSpec("x", [B, seq_len, HIDDEN], torch.bfloat16, init_value=init_x),
-        TensorSpec("weight_t", [HIDDEN, Q_LORA_RANK], torch.bfloat16, init_value=init_weight_t),
-        TensorSpec("out", [B, seq_len, Q_LORA_RANK], torch.bfloat16, is_output=True),
-    ]
+    return _build_tensor_specs(HIDDEN, Q_LORA_RANK, seq_len)
 
 
 def main() -> int:
