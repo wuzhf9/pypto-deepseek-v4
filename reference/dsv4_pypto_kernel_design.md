@@ -43,51 +43,47 @@ DeepSeek V4 Flash PyPTO 实现应直接放在当前仓库中，作为自包含�
 │   ├── dsv4_flash_arch.md
 │   ├── dsv4_pypto_kernel_design.md
 │   └── pypto_serving_qwen3.md
-├── pypto_lib/
-│   └── models/
-│       └── deepseek_v4_flash_bf16/
-│           ├── __init__.py
-│           ├── config.py
-│           ├── common.py
-│           ├── rope.py
-│           ├── rmsnorm.py
-│           ├── linear.py
-│           ├── hc.py
-│           ├── sparse_attn.py
-│           ├── compressor_common.py
-│           ├── compressor_ratio4.py
-│           ├── compressor_ratio128.py
-│           ├── indexer.py
-│           ├── attention_common.py
-│           ├── attention_swa.py
-│           ├── attention_csa.py
-│           ├── attention_hca.py
-│           ├── moe.py
-│           ├── block.py
-│           ├── head.py
-│           ├── prefill_fwd.py
-│           ├── decode_fwd.py
-│           ├── dispatch.py
-│           ├── weight_layout.py
-│           └── golden.py
-├── python/
-│   └── dsv4_flash_bf16/
-│       ├── __init__.py
-│       ├── model_loader.py
-│       ├── executor.py
-│       ├── runner.py
-│       ├── tokenizer.py
-│       └── generate.py
+├── models/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── common.py
+│   ├── rope.py
+│   ├── rmsnorm.py
+│   ├── linear.py
+│   ├── hc.py
+│   ├── sparse_attn.py
+│   ├── compressor_common.py
+│   ├── compressor_ratio4.py
+│   ├── compressor_ratio128.py
+│   ├── indexer.py
+│   ├── attention_common.py
+│   ├── attention_swa.py
+│   ├── attention_csa.py
+│   ├── attention_hca.py
+│   ├── moe.py
+│   ├── block.py
+│   ├── head.py
+│   ├── prefill_fwd.py
+│   ├── decode_fwd.py
+│   ├── dispatch.py
+│   ├── weight_layout.py
+│   └── golden.py
+├── serving/
+│   ├── __init__.py
+│   ├── model_loader.py
+│   ├── executor.py
+│   ├── runner.py
+│   ├── tokenizer.py
+│   └── generate.py
 └── tests/
-    └── dsv4_flash_bf16/
-        ├── test_hc.py
-        ├── test_compressor_ratio4.py
-        ├── test_compressor_ratio128.py
-        ├── test_attention_swa.py
-        ├── test_attention_hca.py
-        ├── test_attention_csa.py
-        ├── test_moe.py
-        └── test_prefill_decode.py
+    ├── test_hc.py
+    ├── test_compressor_ratio4.py
+    ├── test_compressor_ratio128.py
+    ├── test_attention_swa.py
+    ├── test_attention_hca.py
+    ├── test_attention_csa.py
+    ├── test_moe.py
+    └── test_prefill_decode.py
 ```
 
 其中：
@@ -95,8 +91,8 @@ DeepSeek V4 Flash PyPTO 实现应直接放在当前仓库中，作为自包含�
 - `prefill_fwd.py` 和 `decode_fwd.py` 是最终对外编译和运行的顶层 PyPTO 程序。
 - 其余文件提供可复用的 inline kernel 或 host 侧辅助逻辑。
 - `golden.py` 只用于测试和对齐，不参与 NPU runtime。
-- `python/dsv4_flash_bf16/` 是当前仓库内的权重加载、PyPTO 编译、runner 和简单 generation 逻辑。
-- `tests/dsv4_flash_bf16/` 用于逐模块 golden 对齐和端到端 smoke test。
+- `serving/` 是当前仓库内的权重加载、PyPTO 编译、runner 和简单 generation 逻辑。
+- `tests/` 用于逐模块 golden 对齐和端到端 smoke test。
 
 ## 文件职责
 
@@ -128,13 +124,13 @@ DeepSeek V4 Flash PyPTO 实现应直接放在当前仓库中，作为自包含�
 - `hc_eps = 1e-6`
 - `compress_ratios`
 - RoPE/YaRN 参数
-- 固定 batch/seq 编译参数
+- bf16 kernel 需要复用的派生维度常量
 
 注意：
 
 - 固定 `batch = 1`。
-- 固定 `max_seq_len`，用于编译和验证。
-- 不放 fp8/fp4 dtype 配置，不实现低精度路径。
+- 不把 `max_seq_len` 写成模型参数；编译和验证时需要的序列长度应放在 runner 或 compile options 中。
+- 不放 `quantization_config`、`expert_dtype` 等 fp8/fp4 dtype 配置，不实现低精度路径。
 
 ### `common.py`
 
@@ -142,13 +138,11 @@ DeepSeek V4 Flash PyPTO 实现应直接放在当前仓库中，作为自包含�
 
 可包含：
 
-- 维度别名
-- tile 常量
-- shape 检查 helper
-- dtype helper
-- 常用 `pl.dynamic` 定义
+- Python 编译期 shape helper，例如 `ceil_div()`、`assert_divisible()`、`token_count()`
 
 不要把具体计算逻辑全部塞入 `common.py`，否则模块边界会失控。
+模型参数和常量应直接从 `config.py` 导入，不在 `common.py` 中重新导出。
+不要在没有明确重复需求前加入 dtype wrapper、`pl.dynamic` 定义或 attention/MoE/compressor 专用 tile。
 
 ### `linear.py`
 
@@ -194,12 +188,34 @@ out = weight.float() * y
 out -> bf16
 ```
 
-需要支持：
+hidden RMSNorm 的对外 PyPTO 接口应保持模型语义：
 
-- hidden RMSNorm: `[T, dim]`
+```text
+x:   [B, S, dim]
+out: [B, S, dim]
+```
+
+其中 `B = 1`，`S` 使用 `pl.dynamic`，以兼容 prefill 和 decode。kernel 内部可以参考
+`../pypto-serving/pypto-lib/models/deepseek/v4/prefill_rmsnorm.py` 的方式 reshape 为：
+
+```text
+[B, S, dim] -> [S, dim]
+```
+
+再执行二维 RMSNorm 计算。
+
+可复用入口应是 `@pl.jit.inline` 的三维接口；单独验证时再提供 `@pl.jit` wrapper
+调用该 inline kernel。
+
+最终需要支持：
+
+- hidden RMSNorm: 外部 `[1, S, dim]`，内部 flatten 为 `[S, dim]`
 - q-lora RMSNorm: `[T, q_lora_rank]`
 - KV RMSNorm: `[T, head_dim]`
 - per-head q RMS normalize: `[T, n_heads, head_dim]`
+
+实现时可以先落地 hidden RMSNorm，验证 PyPTO kernel、`run_jit` 和 PyTorch golden
+对齐链路。其余维度按相同计算语义补专用入口，避免在 PyPTO 静态 shape 约束下过早抽象。
 
 ### `rope.py`
 
@@ -774,34 +790,27 @@ def dsv4_decode_host(...):
 
 ### `golden.py`
 
-提供 PyTorch golden reference，用于逐模块验证。
+提供逐模块验证所需的公共 harness，用于独立编译、运行 PyPTO kernel 并和 PyTorch
+golden 对比。
 
-应尽量直接复用或对齐：
+应包含：
 
-- `low_vram_attention.py`
-- `low_vram_moe.py`
-- `low_vram_executor.py`
-- `low_vram_kernels.py`
+- `TensorSpec`
+- `RunResult`
+- `run_jit`
+- `ratio_allclose`
 
-建议包含：
+具体模块的 PyTorch golden reference 不集中放在 `golden.py`，而是放在对应 kernel
+文件中，例如 `rmsnorm.py` 内部提供 `golden_rmsnorm()`。这样每个 kernel 文件都可以像
+`../pypto-serving/pypto-lib/models/deepseek/v4` 下的文件一样独立运行验证。
 
-- `golden_hc_pre`
-- `golden_hc_post`
-- `golden_hc_head`
-- `golden_compressor_ratio4_prefill`
-- `golden_compressor_ratio4_decode`
-- `golden_compressor_ratio128_prefill`
-- `golden_compressor_ratio128_decode`
-- `golden_attention_swa_prefill`
-- `golden_attention_swa_decode`
-- `golden_attention_hca_prefill`
-- `golden_attention_hca_decode`
-- `golden_attention_csa_prefill`
-- `golden_attention_csa_decode`
-- `golden_moe`
-- `golden_block`
-- `golden_prefill`
-- `golden_decode`
+模块内的 golden 逻辑应尽量直接对齐：
+
+- `../deepseek_v4_flash/inference/model.py`
+- `../deepseek_v4_flash/inference/low_vram_attention.py`
+- `../deepseek_v4_flash/inference/low_vram_moe.py`
+- `../deepseek_v4_flash/inference/low_vram_executor.py`
+- `../deepseek_v4_flash/inference/low_vram_kernels.py`
 
 ## Attention 是否拆成 SWA/CSA/HCA
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ascend PyPTO Validate"
+  short_description: "Validate PyPTO kernels on Ascend"
+  default_prompt: "Use $ascend-pypto-validate to sync and validate this PyPTO kernel on the Ascend server."
