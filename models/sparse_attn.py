@@ -17,6 +17,8 @@ SOFTMAX_SCALE = HEAD_DIM**-0.5
 NEG_INF = -3.4028234663852886e38
 
 H_TILE = 16
+SPARSE_D_TILE = 32
+HEAD_D_BLOCKS = HEAD_DIM // SPARSE_D_TILE
 DEFAULT_SEQ_LEN = 8
 DEFAULT_DECODE_START_POS = 1
 
@@ -71,18 +73,23 @@ def sparse_attn_swa_fwd(
                 qk_scaled,
                 pl.col_expand(pl.full([H_TILE, TOPK_SWA], dtype=pl.FP32, value=0.0), sparse_bias),
             )
-            qk_mi = pl.row_max(qk_scores)
+            sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
+            qk_mi = pl.maximum(pl.row_max(qk_scores), sink_bias)
             qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
             qk_li = pl.row_sum(qk_exp)
-            qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-            qk_oi = pl.matmul(qk_exp_bf16, sparse_kv, out_dtype=pl.FP32)
 
-            sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
             denom = pl.add(qk_li, pl.exp(pl.sub(sink_bias, qk_mi)))
-            out_fp32 = pl.row_expand_div(qk_oi, denom)
-            out_bf16 = pl.cast(out_fp32, target_type=pl.BF16, mode="rint")
+            for db in pl.range(HEAD_D_BLOCKS):
+                d0 = db * SPARSE_D_TILE
+                kv_value_tile = pl.cast(
+                    sparse_kv[0:TOPK_SWA, d0 : d0 + SPARSE_D_TILE],
+                    target_type=pl.FP32,
+                )
+                qk_oi = pl.matmul(qk_exp, kv_value_tile, out_dtype=pl.FP32)
+                out_fp32 = pl.row_expand_div(qk_oi, denom)
+                out_bf16 = pl.cast(out_fp32, target_type=pl.BF16, mode="rint")
 
-            out_flat[out_row : out_row + H_TILE, 0:HEAD_DIM] = out_bf16
+                out_flat[out_row : out_row + H_TILE, d0 : d0 + SPARSE_D_TILE] = out_bf16
 
     return pl.reshape(out_flat, [B, tokens, N_HEADS, HEAD_DIM])
 
@@ -100,7 +107,7 @@ def sparse_attn_swa_test(
 
 
 def golden_sparse_attn(tensors):
-    """Torch reference matching official ``kernel.py::sparse_attn_kernel``."""
+    """Torch reference matching ``low_vram_kernels.py::sparse_attn_torch``."""
     import torch
 
     q = tensors["q"]
@@ -120,12 +127,9 @@ def golden_sparse_attn(tensors):
 
             selected = kv[batch_id, idxs].float()
             scores = torch.einsum("hd,td->ht", q[batch_id, seq_id].float(), selected) * softmax_scale
-            scores_max = scores.max(dim=1, keepdim=True).values
-            scores_exp = torch.exp(scores - scores_max)
-            numerator = torch.einsum("ht,td->hd", scores_exp.to(torch.bfloat16).float(), selected)
-            denominator = scores_exp.sum(dim=1, keepdim=True)
-            denominator = denominator + torch.exp(attn_sink.float().view(n_heads, 1) - scores_max)
-            out[batch_id, seq_id] = (numerator / denominator).to(q.dtype)
+            scores = torch.cat([scores, attn_sink.float().view(n_heads, 1)], dim=1)
+            probs = torch.softmax(scores, dim=1)[:, :-1]
+            out[batch_id, seq_id] = torch.einsum("ht,td->hd", probs, selected).to(q.dtype)
 
     tensors["out"][:] = out
 

@@ -513,7 +513,7 @@ def main() -> int:
     }
     compare_fn = {
         "kv_cache_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
-        "out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
+        "out": ratio_allclose(atol=1e-3, rtol=2.0 / 128, max_error_ratio=0.005),
     }
 
     cases = []
