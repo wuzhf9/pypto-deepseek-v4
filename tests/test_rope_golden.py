@@ -107,6 +107,22 @@ def _official_apply_rotary_emb(
     return out.to(x.dtype)
 
 
+def _official_apply_full_head_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    inverse: bool,
+) -> torch.Tensor:
+    out = x.clone()
+    out[..., -M.rope_head_dim :] = _official_apply_rotary_emb(
+        x[..., -M.rope_head_dim :],
+        cos,
+        sin,
+        inverse,
+    )
+    return out
+
+
 @pytest.mark.parametrize("compress_ratio", [0, 4, 128])
 def test_rope_tables_match_official_freqs_cis(compress_ratio: int) -> None:
     seqlen = 19
@@ -143,12 +159,13 @@ def test_rope_tables_match_official_freqs_cis(compress_ratio: int) -> None:
 @pytest.mark.parametrize(
     ("shape", "inverse"),
     [
-        ((1, 1, 64), False),
-        ((1, 13, 64), False),
-        ((1, 13, 64), True),
-        ((1, 1, 64, 64), False),
-        ((1, 13, 64, 64), False),
-        ((1, 13, 64, 64), True),
+        ((1, 1, M.head_dim), False),
+        ((1, 13, M.head_dim), False),
+        ((1, 13, M.index_head_dim), False),
+        ((1, 1, M.n_heads, M.head_dim), False),
+        ((1, 13, M.n_heads, M.head_dim), False),
+        ((1, 13, M.n_heads, M.head_dim), True),
+        ((1, 13, M.n_heads, M.index_head_dim), False),
     ],
 )
 def test_manual_rope_golden_matches_official_complex_path(
@@ -169,6 +186,13 @@ def test_manual_rope_golden_matches_official_complex_path(
     )
 
     actual = _apply_rope_golden(x, cos, sin, inverse=inverse)
-    expected = _official_apply_rotary_emb(x, cos, sin, inverse=inverse)
+    expected = _official_apply_full_head_rope(x, cos, sin, inverse=inverse)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if shape[-1] > M.rope_head_dim:
+        torch.testing.assert_close(
+            actual[..., : -M.rope_head_dim],
+            x[..., : -M.rope_head_dim],
+            rtol=0,
+            atol=0,
+        )

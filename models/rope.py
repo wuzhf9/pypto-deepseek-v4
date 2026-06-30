@@ -14,7 +14,12 @@ S_DYN = pl.dynamic("S_DYN")
 ROPE_DIM = FLASH_CONFIG.rope_head_dim
 ROPE_HALF = ROPE_DIM // 2
 N_HEADS = FLASH_CONFIG.n_heads
-ROTARY_T_TILE = 16
+HEAD_DIM = FLASH_CONFIG.head_dim
+INDEX_HEAD_DIM = FLASH_CONFIG.index_head_dim
+HEAD_TAIL_OFFSET = HEAD_DIM - ROPE_DIM
+INDEX_TAIL_OFFSET = INDEX_HEAD_DIM - ROPE_DIM
+ROPE_T_TILE = 16
+ROPE_PREFIX_TILE = 64
 DEFAULT_SEQ_LEN = 8
 
 
@@ -135,29 +140,46 @@ def materialize_rope_range(
 
 
 @pl.jit.inline
-def rotary_3d_fwd(
-    x: pl.Tensor[[B, S_DYN, ROPE_DIM], pl.BF16],
+def rope_3d_512_fwd(
+    x: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    out: pl.Tensor[[B, S_DYN, ROPE_DIM], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
 ):
-    """Apply forward RoPE to ``x`` shaped ``[1, S, 64]``."""
+    """Apply forward RoPE to ``x`` shaped ``[1, S, 512]``."""
     x.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
     out.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
-    x_flat = pl.reshape(x, [tokens, ROPE_DIM])
-    out_flat = pl.reshape(out, [tokens, ROPE_DIM])
-    token_blocks = (tokens + ROTARY_T_TILE - 1) // ROTARY_T_TILE
+    x_flat = pl.reshape(x, [tokens, HEAD_DIM])
+    out_flat = pl.reshape(out, [tokens, HEAD_DIM])
+    token_blocks = (tokens + ROPE_T_TILE - 1) // ROPE_T_TILE
 
     for tb in pl.range(token_blocks):
-        t0 = tb * ROTARY_T_TILE
-        valid_tok = pl.min(ROTARY_T_TILE, tokens - t0)
+        t0 = tb * ROPE_T_TILE
+        valid_tok = pl.min(ROPE_T_TILE, tokens - t0)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rotary_3d_fwd"):
-            ones = pl.full([ROTARY_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_3d_512_fwd"):
+            for pb in pl.range(HEAD_TAIL_OFFSET // ROPE_PREFIX_TILE):
+                p0 = pb * ROPE_PREFIX_TILE
+                prefix_tile = pl.slice(
+                    x_flat,
+                    [ROPE_T_TILE, ROPE_PREFIX_TILE],
+                    [t0, p0],
+                    valid_shape=[valid_tok, ROPE_PREFIX_TILE],
+                )
+                for row in pl.range(valid_tok):
+                    prefix_row = pl.slice(
+                        prefix_tile,
+                        [1, ROPE_PREFIX_TILE],
+                        [row, 0],
+                        valid_shape=[1, ROPE_PREFIX_TILE],
+                    )
+                    out_flat = pl.assemble(out_flat, prefix_row, [t0 + row, p0])
+
+            ones = pl.full([ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
             col = pl.col_expand_mul(ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
             dup_f = pl.cast(pl.cast(pl.mul(col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
             dup_idx = pl.cast(dup_f, target_type=pl.INT32)
@@ -166,11 +188,11 @@ def rotary_3d_fwd(
             sign = pl.sub(pl.mul(lane, 2.0), 1.0)
 
             x_tile = pl.cast(
-                pl.slice(x_flat, [ROTARY_T_TILE, ROPE_DIM], [t0, 0], valid_shape=[valid_tok, ROPE_DIM]),
+                pl.slice(x_flat, [ROPE_T_TILE, ROPE_DIM], [t0, HEAD_TAIL_OFFSET], valid_shape=[valid_tok, ROPE_DIM]),
                 target_type=pl.FP32,
             )
-            cos_tile = pl.slice(cos, [ROTARY_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
-            sin_tile = pl.slice(sin, [ROTARY_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            cos_tile = pl.slice(cos, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            sin_tile = pl.slice(sin, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
             cos_il = pl.gather(cos_tile, dim=-1, index=dup_idx)
             sin_il = pl.gather(sin_tile, dim=-1, index=dup_idx)
             swapped = pl.gather(x_tile, dim=-1, index=swap_idx)
@@ -179,36 +201,50 @@ def rotary_3d_fwd(
 
             for row in pl.range(valid_tok):
                 out_row = pl.slice(rotated_bf16, [1, ROPE_DIM], [row, 0], valid_shape=[1, ROPE_DIM])
-                out_flat = pl.assemble(out_flat, out_row, [t0 + row, 0])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, HEAD_TAIL_OFFSET])
 
-    return pl.reshape(out_flat, [B, tokens, ROPE_DIM])
+    return pl.reshape(out_flat, [B, tokens, HEAD_DIM])
 
 
 @pl.jit.inline
-def rotary_4d_fwd(
-    x: pl.Tensor[[B, S_DYN, N_HEADS, ROPE_DIM], pl.BF16],
+def rope_3d_128_fwd(
+    x: pl.Tensor[[B, S_DYN, INDEX_HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    out: pl.Tensor[[B, S_DYN, N_HEADS, ROPE_DIM], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, INDEX_HEAD_DIM], pl.BF16],
 ):
-    """Apply forward RoPE to ``x`` shaped ``[1, S, 64, 64]``."""
+    """Apply forward RoPE to ``x`` shaped ``[1, S, 128]``."""
     x.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
     out.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
-    x_flat = pl.reshape(x, [tokens, N_HEADS * ROPE_DIM])
-    out_flat = pl.reshape(out, [tokens, N_HEADS * ROPE_DIM])
-    token_blocks = (tokens + ROTARY_T_TILE - 1) // ROTARY_T_TILE
+    x_flat = pl.reshape(x, [tokens, INDEX_HEAD_DIM])
+    out_flat = pl.reshape(out, [tokens, INDEX_HEAD_DIM])
+    token_blocks = (tokens + ROPE_T_TILE - 1) // ROPE_T_TILE
 
     for tb in pl.range(token_blocks):
-        t0 = tb * ROTARY_T_TILE
-        valid_tok = pl.min(ROTARY_T_TILE, tokens - t0)
+        t0 = tb * ROPE_T_TILE
+        valid_tok = pl.min(ROPE_T_TILE, tokens - t0)
 
-        for h in pl.spmd(N_HEADS, name_hint="rotary_4d_fwd"):
-            h0 = h * ROPE_DIM
-            ones = pl.full([ROTARY_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_3d_128_fwd"):
+            prefix_tile = pl.slice(
+                x_flat,
+                [ROPE_T_TILE, ROPE_PREFIX_TILE],
+                [t0, 0],
+                valid_shape=[valid_tok, ROPE_PREFIX_TILE],
+            )
+            for row in pl.range(valid_tok):
+                prefix_row = pl.slice(
+                    prefix_tile,
+                    [1, ROPE_PREFIX_TILE],
+                    [row, 0],
+                    valid_shape=[1, ROPE_PREFIX_TILE],
+                )
+                out_flat = pl.assemble(out_flat, prefix_row, [t0 + row, 0])
+
+            ones = pl.full([ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
             col = pl.col_expand_mul(ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
             dup_f = pl.cast(pl.cast(pl.mul(col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
             dup_idx = pl.cast(dup_f, target_type=pl.INT32)
@@ -217,11 +253,11 @@ def rotary_4d_fwd(
             sign = pl.sub(pl.mul(lane, 2.0), 1.0)
 
             x_tile = pl.cast(
-                pl.slice(x_flat, [ROTARY_T_TILE, ROPE_DIM], [t0, h0], valid_shape=[valid_tok, ROPE_DIM]),
+                pl.slice(x_flat, [ROPE_T_TILE, ROPE_DIM], [t0, INDEX_TAIL_OFFSET], valid_shape=[valid_tok, ROPE_DIM]),
                 target_type=pl.FP32,
             )
-            cos_tile = pl.slice(cos, [ROTARY_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
-            sin_tile = pl.slice(sin, [ROTARY_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            cos_tile = pl.slice(cos, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            sin_tile = pl.slice(sin, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
             cos_il = pl.gather(cos_tile, dim=-1, index=dup_idx)
             sin_il = pl.gather(sin_tile, dim=-1, index=dup_idx)
             swapped = pl.gather(x_tile, dim=-1, index=swap_idx)
@@ -230,36 +266,53 @@ def rotary_4d_fwd(
 
             for row in pl.range(valid_tok):
                 out_row = pl.slice(rotated_bf16, [1, ROPE_DIM], [row, 0], valid_shape=[1, ROPE_DIM])
-                out_flat = pl.assemble(out_flat, out_row, [t0 + row, h0])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, INDEX_TAIL_OFFSET])
 
-    return pl.reshape(out_flat, [B, tokens, N_HEADS, ROPE_DIM])
+    return pl.reshape(out_flat, [B, tokens, INDEX_HEAD_DIM])
 
 
 @pl.jit.inline
-def rotary_4d_inv(
-    x: pl.Tensor[[B, S_DYN, N_HEADS, ROPE_DIM], pl.BF16],
+def rope_4d_512_fwd(
+    x: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    out: pl.Tensor[[B, S_DYN, N_HEADS, ROPE_DIM], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
 ):
-    """Apply inverse RoPE to ``x`` shaped ``[1, S, 64, 64]``."""
+    """Apply forward RoPE to ``x`` shaped ``[1, S, 64, 512]``."""
     x.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
     out.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
-    x_flat = pl.reshape(x, [tokens, N_HEADS * ROPE_DIM])
-    out_flat = pl.reshape(out, [tokens, N_HEADS * ROPE_DIM])
-    token_blocks = (tokens + ROTARY_T_TILE - 1) // ROTARY_T_TILE
+    x_flat = pl.reshape(x, [tokens, N_HEADS * HEAD_DIM])
+    out_flat = pl.reshape(out, [tokens, N_HEADS * HEAD_DIM])
+    token_blocks = (tokens + ROPE_T_TILE - 1) // ROPE_T_TILE
 
     for tb in pl.range(token_blocks):
-        t0 = tb * ROTARY_T_TILE
-        valid_tok = pl.min(ROTARY_T_TILE, tokens - t0)
+        t0 = tb * ROPE_T_TILE
+        valid_tok = pl.min(ROPE_T_TILE, tokens - t0)
 
-        for h in pl.spmd(N_HEADS, name_hint="rotary_4d_inv"):
-            h0 = h * ROPE_DIM
-            ones = pl.full([ROTARY_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        for h in pl.spmd(N_HEADS, name_hint="rope_4d_512_fwd"):
+            h0 = h * HEAD_DIM
+            for pb in pl.range(HEAD_TAIL_OFFSET // ROPE_PREFIX_TILE):
+                p0 = h0 + pb * ROPE_PREFIX_TILE
+                prefix_tile = pl.slice(
+                    x_flat,
+                    [ROPE_T_TILE, ROPE_PREFIX_TILE],
+                    [t0, p0],
+                    valid_shape=[valid_tok, ROPE_PREFIX_TILE],
+                )
+                for row in pl.range(valid_tok):
+                    prefix_row = pl.slice(
+                        prefix_tile,
+                        [1, ROPE_PREFIX_TILE],
+                        [row, 0],
+                        valid_shape=[1, ROPE_PREFIX_TILE],
+                    )
+                    out_flat = pl.assemble(out_flat, prefix_row, [t0 + row, p0])
+
+            ones = pl.full([ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
             col = pl.col_expand_mul(ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
             dup_f = pl.cast(pl.cast(pl.mul(col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
             dup_idx = pl.cast(dup_f, target_type=pl.INT32)
@@ -268,11 +321,79 @@ def rotary_4d_inv(
             sign = pl.sub(pl.mul(lane, 2.0), 1.0)
 
             x_tile = pl.cast(
-                pl.slice(x_flat, [ROTARY_T_TILE, ROPE_DIM], [t0, h0], valid_shape=[valid_tok, ROPE_DIM]),
+                pl.slice(x_flat, [ROPE_T_TILE, ROPE_DIM], [t0, h0 + HEAD_TAIL_OFFSET], valid_shape=[valid_tok, ROPE_DIM]),
                 target_type=pl.FP32,
             )
-            cos_tile = pl.slice(cos, [ROTARY_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
-            sin_tile = pl.slice(sin, [ROTARY_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            cos_tile = pl.slice(cos, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            sin_tile = pl.slice(sin, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            cos_il = pl.gather(cos_tile, dim=-1, index=dup_idx)
+            sin_il = pl.gather(sin_tile, dim=-1, index=dup_idx)
+            swapped = pl.gather(x_tile, dim=-1, index=swap_idx)
+            rotated = pl.add(pl.mul(x_tile, cos_il), pl.mul(pl.mul(swapped, sign), sin_il))
+            rotated_bf16 = pl.cast(rotated, target_type=pl.BF16, mode="rint")
+
+            for row in pl.range(valid_tok):
+                out_row = pl.slice(rotated_bf16, [1, ROPE_DIM], [row, 0], valid_shape=[1, ROPE_DIM])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, h0 + HEAD_TAIL_OFFSET])
+
+    return pl.reshape(out_flat, [B, tokens, N_HEADS, HEAD_DIM])
+
+
+@pl.jit.inline
+def rope_4d_512_inv(
+    x: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
+    sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
+    out: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+):
+    """Apply inverse RoPE to ``x`` shaped ``[1, S, 64, 512]``."""
+    x.bind_dynamic(1, S_DYN)
+    cos.bind_dynamic(0, S_DYN)
+    sin.bind_dynamic(0, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, N_HEADS * HEAD_DIM])
+    out_flat = pl.reshape(out, [tokens, N_HEADS * HEAD_DIM])
+    token_blocks = (tokens + ROPE_T_TILE - 1) // ROPE_T_TILE
+
+    for tb in pl.range(token_blocks):
+        t0 = tb * ROPE_T_TILE
+        valid_tok = pl.min(ROPE_T_TILE, tokens - t0)
+
+        for h in pl.spmd(N_HEADS, name_hint="rope_4d_512_inv"):
+            h0 = h * HEAD_DIM
+            for pb in pl.range(HEAD_TAIL_OFFSET // ROPE_PREFIX_TILE):
+                p0 = h0 + pb * ROPE_PREFIX_TILE
+                prefix_tile = pl.slice(
+                    x_flat,
+                    [ROPE_T_TILE, ROPE_PREFIX_TILE],
+                    [t0, p0],
+                    valid_shape=[valid_tok, ROPE_PREFIX_TILE],
+                )
+                for row in pl.range(valid_tok):
+                    prefix_row = pl.slice(
+                        prefix_tile,
+                        [1, ROPE_PREFIX_TILE],
+                        [row, 0],
+                        valid_shape=[1, ROPE_PREFIX_TILE],
+                    )
+                    out_flat = pl.assemble(out_flat, prefix_row, [t0 + row, p0])
+
+            ones = pl.full([ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+            col = pl.col_expand_mul(ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+            dup_f = pl.cast(pl.cast(pl.mul(col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            dup_idx = pl.cast(dup_f, target_type=pl.INT32)
+            lane = pl.sub(col, pl.mul(dup_f, 2.0))
+            swap_idx = pl.cast(pl.sub(pl.add(col, 1.0), pl.mul(lane, 2.0)), target_type=pl.INT32)
+            sign = pl.sub(pl.mul(lane, 2.0), 1.0)
+
+            x_tile = pl.cast(
+                pl.slice(x_flat, [ROPE_T_TILE, ROPE_DIM], [t0, h0 + HEAD_TAIL_OFFSET], valid_shape=[valid_tok, ROPE_DIM]),
+                target_type=pl.FP32,
+            )
+            cos_tile = pl.slice(cos, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            sin_tile = pl.slice(sin, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
             cos_il = pl.gather(cos_tile, dim=-1, index=dup_idx)
             sin_il = pl.gather(sin_tile, dim=-1, index=dup_idx)
             swapped = pl.gather(x_tile, dim=-1, index=swap_idx)
@@ -281,45 +402,138 @@ def rotary_4d_inv(
 
             for row in pl.range(valid_tok):
                 out_row = pl.slice(rotated_bf16, [1, ROPE_DIM], [row, 0], valid_shape=[1, ROPE_DIM])
-                out_flat = pl.assemble(out_flat, out_row, [t0 + row, h0])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, h0 + HEAD_TAIL_OFFSET])
 
-    return pl.reshape(out_flat, [B, tokens, N_HEADS, ROPE_DIM])
+    return pl.reshape(out_flat, [B, tokens, N_HEADS, HEAD_DIM])
+
+
+@pl.jit.inline
+def rope_4d_128_fwd(
+    x: pl.Tensor[[B, S_DYN, N_HEADS, INDEX_HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
+    sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
+    out: pl.Tensor[[B, S_DYN, N_HEADS, INDEX_HEAD_DIM], pl.BF16],
+):
+    """Apply forward RoPE to ``x`` shaped ``[1, S, 64, 128]``."""
+    x.bind_dynamic(1, S_DYN)
+    cos.bind_dynamic(0, S_DYN)
+    sin.bind_dynamic(0, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, N_HEADS * INDEX_HEAD_DIM])
+    out_flat = pl.reshape(out, [tokens, N_HEADS * INDEX_HEAD_DIM])
+    token_blocks = (tokens + ROPE_T_TILE - 1) // ROPE_T_TILE
+
+    for tb in pl.range(token_blocks):
+        t0 = tb * ROPE_T_TILE
+        valid_tok = pl.min(ROPE_T_TILE, tokens - t0)
+
+        for h in pl.spmd(N_HEADS, name_hint="rope_4d_128_fwd"):
+            h0 = h * INDEX_HEAD_DIM
+            prefix_tile = pl.slice(
+                x_flat,
+                [ROPE_T_TILE, ROPE_PREFIX_TILE],
+                [t0, h0],
+                valid_shape=[valid_tok, ROPE_PREFIX_TILE],
+            )
+            for row in pl.range(valid_tok):
+                prefix_row = pl.slice(
+                    prefix_tile,
+                    [1, ROPE_PREFIX_TILE],
+                    [row, 0],
+                    valid_shape=[1, ROPE_PREFIX_TILE],
+                )
+                out_flat = pl.assemble(out_flat, prefix_row, [t0 + row, h0])
+
+            ones = pl.full([ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+            col = pl.col_expand_mul(ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+            dup_f = pl.cast(pl.cast(pl.mul(col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            dup_idx = pl.cast(dup_f, target_type=pl.INT32)
+            lane = pl.sub(col, pl.mul(dup_f, 2.0))
+            swap_idx = pl.cast(pl.sub(pl.add(col, 1.0), pl.mul(lane, 2.0)), target_type=pl.INT32)
+            sign = pl.sub(pl.mul(lane, 2.0), 1.0)
+
+            x_tile = pl.cast(
+                pl.slice(
+                    x_flat,
+                    [ROPE_T_TILE, ROPE_DIM],
+                    [t0, h0 + INDEX_TAIL_OFFSET],
+                    valid_shape=[valid_tok, ROPE_DIM],
+                ),
+                target_type=pl.FP32,
+            )
+            cos_tile = pl.slice(cos, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            sin_tile = pl.slice(sin, [ROPE_T_TILE, ROPE_HALF], [t0, 0], valid_shape=[valid_tok, ROPE_HALF])
+            cos_il = pl.gather(cos_tile, dim=-1, index=dup_idx)
+            sin_il = pl.gather(sin_tile, dim=-1, index=dup_idx)
+            swapped = pl.gather(x_tile, dim=-1, index=swap_idx)
+            rotated = pl.add(pl.mul(x_tile, cos_il), pl.mul(pl.mul(swapped, sign), sin_il))
+            rotated_bf16 = pl.cast(rotated, target_type=pl.BF16, mode="rint")
+
+            for row in pl.range(valid_tok):
+                out_row = pl.slice(rotated_bf16, [1, ROPE_DIM], [row, 0], valid_shape=[1, ROPE_DIM])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, h0 + INDEX_TAIL_OFFSET])
+
+    return pl.reshape(out_flat, [B, tokens, N_HEADS, INDEX_HEAD_DIM])
 
 
 @pl.jit
-def rotary_3d_fwd_test(
-    x: pl.Tensor[[B, S_DYN, ROPE_DIM], pl.BF16],
+def rope_3d_512_fwd_test(
+    x: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    out: pl.Out[pl.Tensor[[B, S_DYN, ROPE_DIM], pl.BF16]],
+    out: pl.Out[pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16]],
 ):
-    out = rotary_3d_fwd(x, cos, sin, out)
+    out = rope_3d_512_fwd(x, cos, sin, out)
     return out
 
 
 @pl.jit
-def rotary_4d_fwd_test(
-    x: pl.Tensor[[B, S_DYN, N_HEADS, ROPE_DIM], pl.BF16],
+def rope_3d_128_fwd_test(
+    x: pl.Tensor[[B, S_DYN, INDEX_HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    out: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, ROPE_DIM], pl.BF16]],
+    out: pl.Out[pl.Tensor[[B, S_DYN, INDEX_HEAD_DIM], pl.BF16]],
 ):
-    out = rotary_4d_fwd(x, cos, sin, out)
+    out = rope_3d_128_fwd(x, cos, sin, out)
     return out
 
 
 @pl.jit
-def rotary_4d_inv_test(
-    x: pl.Tensor[[B, S_DYN, N_HEADS, ROPE_DIM], pl.BF16],
+def rope_4d_512_fwd_test(
+    x: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    out: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, ROPE_DIM], pl.BF16]],
+    out: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
 ):
-    out = rotary_4d_inv(x, cos, sin, out)
+    out = rope_4d_512_fwd(x, cos, sin, out)
     return out
 
 
-def _apply_rope_golden(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, inverse: bool) -> torch.Tensor:
+@pl.jit
+def rope_4d_512_inv_test(
+    x: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
+    sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
+    out: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
+):
+    out = rope_4d_512_inv(x, cos, sin, out)
+    return out
+
+
+@pl.jit
+def rope_4d_128_fwd_test(
+    x: pl.Tensor[[B, S_DYN, N_HEADS, INDEX_HEAD_DIM], pl.BF16],
+    cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
+    sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
+    out: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, INDEX_HEAD_DIM], pl.BF16]],
+):
+    out = rope_4d_128_fwd(x, cos, sin, out)
+    return out
+
+
+def _apply_rope_tail_golden(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, inverse: bool) -> torch.Tensor:
     x_fp32 = x.float()
     pair = x_fp32.unflatten(-1, (-1, 2))
     x0 = pair[..., 0]
@@ -342,15 +556,17 @@ def _apply_rope_golden(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *,
     return torch.stack([y0, y1], dim=-1).flatten(-2).to(x.dtype)
 
 
-def golden_rotary_3d_fwd(tensors):
+def _apply_rope_golden(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, inverse: bool) -> torch.Tensor:
+    out = x.clone()
+    out[..., -ROPE_DIM:] = _apply_rope_tail_golden(x[..., -ROPE_DIM:], cos, sin, inverse=inverse)
+    return out
+
+
+def golden_rope_fwd(tensors):
     tensors["out"][:] = _apply_rope_golden(tensors["x"], tensors["cos"], tensors["sin"], inverse=False)
 
 
-def golden_rotary_4d_fwd(tensors):
-    tensors["out"][:] = _apply_rope_golden(tensors["x"], tensors["cos"], tensors["sin"], inverse=False)
-
-
-def golden_rotary_4d_inv(tensors):
+def golden_rope_inv(tensors):
     tensors["out"][:] = _apply_rope_golden(tensors["x"], tensors["cos"], tensors["sin"], inverse=True)
 
 
@@ -371,12 +587,20 @@ def _build_tensor_specs(shape: list[int], seq_len: int, start_pos: int):
     ]
 
 
-def build_rotary_3d_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
-    return _build_tensor_specs([B, seq_len, ROPE_DIM], seq_len, start_pos)
+def build_rope_3d_512_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
+    return _build_tensor_specs([B, seq_len, HEAD_DIM], seq_len, start_pos)
 
 
-def build_rotary_4d_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
-    return _build_tensor_specs([B, seq_len, N_HEADS, ROPE_DIM], seq_len, start_pos)
+def build_rope_3d_128_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
+    return _build_tensor_specs([B, seq_len, INDEX_HEAD_DIM], seq_len, start_pos)
+
+
+def build_rope_4d_512_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
+    return _build_tensor_specs([B, seq_len, N_HEADS, HEAD_DIM], seq_len, start_pos)
+
+
+def build_rope_4d_128_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
+    return _build_tensor_specs([B, seq_len, N_HEADS, INDEX_HEAD_DIM], seq_len, start_pos)
 
 
 def main() -> int:
@@ -394,9 +618,11 @@ def main() -> int:
     args = parser.parse_args()
 
     cases = [
-        ("rotary-3d-fwd", rotary_3d_fwd_test, build_rotary_3d_specs, golden_rotary_3d_fwd),
-        ("rotary-4d-fwd", rotary_4d_fwd_test, build_rotary_4d_specs, golden_rotary_4d_fwd),
-        ("rotary-4d-inv", rotary_4d_inv_test, build_rotary_4d_specs, golden_rotary_4d_inv),
+        ("rope-3d-512-fwd", rope_3d_512_fwd_test, build_rope_3d_512_specs, golden_rope_fwd),
+        ("rope-3d-128-fwd", rope_3d_128_fwd_test, build_rope_3d_128_specs, golden_rope_fwd),
+        ("rope-4d-512-fwd", rope_4d_512_fwd_test, build_rope_4d_512_specs, golden_rope_fwd),
+        ("rope-4d-512-inv", rope_4d_512_inv_test, build_rope_4d_512_specs, golden_rope_inv),
+        ("rope-4d-128-fwd", rope_4d_128_fwd_test, build_rope_4d_128_specs, golden_rope_fwd),
     ]
     runtime_cfg = {
         "platform": args.platform,
@@ -436,21 +662,31 @@ __all__ = [
     "ROPE_DIM",
     "ROPE_HALF",
     "N_HEADS",
-    "ROTARY_T_TILE",
+    "HEAD_DIM",
+    "INDEX_HEAD_DIM",
+    "HEAD_TAIL_OFFSET",
+    "INDEX_TAIL_OFFSET",
+    "ROPE_T_TILE",
+    "ROPE_PREFIX_TILE",
     "DEFAULT_SEQ_LEN",
     "rope_profile_for_compress_ratio",
     "precompute_freqs_cos_sin",
     "build_deepseek_v4_rope_tables",
     "materialize_rope_range",
-    "rotary_3d_fwd",
-    "rotary_4d_fwd",
-    "rotary_4d_inv",
-    "rotary_3d_fwd_test",
-    "rotary_4d_fwd_test",
-    "rotary_4d_inv_test",
-    "golden_rotary_3d_fwd",
-    "golden_rotary_4d_fwd",
-    "golden_rotary_4d_inv",
-    "build_rotary_3d_specs",
-    "build_rotary_4d_specs",
+    "rope_3d_512_fwd",
+    "rope_3d_128_fwd",
+    "rope_4d_512_fwd",
+    "rope_4d_512_inv",
+    "rope_4d_128_fwd",
+    "rope_3d_512_fwd_test",
+    "rope_3d_128_fwd_test",
+    "rope_4d_512_fwd_test",
+    "rope_4d_512_inv_test",
+    "rope_4d_128_fwd_test",
+    "golden_rope_fwd",
+    "golden_rope_inv",
+    "build_rope_3d_512_specs",
+    "build_rope_3d_128_specs",
+    "build_rope_4d_512_specs",
+    "build_rope_4d_128_specs",
 ]

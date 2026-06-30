@@ -75,11 +75,10 @@ def rmsnorm_4096(
                 weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
                 weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
                 normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
-                out_flat = pl.assemble(
-                    out_flat,
-                    pl.cast(normed, target_type=pl.BF16, mode="rint"),
-                    [t0, k0],
-                )
+                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
+                for row in pl.range(valid_tok):
+                    out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
 
     return pl.reshape(out_flat, [B, tokens, D_4096])
 
@@ -124,11 +123,10 @@ def rmsnorm_1024(
                 weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
                 weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
                 normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
-                out_flat = pl.assemble(
-                    out_flat,
-                    pl.cast(normed, target_type=pl.BF16, mode="rint"),
-                    [t0, k0],
-                )
+                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
+                for row in pl.range(valid_tok):
+                    out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
 
     return pl.reshape(out_flat, [B, tokens, D_1024])
 
@@ -173,11 +171,10 @@ def rmsnorm_512(
                 weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
                 weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
                 normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
-                out_flat = pl.assemble(
-                    out_flat,
-                    pl.cast(normed, target_type=pl.BF16, mode="rint"),
-                    [t0, k0],
-                )
+                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
+                for row in pl.range(valid_tok):
+                    out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
 
     return pl.reshape(out_flat, [B, tokens, D_512])
 
@@ -222,11 +219,10 @@ def rmsnorm_128(
                 weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
                 weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
                 normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
-                out_flat = pl.assemble(
-                    out_flat,
-                    pl.cast(normed, target_type=pl.BF16, mode="rint"),
-                    [t0, k0],
-                )
+                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
+                for row in pl.range(valid_tok):
+                    out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
 
     return pl.reshape(out_flat, [B, tokens, D_128])
 
