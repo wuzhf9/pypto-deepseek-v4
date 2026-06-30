@@ -100,13 +100,14 @@ def sparse_attn_swa_test(
 
 
 def golden_sparse_attn(tensors):
-    """Torch reference matching official ``low_vram_kernels.sparse_attn_torch``."""
+    """Torch reference matching official ``kernel.py::sparse_attn_kernel``."""
     import torch
 
     q = tensors["q"]
     kv = tensors["kv"]
     attn_sink = tensors["attn_sink"]
     topk_idxs = tensors["topk_idxs"]
+    softmax_scale = tensors.get("softmax_scale", SOFTMAX_SCALE)
 
     bsz, seqlen, n_heads, _ = q.shape
     out = torch.zeros_like(q)
@@ -118,10 +119,13 @@ def golden_sparse_attn(tensors):
                 continue
 
             selected = kv[batch_id, idxs].float()
-            scores = torch.einsum("hd,td->ht", q[batch_id, seq_id].float(), selected) * SOFTMAX_SCALE
-            scores = torch.cat([scores, attn_sink.float().view(n_heads, 1)], dim=1)
-            probs = torch.softmax(scores, dim=1)[:, :-1]
-            out[batch_id, seq_id] = torch.einsum("ht,td->hd", probs, selected).to(q.dtype)
+            scores = torch.einsum("hd,td->ht", q[batch_id, seq_id].float(), selected) * softmax_scale
+            scores_max = scores.max(dim=1, keepdim=True).values
+            scores_exp = torch.exp(scores - scores_max)
+            numerator = torch.einsum("ht,td->hd", scores_exp.to(torch.bfloat16).float(), selected)
+            denominator = scores_exp.sum(dim=1, keepdim=True)
+            denominator = denominator + torch.exp(attn_sink.float().view(n_heads, 1) - scores_max)
+            out[batch_id, seq_id] = (numerator / denominator).to(q.dtype)
 
     tensors["out"][:] = out
 
