@@ -93,7 +93,7 @@ def attention_out_fwd(
 
     proj = pl.reshape(proj_flat, [B, tokens, ATTN_OUT_IN])
     out = linear_8192_to_4096(proj, wo_b_t, out)
-    return o_inv, proj, out
+    return out
 
 
 @pl.jit
@@ -103,12 +103,12 @@ def attention_out_fwd_test(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    o_inv: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    proj: pl.Out[pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16]],
+    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
-    o_inv, proj, out = attention_out_fwd(o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
-    return o_inv, proj, out
+    out = attention_out_fwd(o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
+    return out
 
 
 def golden_attention_out(tensors):
@@ -148,8 +148,8 @@ def build_tensor_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
         TensorSpec("wo_b_t", [ATTN_OUT_IN, HIDDEN], torch.bfloat16, init_value=init_wo_b_t),
         TensorSpec("cos", [seq_len, ROPE_HALF], torch.float32, init_value=local_cos),
         TensorSpec("sin", [seq_len, ROPE_HALF], torch.float32, init_value=local_sin),
-        TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16, is_output=True),
-        TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16, is_output=True),
+        TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
+        TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
         TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
     ]
 
@@ -157,7 +157,7 @@ def build_tensor_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
 def main() -> int:
     import argparse
 
-    from models.golden import ignore_output, ratio_allclose, run_jit
+    from models.golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 Flash attention output validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -174,8 +174,6 @@ def main() -> int:
         "enable_l2_swimlane": args.enable_l2_swimlane,
     }
     compare_fn = {
-        "o_inv": ignore_output,
-        "proj": ignore_output,
         "out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
     }
 

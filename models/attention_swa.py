@@ -100,7 +100,6 @@ def attention_swa_prefill_fwd(
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
     q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    q_scaled: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
     kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
@@ -118,7 +117,7 @@ def attention_swa_prefill_fwd(
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
 
-    q_a, q_proj, q_scaled, kv_proj, kv_normed, qr, q, kv = attention_qkv_fwd(
+    qr, q, kv = attention_qkv_fwd(
         x,
         wq_a_t,
         q_norm_w,
@@ -129,7 +128,6 @@ def attention_swa_prefill_fwd(
         sin,
         q_a,
         q_proj,
-        q_scaled,
         kv_proj,
         kv_normed,
         qr,
@@ -138,8 +136,8 @@ def attention_swa_prefill_fwd(
     )
     kv_cache_out = update_swa_prefill_cache(kv, kv_cache_out)
     attn_o = sparse_attn_swa_fwd(q, kv, attn_sink, topk_idxs, attn_o)
-    o_inv_out, proj_out, out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
-    return q_a, q_proj, q_scaled, kv_proj, kv_normed, qr, q, kv, kv_cache_out, attn_o, o_inv_out, proj_out, out_final
+    out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
+    return kv_cache_out, out_final
 
 
 @pl.jit.inline
@@ -160,7 +158,6 @@ def attention_swa_decode_fwd(
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
     q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    q_scaled: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
     kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
@@ -173,7 +170,7 @@ def attention_swa_decode_fwd(
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Attention.forward`` for ``compress_ratio == 0, start_pos > 0``."""
-    q_a, q_proj, q_scaled, kv_proj, kv_normed, qr, q, kv = attention_qkv_fwd(
+    qr, q, kv = attention_qkv_fwd(
         x,
         wq_a_t,
         q_norm_w,
@@ -184,7 +181,6 @@ def attention_swa_decode_fwd(
         sin,
         q_a,
         q_proj,
-        q_scaled,
         kv_proj,
         kv_normed,
         qr,
@@ -193,8 +189,8 @@ def attention_swa_decode_fwd(
     )
     kv_cache_out = update_swa_decode_cache(kv_cache, kv, cache_pos, kv_cache_out)
     attn_o = sparse_attn_swa_fwd(q, kv_cache_out, attn_sink, topk_idxs, attn_o)
-    o_inv_out, proj_out, out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
-    return q_a, q_proj, q_scaled, kv_proj, kv_normed, qr, q, kv, kv_cache_out, attn_o, o_inv_out, proj_out, out_final
+    out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
+    return kv_cache_out, out_final
 
 
 @pl.jit
@@ -211,18 +207,17 @@ def attention_swa_prefill_test(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    q_a: pl.Out[pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16]],
-    q_proj: pl.Out[pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16]],
-    q_scaled: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    kv_proj: pl.Out[pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16]],
-    kv_normed: pl.Out[pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16]],
-    qr: pl.Out[pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16]],
-    q: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    kv: pl.Out[pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16]],
+    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
+    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
+    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
+    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
+    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    o_inv: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    proj: pl.Out[pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16]],
+    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return attention_swa_prefill_fwd(
@@ -240,7 +235,6 @@ def attention_swa_prefill_test(
         sin,
         q_a,
         q_proj,
-        q_scaled,
         kv_proj,
         kv_normed,
         qr,
@@ -270,18 +264,17 @@ def attention_swa_decode_test(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    q_a: pl.Out[pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16]],
-    q_proj: pl.Out[pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16]],
-    q_scaled: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    kv_proj: pl.Out[pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16]],
-    kv_normed: pl.Out[pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16]],
-    qr: pl.Out[pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16]],
-    q: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    kv: pl.Out[pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16]],
+    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
+    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
+    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
+    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
+    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    o_inv: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
-    proj: pl.Out[pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16]],
+    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return attention_swa_decode_fwd(
@@ -301,7 +294,6 @@ def attention_swa_decode_test(
         sin,
         q_a,
         q_proj,
-        q_scaled,
         kv_proj,
         kv_normed,
         qr,
@@ -345,7 +337,6 @@ def _golden_attention_swa(tensors, *, decode: bool):
     q_proj = q
     q = q.unflatten(-1, (N_HEADS, HEAD_DIM))
     q = (q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + EPS)).to(torch.bfloat16)
-    q_scaled = q
     q = _apply_rope_golden(q, tensors["cos"], tensors["sin"], inverse=False)
 
     # win kv
@@ -383,7 +374,6 @@ def _golden_attention_swa(tensors, *, decode: bool):
 
     tensors["q_a"][:] = q_a
     tensors["q_proj"][:] = q_proj
-    tensors["q_scaled"][:] = q_scaled
     tensors["kv_proj"][:] = kv_proj
     tensors["kv_normed"][:] = kv_normed
     tensors["qr"][:] = qr
@@ -474,18 +464,17 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
         specs = [x_spec, *weight_specs]
     specs.extend(
         [
-            TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16, is_output=True),
-            TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16, is_output=True),
-            TensorSpec("q_scaled", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16, is_output=True),
-            TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16, is_output=True),
+            TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
+            TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16),
+            TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16),
+            TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16),
+            TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
+            TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
+            TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16),
             TensorSpec("kv_cache_out", [B, WINDOW_SIZE, HEAD_DIM], torch.bfloat16, is_output=True, init_value=0.0),
-            TensorSpec("attn_o", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16, is_output=True),
+            TensorSpec("attn_o", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
+            TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
+            TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
             TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
         ]
     )
@@ -505,7 +494,7 @@ def build_swa_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
 def main() -> int:
     import argparse
 
-    from models.golden import ignore_output, ratio_allclose, run_jit
+    from models.golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 Flash SWA attention validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -523,18 +512,7 @@ def main() -> int:
         "enable_l2_swimlane": args.enable_l2_swimlane,
     }
     compare_fn = {
-        "q_a": ignore_output,
-        "q_proj": ignore_output,
-        "q_scaled": ignore_output,
-        "kv_proj": ignore_output,
-        "kv_normed": ignore_output,
-        "qr": ignore_output,
-        "q": ignore_output,
-        "kv": ignore_output,
         "kv_cache_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
-        "attn_o": ignore_output,
-        "o_inv": ignore_output,
-        "proj": ignore_output,
         "out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
     }
 
