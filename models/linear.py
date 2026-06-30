@@ -13,6 +13,7 @@ HIDDEN = M.dim
 Q_LORA_RANK = M.q_lora_rank
 HEAD_DIM = M.head_dim
 ATTN_Q_OUT = M.n_heads * M.head_dim
+ATTN_OUT_IN = M.o_groups * M.o_lora_rank
 
 T_TILE = 16
 K_TILE = 128
@@ -24,17 +25,22 @@ DEFAULT_SEQ_LEN = 8
 
 assert_divisible(HIDDEN, K_TILE, "hidden linear input size")
 assert_divisible(Q_LORA_RANK, K_TILE, "q lora linear input size")
+assert_divisible(ATTN_OUT_IN, K_TILE, "attention output linear input size")
 assert_divisible(HEAD_DIM, O_TILE, "512 linear output size")
 assert_divisible(Q_LORA_RANK, O_TILE, "1024 linear output size")
+assert_divisible(HIDDEN, O_TILE, "4096 linear output size")
 assert_divisible(ATTN_Q_OUT, ATTN_Q_OUT_TILE, "32768 linear output size")
 assert_divisible(HEAD_DIM // O_TILE, OUT_GROUP, "512 output blocks")
 assert_divisible(Q_LORA_RANK // O_TILE, OUT_GROUP, "1024 output blocks")
+assert_divisible(HIDDEN // O_TILE, OUT_GROUP, "4096 output blocks")
 assert_divisible(ATTN_Q_OUT // ATTN_Q_OUT_TILE, ATTN_Q_OUT_GROUP, "32768 output tile blocks")
 
 HIDDEN_K_BLOCKS = HIDDEN // K_TILE
 Q_LORA_K_BLOCKS = Q_LORA_RANK // K_TILE
+ATTN_OUT_K_BLOCKS = ATTN_OUT_IN // K_TILE
 HEAD_DIM_O_BLOCKS = HEAD_DIM // O_TILE
 Q_LORA_O_BLOCKS = Q_LORA_RANK // O_TILE
+HIDDEN_O_BLOCKS = HIDDEN // O_TILE
 ATTN_Q_OUT_BLOCKS = ATTN_Q_OUT // ATTN_Q_OUT_TILE
 
 
@@ -167,6 +173,45 @@ def linear_1024_to_32768(
     return pl.reshape(out_flat, [B, tokens, ATTN_Q_OUT])
 
 
+@pl.jit.inline
+def linear_8192_to_4096(
+    x: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
+    weight_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
+):
+    """Compute ``x @ weight_t`` for ``weight_t`` shape ``[8192, 4096]``."""
+    x.bind_dynamic(1, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, ATTN_OUT_IN])
+    out_flat = pl.reshape(out, [tokens, HIDDEN])
+    token_blocks = (tokens + T_TILE - 1) // T_TILE
+
+    for tb in pl.range(token_blocks):
+        t0 = tb * T_TILE
+        valid_tok = pl.min(T_TILE, tokens - t0)
+
+        for og_idx in pl.spmd(HIDDEN_O_BLOCKS // OUT_GROUP, name_hint="linear_8192_to_4096"):
+            og = og_idx * OUT_GROUP
+            for o_inner in pl.pipeline(OUT_GROUP, stage=2):
+                o0 = (og + o_inner) * O_TILE
+                x0 = pl.slice(x_flat, [T_TILE, K_TILE], [t0, 0], valid_shape=[valid_tok, K_TILE])
+                w0 = pl.slice(weight_t, [K_TILE, O_TILE], [0, o0])
+                acc = pl.matmul(x0, w0, out_dtype=pl.FP32)
+                for kb in pl.pipeline(1, ATTN_OUT_K_BLOCKS, stage=2):
+                    k0 = kb * K_TILE
+                    xk = pl.slice(x_flat, [T_TILE, K_TILE], [t0, k0], valid_shape=[valid_tok, K_TILE])
+                    wk = pl.slice(weight_t, [K_TILE, O_TILE], [k0, o0])
+                    acc = pl.matmul_acc(acc, xk, wk)
+                acc_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                for row in pl.range(valid_tok):
+                    out_row = pl.slice(acc_bf16, [1, O_TILE], [row, 0])
+                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, o0])
+
+    return pl.reshape(out_flat, [B, tokens, HIDDEN])
+
+
 @pl.jit
 def linear_4096_to_512_test(
     x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
@@ -194,6 +239,16 @@ def linear_1024_to_32768_test(
     out: pl.Out[pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16]],
 ):
     out = linear_1024_to_32768(x, weight_t, out)
+    return out
+
+
+@pl.jit
+def linear_8192_to_4096_test(
+    x: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
+    weight_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
+):
+    out = linear_8192_to_4096(x, weight_t, out)
     return out
 
 
@@ -235,6 +290,10 @@ def build_1024_to_32768_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return _build_tensor_specs(Q_LORA_RANK, ATTN_Q_OUT, seq_len)
 
 
+def build_8192_to_4096_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(ATTN_OUT_IN, HIDDEN, seq_len)
+
+
 def main() -> int:
     import argparse
 
@@ -252,6 +311,7 @@ def main() -> int:
         ("4096-to-512", linear_4096_to_512_test, build_4096_to_512_specs),
         ("4096-to-1024", linear_4096_to_1024_test, build_4096_to_1024_specs),
         ("1024-to-32768", linear_1024_to_32768_test, build_1024_to_32768_specs),
+        ("8192-to-4096", linear_8192_to_4096_test, build_8192_to_4096_specs),
     ]
     runtime_cfg = {
         "platform": args.platform,
@@ -292,6 +352,7 @@ __all__ = [
     "Q_LORA_RANK",
     "HEAD_DIM",
     "ATTN_Q_OUT",
+    "ATTN_OUT_IN",
     "T_TILE",
     "K_TILE",
     "O_TILE",
@@ -302,11 +363,14 @@ __all__ = [
     "linear_4096_to_512",
     "linear_4096_to_1024",
     "linear_1024_to_32768",
+    "linear_8192_to_4096",
     "linear_4096_to_512_test",
     "linear_4096_to_1024_test",
     "linear_1024_to_32768_test",
+    "linear_8192_to_4096_test",
     "golden_linear",
     "build_4096_to_512_specs",
     "build_4096_to_1024_specs",
     "build_1024_to_32768_specs",
+    "build_8192_to_4096_specs",
 ]
