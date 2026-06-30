@@ -150,6 +150,11 @@ def ratio_allclose(
     return compare
 
 
+def ignore_output(*_args: Any, **_kwargs: Any) -> tuple[bool, str]:
+    """Comparator for output buffers that are required by PyPTO but not validated."""
+    return True, ""
+
+
 def _save_tensors(dest_dir: Path, tensors: dict[str, torch.Tensor]) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     for name, tensor in tensors.items():
