@@ -397,37 +397,46 @@ def compressor_ratio128_decode_fwd(
     cache_flat = pl.reshape(compressed_cache, [TOPK_HCA, HEAD_DIM])
     cache_out_flat = pl.reshape(compressed_cache_out, [TOPK_HCA, HEAD_DIM])
 
-    for row in pl.spmd(COMPRESS_RATIO, name_hint="compressor_c128_decode_state_copy"):
-        for hb in pl.pipeline(HEAD_CHUNKS, stage=2):
-            h0 = hb * HEAD_CHUNK
-            kv_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_state_flat[
-                row : row + 1, h0 : h0 + HEAD_CHUNK
-            ]
-            score_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = score_state_flat[
-                row : row + 1, h0 : h0 + HEAD_CHUNK
-            ]
-
-    for cache_row in pl.spmd(TOPK_HCA, name_hint="compressor_c128_decode_cache_copy"):
-        for hb in pl.pipeline(HEAD_CHUNKS, stage=2):
-            h0 = hb * HEAD_CHUNK
-            cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
-                cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
-            ]
-
     raw_slot = pl.read(slot, [0])
     slot_idx = pl.cast(raw_slot, pl.INDEX)
     should_flag = pl.read(should_compress, [0])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c128_decode_state_update"):
-        for hb in pl.range(HEAD_CHUNKS):
-            h0 = hb * HEAD_CHUNK
-            kv_state_out_flat[slot_idx : slot_idx + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
-                0:1, h0 : h0 + HEAD_CHUNK
-            ]
-            score_state_out_flat[slot_idx : slot_idx + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
-                score_proj_flat[0:1, h0 : h0 + HEAD_CHUNK],
-                ape[slot_idx : slot_idx + 1, h0 : h0 + HEAD_CHUNK],
-            )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c128_decode_state_copy_update"):
+        for row in pl.range(COMPRESS_RATIO):
+            for hb in pl.range(HEAD_CHUNKS):
+                h0 = hb * HEAD_CHUNK
+                if row == slot_idx:
+                    kv_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                        0:1, h0 : h0 + HEAD_CHUNK
+                    ]
+                    score_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                        score_proj_flat[0:1, h0 : h0 + HEAD_CHUNK],
+                        ape[row : row + 1, h0 : h0 + HEAD_CHUNK],
+                    )
+                else:
+                    kv_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_state_flat[
+                        row : row + 1, h0 : h0 + HEAD_CHUNK
+                    ]
+                    score_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = score_state_flat[
+                        row : row + 1, h0 : h0 + HEAD_CHUNK
+                    ]
+
+    raw_cache_slot = pl.read(cache_slot, [0])
+    cache_slot_idx = pl.cast(raw_cache_slot, pl.INDEX)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c128_decode_cache_copy"):
+        for cache_row in pl.range(TOPK_HCA):
+            for hb in pl.range(HEAD_CHUNKS):
+                h0 = hb * HEAD_CHUNK
+                if should_flag != 0:
+                    if cache_row != cache_slot_idx:
+                        cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
+                            cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
+                        ]
+                else:
+                    cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
+                        cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
+                    ]
 
     if should_flag != 0:
         pooled_flat = pl.reshape(pooled, [1, HEAD_DIM])
@@ -507,8 +516,6 @@ def compressor_ratio128_decode_fwd(
             decode_rope_out_row = pl.slice(rotated_bf16, [1, ROPE_DIM], [0, 0], valid_shape=[1, ROPE_DIM])
             compressed_flat = pl.assemble(compressed_flat, decode_rope_out_row, [0, HEAD_TAIL_OFFSET])
 
-        raw_cache_slot = pl.read(cache_slot, [0])
-        cache_slot_idx = pl.cast(raw_cache_slot, pl.INDEX)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c128_decode_cache_write"):
             for hb in pl.range(HEAD_CHUNKS):
                 h0 = hb * HEAD_CHUNK
@@ -517,6 +524,7 @@ def compressor_ratio128_decode_fwd(
                 ]
 
     return compressed, kv_state_out, score_state_out, compressed_cache_out
+
 
 
 @pl.jit
