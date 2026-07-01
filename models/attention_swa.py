@@ -322,10 +322,20 @@ def _golden_sparse_attn(q, kv, attn_sink, topk_idxs):
     return tensors["out"]
 
 
-def _golden_attention_swa(tensors, *, decode: bool):
+def golden_attention_swa_forward(tensors, start_pos: int):
     import torch
 
+    if start_pos < 0:
+        raise ValueError(f"start_pos must be non-negative, got {start_pos}")
+
     x = tensors["x"]
+    if start_pos > 0 and x.shape[1] != 1:
+        raise ValueError(f"decode expects seq_len=1, got {x.shape[1]}")
+    if start_pos > 0 and int(tensors["cache_pos"][0].item()) != start_pos % WINDOW_SIZE:
+        raise ValueError(
+            f"decode cache_pos mismatch: expected {start_pos % WINDOW_SIZE}, "
+            f"got {int(tensors['cache_pos'][0].item())}"
+        )
 
     # q
     qr = q = torch.matmul(x.float(), tensors["wq_a_t"].float()).to(torch.bfloat16)
@@ -348,7 +358,7 @@ def _golden_attention_swa(tensors, *, decode: bool):
     kv = _apply_rope_golden(kv, tensors["cos"], tensors["sin"], inverse=False)
 
     # FP8 act_quant on non-RoPE dims is intentionally removed in this bf16 path.
-    if decode:
+    if start_pos > 0:
         kv_cache_out = tensors["kv_cache"].clone()
         kv_cache_out[0, int(tensors["cache_pos"][0].item())] = kv[0, 0]
         attn_kv = kv_cache_out
@@ -387,11 +397,13 @@ def _golden_attention_swa(tensors, *, decode: bool):
 
 
 def golden_attention_swa_prefill(tensors):
-    _golden_attention_swa(tensors, decode=False)
+    golden_attention_swa_forward(tensors, start_pos=0)
 
 
-def golden_attention_swa_decode(tensors):
-    _golden_attention_swa(tensors, decode=True)
+def golden_attention_swa_decode(tensors, start_pos: int = DEFAULT_DECODE_START_POS):
+    if start_pos <= 0:
+        raise ValueError(f"decode start_pos must be positive, got {start_pos}")
+    golden_attention_swa_forward(tensors, start_pos=start_pos)
 
 
 def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
@@ -520,7 +532,14 @@ def main() -> int:
     if args.case in ("all", "prefill"):
         cases.append(("swa-prefill", attention_swa_prefill_test, lambda: build_swa_prefill_specs(args.seq_len), golden_attention_swa_prefill))
     if args.case in ("all", "decode"):
-        cases.append(("swa-decode", attention_swa_decode_test, lambda: build_swa_decode_specs(args.decode_start_pos), golden_attention_swa_decode))
+        cases.append(
+            (
+                "swa-decode",
+                attention_swa_decode_test,
+                lambda: build_swa_decode_specs(args.decode_start_pos),
+                lambda tensors: golden_attention_swa_forward(tensors, start_pos=args.decode_start_pos),
+            )
+        )
 
     failed = False
     for name, fn, build_specs, golden_fn in cases:
@@ -564,6 +583,7 @@ __all__ = [
     "attention_swa_decode_fwd",
     "attention_swa_prefill_test",
     "attention_swa_decode_test",
+    "golden_attention_swa_forward",
     "golden_attention_swa_prefill",
     "golden_attention_swa_decode",
     "build_swa_prefill_specs",

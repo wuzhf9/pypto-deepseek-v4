@@ -256,7 +256,7 @@ def test_attention_swa_prefill_golden_matches_official_model(tiny_args, seq_len:
     tensors = _base_tensors(attn, x, start_pos=0)
     _add_output_tensors(tensors, tiny_args, seq_len=x.shape[1])
 
-    attention_swa.golden_attention_swa_prefill(tensors)
+    attention_swa.golden_attention_swa_forward(tensors, start_pos=0)
 
     torch.testing.assert_close(tensors["out"], expected, rtol=0, atol=0)
     torch.testing.assert_close(tensors["kv_cache_out"], attn.kv_cache, rtol=0, atol=0)
@@ -277,7 +277,7 @@ def test_attention_swa_decode_golden_matches_official_model(tiny_args) -> None:
     tensors["cache_pos"] = torch.tensor([prompt_len % tiny_args.window_size], dtype=torch.int32)
     _add_output_tensors(tensors, tiny_args, seq_len=1)
 
-    attention_swa.golden_attention_swa_decode(tensors)
+    attention_swa.golden_attention_swa_forward(tensors, start_pos=prompt_len)
 
     torch.testing.assert_close(tensors["out"], expected, rtol=0, atol=0)
     torch.testing.assert_close(tensors["kv_cache_out"], attn.kv_cache, rtol=0, atol=0)

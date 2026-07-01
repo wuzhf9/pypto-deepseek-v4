@@ -49,6 +49,7 @@ _install_pypto_language_stub()
 from models.config import FLASH_CONFIG as M  # noqa: E402
 from models.rope import (  # noqa: E402
     _apply_rope_golden,
+    materialize_compressor_rope,
     precompute_freqs_cos_sin,
 )
 
@@ -154,6 +155,37 @@ def test_rope_tables_match_official_freqs_cis(compress_ratio: int) -> None:
     assert sin.dtype == torch.float32
     torch.testing.assert_close(cos, freqs_cis.real, rtol=0, atol=0)
     torch.testing.assert_close(sin, freqs_cis.imag, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("seq_len", [1, M.window_size - 1, M.window_size, M.window_size * 2 + 13])
+def test_materialize_compressor_rope_matches_official_slice(seq_len: int, ratio: int) -> None:
+    base = M.compress_rope_theta
+    original_seq_len = M.original_seq_len
+    cos, sin = precompute_freqs_cos_sin(
+        M.rope_head_dim,
+        seq_len,
+        original_seq_len,
+        base,
+        M.rope_factor,
+        M.beta_fast,
+        M.beta_slow,
+    )
+    freqs_cis = _official_freqs_cis(
+        M.rope_head_dim,
+        seq_len,
+        original_seq_len,
+        base,
+        M.rope_factor,
+        M.beta_fast,
+        M.beta_slow,
+    )
+    cutoff = seq_len - seq_len % ratio
+
+    actual_cos, actual_sin = materialize_compressor_rope(cos, sin, seq_len, ratio)
+
+    torch.testing.assert_close(actual_cos, freqs_cis[:cutoff:ratio].real.contiguous(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_sin, freqs_cis[:cutoff:ratio].imag.contiguous(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

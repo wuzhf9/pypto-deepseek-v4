@@ -139,6 +139,21 @@ def materialize_rope_range(
     return freqs_cos[start_pos:end_pos].contiguous(), freqs_sin[start_pos:end_pos].contiguous()
 
 
+def materialize_compressor_rope(
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+    seq_len: int,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slice compressor prefill RoPE tables matching ``freqs_cis[:cutoff:ratio]``."""
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if ratio <= 0:
+        raise ValueError(f"ratio must be positive, got {ratio}")
+    cutoff = seq_len - seq_len % ratio
+    return freqs_cos[:cutoff:ratio].contiguous(), freqs_sin[:cutoff:ratio].contiguous()
+
+
 @pl.jit.inline
 def rope_3d_512_fwd(
     x: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
@@ -673,6 +688,7 @@ __all__ = [
     "precompute_freqs_cos_sin",
     "build_deepseek_v4_rope_tables",
     "materialize_rope_range",
+    "materialize_compressor_rope",
     "rope_3d_512_fwd",
     "rope_3d_128_fwd",
     "rope_4d_512_fwd",
