@@ -13,6 +13,10 @@ N_HEADS = M.n_heads
 HEAD_DIM = M.head_dim
 WINDOW_SIZE = M.window_size
 TOPK_SWA = WINDOW_SIZE
+HCA_COMPRESS_RATIO = 128
+HCA_MAX_POSITION_EMBEDDINGS = 4096
+TOPK_HCA = HCA_MAX_POSITION_EMBEDDINGS // HCA_COMPRESS_RATIO
+TOPK_HCA_TOTAL = TOPK_SWA + TOPK_HCA
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 NEG_INF = -3.4028234663852886e38
 
@@ -106,6 +110,91 @@ def sparse_attn_swa_test(
     return out
 
 
+@pl.jit.inline
+def sparse_attn_hca_fwd(
+    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[N_HEADS], pl.FP32],
+    topk_idxs: pl.Tensor[[B, S_DYN, TOPK_HCA_TOTAL], pl.INT32],
+    out: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+):
+    """HCA sparse attention with window and compressed indices."""
+    q.bind_dynamic(1, S_DYN)
+    kv.bind_dynamic(1, K_DYN)
+    topk_idxs.bind_dynamic(1, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(q, 1)
+    kv_len = pl.tensor.dim(kv, 1)
+    q_flat = pl.reshape(q, [tokens * N_HEADS, HEAD_DIM])
+    kv_flat = pl.reshape(kv, [kv_len, HEAD_DIM])
+    topk_flat = pl.reshape(topk_idxs, [tokens, TOPK_HCA_TOTAL])
+    out_flat = pl.reshape(out, [tokens * N_HEADS, HEAD_DIM])
+
+    for t in pl.range(tokens):
+        sparse_kv = pl.create_tensor([TOPK_HCA_TOTAL, HEAD_DIM], dtype=pl.BF16)
+        sparse_bias = pl.create_tensor([1, TOPK_HCA_TOTAL], dtype=pl.FP32)
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sparse_attn_hca_gather"):
+            sparse_kv[0:TOPK_HCA_TOTAL, 0:HEAD_DIM] = pl.full(
+                [TOPK_HCA_TOTAL, HEAD_DIM], dtype=pl.BF16, value=0.0
+            )
+            topk_row = topk_flat[t : t + 1, 0:TOPK_HCA_TOTAL]
+            topk_fp32 = pl.cast(topk_row, target_type=pl.FP32)
+            valid_flag = pl.minimum(pl.maximum(pl.add(topk_fp32, 1.0), 0.0), 1.0)
+            sparse_bias[0:1, 0:TOPK_HCA_TOTAL] = pl.mul(pl.sub(valid_flag, 1.0), -NEG_INF)
+
+            for ki in pl.range(TOPK_HCA_TOTAL):
+                raw = pl.read(topk_flat, [t, ki])
+                if raw >= 0:
+                    if raw < kv_len:
+                        src = pl.cast(raw, pl.INDEX)
+                        sparse_kv[ki : ki + 1, 0:HEAD_DIM] = kv_flat[src : src + 1, 0:HEAD_DIM]
+
+        for hb in pl.spmd(N_HEADS // H_TILE, name_hint="sparse_attn_topk160"):
+            h0 = hb * H_TILE
+            out_row = t * N_HEADS + h0
+
+            q_tile = q_flat[out_row : out_row + H_TILE, 0:HEAD_DIM]
+            qk_raw = pl.matmul(q_tile, sparse_kv, b_trans=True, out_dtype=pl.FP32)
+            qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+            qk_scores = pl.add(
+                qk_scaled,
+                pl.col_expand(pl.full([H_TILE, TOPK_HCA_TOTAL], dtype=pl.FP32, value=0.0), sparse_bias),
+            )
+            sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
+            qk_mi = pl.maximum(pl.row_max(qk_scores), sink_bias)
+            qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+            qk_li = pl.row_sum(qk_exp)
+
+            denom = pl.add(qk_li, pl.exp(pl.sub(sink_bias, qk_mi)))
+            for db in pl.range(HEAD_D_BLOCKS):
+                d0 = db * SPARSE_D_TILE
+                kv_value_tile = pl.cast(
+                    sparse_kv[0:TOPK_HCA_TOTAL, d0 : d0 + SPARSE_D_TILE],
+                    target_type=pl.FP32,
+                )
+                qk_oi = pl.matmul(qk_exp, kv_value_tile, out_dtype=pl.FP32)
+                out_fp32 = pl.row_expand_div(qk_oi, denom)
+                out_bf16 = pl.cast(out_fp32, target_type=pl.BF16, mode="rint")
+
+                out_flat[out_row : out_row + H_TILE, d0 : d0 + SPARSE_D_TILE] = out_bf16
+
+    return pl.reshape(out_flat, [B, tokens, N_HEADS, HEAD_DIM])
+
+
+@pl.jit
+def sparse_attn_hca_test(
+    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[N_HEADS], pl.FP32],
+    topk_idxs: pl.Tensor[[B, S_DYN, TOPK_HCA_TOTAL], pl.INT32],
+    out: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
+):
+    out = sparse_attn_hca_fwd(q, kv, attn_sink, topk_idxs, out)
+    return out
+
+
 def golden_sparse_attn(tensors):
     """Torch reference matching ``low_vram_kernels.py::sparse_attn_torch``."""
     import torch
@@ -167,6 +256,52 @@ def build_window_topk_idxs(seq_len: int, start_pos: int = 0, topk_max: int = TOP
     return topk
 
 
+def build_compress_topk_idxs(
+    ratio: int,
+    seq_len: int,
+    start_pos: int,
+    offset: int,
+    topk_max: int = TOPK_HCA,
+):
+    """Build fixed-width compressed topk indices matching official semantics.
+
+    The official ``get_compress_topk_idxs`` returns a variable-width matrix.
+    PyPTO kernels need a static ``TOPK`` width, so this helper first builds the
+    exact official matrix and then pads the final dimension with ``-1``.
+    """
+    import torch
+
+    if ratio <= 0:
+        raise ValueError(f"ratio must be positive, got {ratio}")
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if start_pos < 0:
+        raise ValueError(f"start_pos must be non-negative, got {start_pos}")
+    if offset < 0:
+        raise ValueError(f"offset must be non-negative, got {offset}")
+    if topk_max < 0:
+        raise ValueError(f"topk_max must be non-negative, got {topk_max}")
+
+    if start_pos > 0:
+        if seq_len != 1:
+            raise ValueError(f"decode-style compress topk expects seq_len=1, got {seq_len}")
+        matrix = torch.arange(0, (start_pos + 1) // ratio, dtype=torch.int32) + offset
+        matrix = matrix.view(1, -1)
+    else:
+        matrix = torch.arange(seq_len // ratio, dtype=torch.int32).repeat(seq_len, 1)
+        mask = matrix >= torch.arange(1, seq_len + 1, dtype=torch.int32).unsqueeze(1) // ratio
+        matrix = torch.where(mask, torch.full_like(matrix, -1), matrix + offset)
+
+    actual_topk = matrix.shape[1]
+    if actual_topk > topk_max:
+        raise ValueError(f"topk_max={topk_max} is smaller than required compressed topk={actual_topk}")
+
+    topk = torch.full((B, matrix.shape[0], topk_max), -1, dtype=torch.int32)
+    if actual_topk > 0:
+        topk[:, :, :actual_topk] = matrix.unsqueeze(0).expand(B, -1, -1)
+    return topk
+
+
 def _build_tensor_specs(seq_len: int, kv_len: int, topk_max: int, topk_init):
     import torch
 
@@ -208,6 +343,50 @@ def build_swa_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
     )
 
 
+def build_hca_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    import torch
+
+    def init_topk():
+        window_topk = build_window_topk_idxs(seq_len, start_pos=0, topk_max=TOPK_SWA)
+        compress_topk = build_compress_topk_idxs(
+            HCA_COMPRESS_RATIO,
+            seq_len,
+            start_pos=0,
+            offset=seq_len,
+            topk_max=TOPK_HCA,
+        )
+        return torch.cat([window_topk, compress_topk], dim=-1)
+
+    return _build_tensor_specs(
+        seq_len,
+        seq_len + seq_len // HCA_COMPRESS_RATIO,
+        TOPK_SWA + TOPK_HCA,
+        init_topk,
+    )
+
+
+def build_hca_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
+    import torch
+
+    def init_topk():
+        window_topk = build_window_topk_idxs(1, start_pos=start_pos, topk_max=TOPK_SWA)
+        compress_topk = build_compress_topk_idxs(
+            HCA_COMPRESS_RATIO,
+            1,
+            start_pos=start_pos,
+            offset=WINDOW_SIZE,
+            topk_max=TOPK_HCA,
+        )
+        return torch.cat([window_topk, compress_topk], dim=-1)
+
+    return _build_tensor_specs(
+        1,
+        WINDOW_SIZE + TOPK_HCA,
+        TOPK_SWA + TOPK_HCA,
+        init_topk,
+    )
+
+
 def main() -> int:
     import argparse
 
@@ -225,6 +404,8 @@ def main() -> int:
     cases = [
         ("swa-prefill", sparse_attn_swa_test, lambda: build_swa_prefill_specs(args.seq_len)),
         ("swa-decode", sparse_attn_swa_test, lambda: build_swa_decode_specs(args.decode_start_pos)),
+        ("hca-prefill", sparse_attn_hca_test, lambda: build_hca_prefill_specs(args.seq_len)),
+        ("hca-decode", sparse_attn_hca_test, lambda: build_hca_decode_specs(args.decode_start_pos)),
     ]
     runtime_cfg = {
         "platform": args.platform,
@@ -266,14 +447,23 @@ __all__ = [
     "HEAD_DIM",
     "WINDOW_SIZE",
     "TOPK_SWA",
+    "HCA_COMPRESS_RATIO",
+    "HCA_MAX_POSITION_EMBEDDINGS",
+    "TOPK_HCA",
+    "TOPK_HCA_TOTAL",
     "SOFTMAX_SCALE",
     "NEG_INF",
     "H_TILE",
     "DEFAULT_SEQ_LEN",
     "sparse_attn_swa_fwd",
     "sparse_attn_swa_test",
+    "sparse_attn_hca_fwd",
+    "sparse_attn_hca_test",
     "golden_sparse_attn",
     "build_window_topk_idxs",
+    "build_compress_topk_idxs",
     "build_swa_prefill_specs",
     "build_swa_decode_specs",
+    "build_hca_prefill_specs",
+    "build_hca_decode_specs",
 ]
