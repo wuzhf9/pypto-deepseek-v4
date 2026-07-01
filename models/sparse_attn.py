@@ -13,6 +13,11 @@ N_HEADS = M.n_heads
 HEAD_DIM = M.head_dim
 WINDOW_SIZE = M.window_size
 TOPK_SWA = WINDOW_SIZE
+CSA_COMPRESS_RATIO = 4
+TOPK_CSA = M.index_topk
+TOPK_CSA_TOTAL = TOPK_SWA + TOPK_CSA
+TOPK_CSA_TILE = 16
+TOPK_CSA_BLOCKS = TOPK_CSA_TOTAL // TOPK_CSA_TILE
 HCA_COMPRESS_RATIO = 128
 HCA_MAX_POSITION_EMBEDDINGS = 4096
 TOPK_HCA = HCA_MAX_POSITION_EMBEDDINGS // HCA_COMPRESS_RATIO
@@ -23,6 +28,8 @@ NEG_INF = -3.4028234663852886e38
 H_TILE = 16
 SPARSE_D_TILE = 32
 HEAD_D_BLOCKS = HEAD_DIM // SPARSE_D_TILE
+SPARSE_D_TILE_CSA = 32
+HEAD_D_BLOCKS_CSA = HEAD_DIM // SPARSE_D_TILE_CSA
 DEFAULT_SEQ_LEN = 8
 DEFAULT_DECODE_START_POS = 1
 
@@ -195,6 +202,105 @@ def sparse_attn_hca_test(
     return out
 
 
+@pl.jit.inline
+def sparse_attn_csa_fwd(
+    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[N_HEADS], pl.FP32],
+    topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
+    out: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+):
+    """CSA sparse attention with window and indexer-selected indices."""
+    q.bind_dynamic(1, S_DYN)
+    kv.bind_dynamic(1, K_DYN)
+    topk_idxs.bind_dynamic(1, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(q, 1)
+    kv_len = pl.tensor.dim(kv, 1)
+    q_flat = pl.reshape(q, [tokens * N_HEADS, HEAD_DIM])
+    kv_flat = pl.reshape(kv, [kv_len, HEAD_DIM])
+    topk_flat = pl.reshape(topk_idxs, [tokens, TOPK_CSA_TOTAL])
+    out_flat = pl.reshape(out, [tokens * N_HEADS, HEAD_DIM])
+
+    for t in pl.range(tokens):
+        for hb in pl.spmd(N_HEADS // H_TILE, name_hint="sparse_attn_topk640"):
+            h0 = hb * H_TILE
+            out_row = t * N_HEADS + h0
+            q_tile = q_flat[out_row : out_row + H_TILE, 0:HEAD_DIM]
+
+            sparse_kv = pl.create_tensor([TOPK_CSA_TILE, HEAD_DIM], dtype=pl.BF16)
+            sparse_bias = pl.create_tensor([1, TOPK_CSA_TILE], dtype=pl.FP32)
+            sparse_value = pl.create_tensor([TOPK_CSA_TILE, SPARSE_D_TILE_CSA], dtype=pl.BF16)
+
+            for db in pl.range(HEAD_D_BLOCKS_CSA):
+                d0 = db * SPARSE_D_TILE_CSA
+                sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
+                qk_mi = sink_bias
+                denom = pl.exp(pl.sub(sink_bias, sink_bias))
+                out_num = pl.full([H_TILE, SPARSE_D_TILE_CSA], dtype=pl.FP32, value=0.0)
+
+                for cb in pl.range(TOPK_CSA_BLOCKS):
+                    k_base = cb * TOPK_CSA_TILE
+                    sparse_kv[0:TOPK_CSA_TILE, 0:HEAD_DIM] = pl.full(
+                        [TOPK_CSA_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0
+                    )
+                    sparse_value[0:TOPK_CSA_TILE, 0:SPARSE_D_TILE_CSA] = pl.full(
+                        [TOPK_CSA_TILE, SPARSE_D_TILE_CSA], dtype=pl.BF16, value=0.0
+                    )
+                    topk_row = topk_flat[t : t + 1, k_base : k_base + TOPK_CSA_TILE]
+                    topk_fp32 = pl.cast(topk_row, target_type=pl.FP32)
+                    valid_flag = pl.minimum(pl.maximum(pl.add(topk_fp32, 1.0), 0.0), 1.0)
+                    sparse_bias[0:1, 0:TOPK_CSA_TILE] = pl.mul(pl.sub(valid_flag, 1.0), -NEG_INF)
+
+                    for ki in pl.range(TOPK_CSA_TILE):
+                        raw = pl.read(topk_flat, [t, k_base + ki])
+                        if raw >= 0:
+                            if raw < kv_len:
+                                src = pl.cast(raw, pl.INDEX)
+                                sparse_kv[ki : ki + 1, 0:HEAD_DIM] = kv_flat[src : src + 1, 0:HEAD_DIM]
+                                value_row = pl.slice(kv_flat, [1, SPARSE_D_TILE_CSA], [src, d0])
+                                sparse_value[ki : ki + 1, 0:SPARSE_D_TILE_CSA] = value_row
+
+                    qk_raw = pl.matmul(q_tile, sparse_kv, b_trans=True, out_dtype=pl.FP32)
+                    qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                    qk_scores = pl.add(
+                        qk_scaled,
+                        pl.col_expand(
+                            pl.full([H_TILE, TOPK_CSA_TILE], dtype=pl.FP32, value=0.0),
+                            sparse_bias,
+                        ),
+                    )
+                    chunk_mi = pl.row_max(qk_scores)
+                    new_mi = pl.maximum(qk_mi, chunk_mi)
+                    alpha = pl.exp(pl.sub(qk_mi, new_mi))
+                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, new_mi))
+                    denom = pl.add(pl.mul(denom, alpha), pl.row_sum(qk_exp))
+                    kv_value_tile = pl.cast(sparse_value, target_type=pl.FP32)
+                    qk_oi = pl.matmul(qk_exp, kv_value_tile, out_dtype=pl.FP32)
+                    out_num = pl.add(pl.row_expand_mul(out_num, alpha), qk_oi)
+                    qk_mi = new_mi
+
+                out_fp32 = pl.row_expand_div(out_num, denom)
+                out_bf16 = pl.cast(out_fp32, target_type=pl.BF16, mode="rint")
+
+                out_flat[out_row : out_row + H_TILE, d0 : d0 + SPARSE_D_TILE_CSA] = out_bf16
+
+    return pl.reshape(out_flat, [B, tokens, N_HEADS, HEAD_DIM])
+
+
+@pl.jit
+def sparse_attn_csa_test(
+    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[N_HEADS], pl.FP32],
+    topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
+    out: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
+):
+    out = sparse_attn_csa_fwd(q, kv, attn_sink, topk_idxs, out)
+    return out
+
+
 def golden_sparse_attn(tensors):
     """Torch reference matching ``low_vram_kernels.py::sparse_attn_torch``."""
     import torch
@@ -302,6 +408,48 @@ def build_compress_topk_idxs(
     return topk
 
 
+def build_csa_synthetic_topk_idxs(
+    seq_len: int,
+    start_pos: int = 0,
+    offset: int | None = None,
+):
+    """Build fixed-width CSA topk indices without depending on Indexer.
+
+    The window part follows the official ``get_window_topk_idxs`` semantics.
+    The compressed part is a deterministic stand-in for Indexer output: it
+    selects visible compressed KV slots in ascending order and pads to
+    ``INDEX_TOPK`` with ``-1``.
+    """
+    import torch
+
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if start_pos < 0:
+        raise ValueError(f"start_pos must be non-negative, got {start_pos}")
+    if start_pos > 0 and seq_len != 1:
+        raise ValueError(f"decode-style CSA topk expects seq_len=1, got {seq_len}")
+
+    if offset is None:
+        offset = seq_len if start_pos == 0 else WINDOW_SIZE
+    if offset < 0:
+        raise ValueError(f"offset must be non-negative, got {offset}")
+
+    window_topk = build_window_topk_idxs(seq_len, start_pos=start_pos, topk_max=TOPK_SWA)
+    compress_topk = torch.full((B, seq_len, TOPK_CSA), -1, dtype=torch.int32)
+
+    if start_pos > 0:
+        visible_blocks = min(TOPK_CSA, (start_pos + 1) // CSA_COMPRESS_RATIO)
+        if visible_blocks > 0:
+            compress_topk[0, 0, :visible_blocks] = torch.arange(visible_blocks, dtype=torch.int32) + offset
+    else:
+        for t in range(seq_len):
+            visible_blocks = min(TOPK_CSA, (t + 1) // CSA_COMPRESS_RATIO)
+            if visible_blocks > 0:
+                compress_topk[0, t, :visible_blocks] = torch.arange(visible_blocks, dtype=torch.int32) + offset
+
+    return torch.cat([window_topk, compress_topk], dim=-1)
+
+
 def _build_tensor_specs(seq_len: int, kv_len: int, topk_max: int, topk_init):
     import torch
 
@@ -360,7 +508,7 @@ def build_hca_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return _build_tensor_specs(
         seq_len,
         seq_len + seq_len // HCA_COMPRESS_RATIO,
-        TOPK_SWA + TOPK_HCA,
+        TOPK_HCA_TOTAL,
         init_topk,
     )
 
@@ -382,8 +530,26 @@ def build_hca_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
     return _build_tensor_specs(
         1,
         WINDOW_SIZE + TOPK_HCA,
-        TOPK_SWA + TOPK_HCA,
+        TOPK_HCA_TOTAL,
         init_topk,
+    )
+
+
+def build_csa_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(
+        seq_len,
+        seq_len + seq_len // CSA_COMPRESS_RATIO,
+        TOPK_CSA_TOTAL,
+        lambda: build_csa_synthetic_topk_idxs(seq_len, start_pos=0, offset=seq_len),
+    )
+
+
+def build_csa_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
+    return _build_tensor_specs(
+        1,
+        WINDOW_SIZE + min(TOPK_CSA, (start_pos + 1) // CSA_COMPRESS_RATIO),
+        TOPK_CSA_TOTAL,
+        lambda: build_csa_synthetic_topk_idxs(1, start_pos=start_pos, offset=WINDOW_SIZE),
     )
 
 
@@ -404,6 +570,8 @@ def main() -> int:
     cases = [
         ("swa-prefill", sparse_attn_swa_test, lambda: build_swa_prefill_specs(args.seq_len)),
         ("swa-decode", sparse_attn_swa_test, lambda: build_swa_decode_specs(args.decode_start_pos)),
+        ("csa-prefill", sparse_attn_csa_test, lambda: build_csa_prefill_specs(args.seq_len)),
+        ("csa-decode", sparse_attn_csa_test, lambda: build_csa_decode_specs(args.decode_start_pos)),
         ("hca-prefill", sparse_attn_hca_test, lambda: build_hca_prefill_specs(args.seq_len)),
         ("hca-decode", sparse_attn_hca_test, lambda: build_hca_decode_specs(args.decode_start_pos)),
     ]
@@ -447,6 +615,9 @@ __all__ = [
     "HEAD_DIM",
     "WINDOW_SIZE",
     "TOPK_SWA",
+    "CSA_COMPRESS_RATIO",
+    "TOPK_CSA",
+    "TOPK_CSA_TOTAL",
     "HCA_COMPRESS_RATIO",
     "HCA_MAX_POSITION_EMBEDDINGS",
     "TOPK_HCA",
@@ -457,13 +628,18 @@ __all__ = [
     "DEFAULT_SEQ_LEN",
     "sparse_attn_swa_fwd",
     "sparse_attn_swa_test",
+    "sparse_attn_csa_fwd",
+    "sparse_attn_csa_test",
     "sparse_attn_hca_fwd",
     "sparse_attn_hca_test",
     "golden_sparse_attn",
     "build_window_topk_idxs",
     "build_compress_topk_idxs",
+    "build_csa_synthetic_topk_idxs",
     "build_swa_prefill_specs",
     "build_swa_decode_specs",
+    "build_csa_prefill_specs",
+    "build_csa_decode_specs",
     "build_hca_prefill_specs",
     "build_hca_decode_specs",
 ]
