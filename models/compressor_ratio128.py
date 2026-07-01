@@ -4,6 +4,7 @@ import pypto.language as pl
 
 from models.common import assert_divisible
 from models.config import FLASH_CONFIG as M
+from models.linear import linear_4096_to_512_fp32
 from models.rope import (
     _apply_rope_golden,
     build_deepseek_v4_rope_tables,
@@ -27,10 +28,6 @@ NEG_INF = -3.4028234663852886e38
 EPS = M.rms_norm_eps
 INV_HEAD_DIM = 1.0 / HEAD_DIM
 
-T_TILE = 16
-K_TILE = 128
-O_TILE = 32
-OUT_GROUP = 2
 HEAD_CHUNK = 64
 HEAD_CHUNKS = HEAD_DIM // HEAD_CHUNK
 RMS_T_TILE = 8
@@ -41,60 +38,9 @@ ROPE_PREFIX_TILE = 64
 DEFAULT_SEQ_LEN = 256
 DEFAULT_DECODE_START_POS = COMPRESS_RATIO - 1
 
-assert_divisible(HIDDEN, K_TILE, "compressor ratio128 hidden input size")
-assert_divisible(HEAD_DIM, O_TILE, "compressor ratio128 projection output size")
-assert_divisible(HEAD_DIM // O_TILE, OUT_GROUP, "compressor ratio128 output blocks")
 assert_divisible(HEAD_DIM, HEAD_CHUNK, "compressor ratio128 head chunks")
 assert_divisible(HEAD_DIM, RMS_D_TILE, "compressor ratio128 RMSNorm size")
 assert_divisible(HEAD_TAIL_OFFSET, ROPE_PREFIX_TILE, "compressor ratio128 RoPE prefix")
-
-HIDDEN_K_BLOCKS = HIDDEN // K_TILE
-HEAD_DIM_O_BLOCKS = HEAD_DIM // O_TILE
-
-
-@pl.jit.inline
-def linear_4096_to_512_fp32(
-    x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    weight_t: pl.Tensor[[HIDDEN, HEAD_DIM], pl.BF16],
-    out: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-):
-    """Compute ``x @ weight_t`` and keep the projection in FP32."""
-    x.bind_dynamic(1, S_DYN)
-    out.bind_dynamic(1, S_DYN)
-
-    tokens = pl.tensor.dim(x, 1)
-    x_flat = pl.reshape(x, [tokens, HIDDEN])
-    out_flat = pl.reshape(out, [tokens, HEAD_DIM])
-    token_blocks = (tokens + T_TILE - 1) // T_TILE
-
-    for tb in pl.range(token_blocks):
-        t0 = tb * T_TILE
-        valid_tok = pl.min(T_TILE, tokens - t0)
-        out_tile_fp32 = pl.create_tensor([T_TILE, HEAD_DIM], dtype=pl.FP32)
-
-        for og_idx in pl.spmd(HEAD_DIM_O_BLOCKS // OUT_GROUP, name_hint="compressor_c128_linear_fp32"):
-            og = og_idx * OUT_GROUP
-            for o_inner in pl.pipeline(OUT_GROUP, stage=2):
-                o0 = (og + o_inner) * O_TILE
-                x0 = pl.slice(x_flat, [T_TILE, K_TILE], [t0, 0], valid_shape=[valid_tok, K_TILE])
-                w0 = pl.slice(weight_t, [K_TILE, O_TILE], [0, o0])
-                acc = pl.matmul(x0, w0, out_dtype=pl.FP32)
-                for kb in pl.pipeline(1, HIDDEN_K_BLOCKS, stage=2):
-                    k0 = kb * K_TILE
-                    xk = pl.slice(x_flat, [T_TILE, K_TILE], [t0, k0], valid_shape=[valid_tok, K_TILE])
-                    wk = pl.slice(weight_t, [K_TILE, O_TILE], [k0, o0])
-                    acc = pl.matmul_acc(acc, xk, wk)
-                out_tile_fp32[:, o0 : o0 + O_TILE] = acc
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c128_linear_fp32_write"):
-            for ob in pl.range(HEAD_DIM_O_BLOCKS):
-                o0 = ob * O_TILE
-                out_tile = out_tile_fp32[:, o0 : o0 + O_TILE]
-                for row in pl.range(valid_tok):
-                    linear_out_row = pl.slice(out_tile, [1, O_TILE], [row, 0])
-                    out_flat = pl.assemble(out_flat, linear_out_row, [t0 + row, o0])
-
-    return pl.reshape(out_flat, [B, tokens, HEAD_DIM])
 
 @pl.jit.inline
 def compressor_ratio128_prefill_fwd(
@@ -885,7 +831,6 @@ __all__ = [
     "NEG_INF",
     "DEFAULT_SEQ_LEN",
     "DEFAULT_DECODE_START_POS",
-    "linear_4096_to_512_fp32",
     "compressor_ratio128_prefill_fwd",
     "compressor_ratio128_prefill_test",
     "compressor_ratio128_decode_fwd",

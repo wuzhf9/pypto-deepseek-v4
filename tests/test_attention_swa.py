@@ -85,7 +85,7 @@ def _make_linear_reference():
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert bias is None
-        return torch.matmul(x.float(), weight.t().float()).to(x.dtype)
+        return torch.matmul(x.float(), weight.t().contiguous().float()).to(x.dtype)
 
     return linear
 
