@@ -104,15 +104,61 @@ def compressor_ratio4_indexer_prefill_fwd(
     score_state_flat = pl.reshape(score_state_out, [STATE_ROWS, INDEX_PROJ_DIM])
     cache_flat = pl.reshape(compressed_cache_out, [TOPK_CSA_COMPRESSED, INDEX_HEAD_DIM])
 
-    for row in pl.spmd(STATE_ROWS, name_hint="compressor_c4_index_state_init"):
+    for row in pl.spmd(STATE_ROWS, name_hint="compressor_c4_index_state_write"):
         for hb in pl.pipeline(INDEX_PROJ_CHUNKS, stage=2):
             h0 = hb * HEAD_CHUNK
-            kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
-                [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
-            )
-            score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
-                [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
-            )
+            if should_compress:
+                if row < COMPRESS_RATIO:
+                    src = cutoff - COMPRESS_RATIO + row
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                        src : src + 1, h0 : h0 + HEAD_CHUNK
+                    ]
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                        score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
+                        ape[row : row + 1, h0 : h0 + HEAD_CHUNK],
+                    )
+                elif row < COMPRESS_RATIO + remainder:
+                    rem = row - COMPRESS_RATIO
+                    src = cutoff + rem
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                        src : src + 1, h0 : h0 + HEAD_CHUNK
+                    ]
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                        score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
+                        ape[rem : rem + 1, h0 : h0 + HEAD_CHUNK],
+                    )
+                else:
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                        [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
+                    )
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                        [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
+                    )
+            elif row >= COMPRESS_RATIO:
+                rem = row - COMPRESS_RATIO
+                if rem < remainder:
+                    src = cutoff + rem
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                        src : src + 1, h0 : h0 + HEAD_CHUNK
+                    ]
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                        score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
+                        ape[rem : rem + 1, h0 : h0 + HEAD_CHUNK],
+                    )
+                else:
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                        [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
+                    )
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                        [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
+                    )
+            else:
+                kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
+                )
+                score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
+                )
 
     for cache_row in pl.spmd(TOPK_CSA_COMPRESSED, name_hint="compressor_c4_index_cache_init"):
         for hb in pl.pipeline(INDEX_HEAD_CHUNKS, stage=2):
@@ -120,35 +166,6 @@ def compressor_ratio4_indexer_prefill_fwd(
             cache_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
                 [1, HEAD_CHUNK], dtype=pl.BF16, value=0.0
             )
-
-    if should_compress:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c4_index_overlap_state"):
-            last_block = cutoff - COMPRESS_RATIO
-            for r in pl.range(COMPRESS_RATIO):
-                src = last_block + r
-                for hb in pl.range(INDEX_PROJ_CHUNKS):
-                    h0 = hb * HEAD_CHUNK
-                    kv_state_flat[r : r + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
-                        src : src + 1, h0 : h0 + HEAD_CHUNK
-                    ]
-                    score_state_flat[r : r + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
-                        score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
-                        ape[r : r + 1, h0 : h0 + HEAD_CHUNK],
-                    )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c4_index_remainder_state"):
-        for r in pl.range(remainder):
-            src = cutoff + r
-            dst = COMPRESS_RATIO + r
-            for hb in pl.range(INDEX_PROJ_CHUNKS):
-                h0 = hb * HEAD_CHUNK
-                kv_state_flat[dst : dst + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
-                    src : src + 1, h0 : h0 + HEAD_CHUNK
-                ]
-                score_state_flat[dst : dst + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
-                    score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
-                    ape[r : r + 1, h0 : h0 + HEAD_CHUNK],
-                )
 
     if should_compress:
         for block in pl.range(blocks):
@@ -699,15 +716,61 @@ def compressor_ratio4_attention_prefill_fwd(
     score_state_flat = pl.reshape(score_state_out, [STATE_ROWS, ATTN_PROJ_DIM])
     cache_flat = pl.reshape(compressed_cache_out, [TOPK_CSA_COMPRESSED, ATTN_HEAD_DIM])
 
-    for row in pl.spmd(STATE_ROWS, name_hint="compressor_c4_attn_state_init"):
+    for row in pl.spmd(STATE_ROWS, name_hint="compressor_c4_attn_state_write"):
         for hb in pl.pipeline(ATTN_PROJ_CHUNKS, stage=2):
             h0 = hb * HEAD_CHUNK
-            kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
-                [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
-            )
-            score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
-                [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
-            )
+            if should_compress:
+                if row < COMPRESS_RATIO:
+                    src = cutoff - COMPRESS_RATIO + row
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                        src : src + 1, h0 : h0 + HEAD_CHUNK
+                    ]
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                        score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
+                        ape[row : row + 1, h0 : h0 + HEAD_CHUNK],
+                    )
+                elif row < COMPRESS_RATIO + remainder:
+                    rem = row - COMPRESS_RATIO
+                    src = cutoff + rem
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                        src : src + 1, h0 : h0 + HEAD_CHUNK
+                    ]
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                        score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
+                        ape[rem : rem + 1, h0 : h0 + HEAD_CHUNK],
+                    )
+                else:
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                        [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
+                    )
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                        [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
+                    )
+            elif row >= COMPRESS_RATIO:
+                rem = row - COMPRESS_RATIO
+                if rem < remainder:
+                    src = cutoff + rem
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                        src : src + 1, h0 : h0 + HEAD_CHUNK
+                    ]
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                        score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
+                        ape[rem : rem + 1, h0 : h0 + HEAD_CHUNK],
+                    )
+                else:
+                    kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                        [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
+                    )
+                    score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                        [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
+                    )
+            else:
+                kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
+                )
+                score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
+                )
 
     for cache_row in pl.spmd(TOPK_CSA_COMPRESSED, name_hint="compressor_c4_attn_cache_init"):
         for hb in pl.pipeline(ATTN_HEAD_CHUNKS, stage=2):
@@ -715,35 +778,6 @@ def compressor_ratio4_attention_prefill_fwd(
             cache_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
                 [1, HEAD_CHUNK], dtype=pl.BF16, value=0.0
             )
-
-    if should_compress:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c4_attn_overlap_state"):
-            last_block = cutoff - COMPRESS_RATIO
-            for r in pl.range(COMPRESS_RATIO):
-                src = last_block + r
-                for hb in pl.range(ATTN_PROJ_CHUNKS):
-                    h0 = hb * HEAD_CHUNK
-                    kv_state_flat[r : r + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
-                        src : src + 1, h0 : h0 + HEAD_CHUNK
-                    ]
-                    score_state_flat[r : r + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
-                        score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
-                        ape[r : r + 1, h0 : h0 + HEAD_CHUNK],
-                    )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c4_attn_remainder_state"):
-        for r in pl.range(remainder):
-            src = cutoff + r
-            dst = COMPRESS_RATIO + r
-            for hb in pl.range(ATTN_PROJ_CHUNKS):
-                h0 = hb * HEAD_CHUNK
-                kv_state_flat[dst : dst + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
-                    src : src + 1, h0 : h0 + HEAD_CHUNK
-                ]
-                score_state_flat[dst : dst + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
-                    score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
-                    ape[r : r + 1, h0 : h0 + HEAD_CHUNK],
-                )
 
     if should_compress:
         for block in pl.range(blocks):
@@ -1248,7 +1282,7 @@ def compressor_ratio4_attention_decode_test(
     return compressed, kv_state_out, score_state_out, compressed_cache_out
 
 
-def _golden_compressor_ratio4_forward(tensors, start_pos: int, *, head_dim: int, proj_dim: int, module_name: str):
+def golden_compressor_ratio4_forward(tensors, start_pos: int, *, head_dim: int, proj_dim: int, module_name: str):
     import torch
 
     x = tensors["x"]
@@ -1369,7 +1403,7 @@ def _golden_compressor_ratio4_forward(tensors, start_pos: int, *, head_dim: int,
 
 
 def golden_compressor_ratio4_indexer_forward(tensors, start_pos: int):
-    _golden_compressor_ratio4_forward(
+    golden_compressor_ratio4_forward(
         tensors,
         start_pos=start_pos,
         head_dim=INDEX_HEAD_DIM,
@@ -1379,7 +1413,7 @@ def golden_compressor_ratio4_indexer_forward(tensors, start_pos: int):
 
 
 def golden_compressor_ratio4_attention_forward(tensors, start_pos: int):
-    _golden_compressor_ratio4_forward(
+    golden_compressor_ratio4_forward(
         tensors,
         start_pos=start_pos,
         head_dim=ATTN_HEAD_DIM,
@@ -1809,6 +1843,7 @@ __all__ = [
     "compressor_ratio4_attention_prefill_test",
     "compressor_ratio4_attention_decode_fwd",
     "compressor_ratio4_attention_decode_test",
+    "golden_compressor_ratio4_forward",
     "golden_compressor_ratio4_indexer_forward",
     "golden_compressor_ratio4_indexer_prefill",
     "golden_compressor_ratio4_indexer_decode",

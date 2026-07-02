@@ -88,15 +88,25 @@ def compressor_ratio128_prefill_fwd(
     kv_state_flat = pl.reshape(kv_state_out, [COMPRESS_RATIO, HEAD_DIM])
     score_state_flat = pl.reshape(score_state_out, [COMPRESS_RATIO, HEAD_DIM])
 
-    for row in pl.spmd(COMPRESS_RATIO, name_hint="compressor_c128_state_init"):
+    for row in pl.spmd(COMPRESS_RATIO, name_hint="compressor_c128_state_write"):
         for hb in pl.pipeline(HEAD_CHUNKS, stage=2):
             h0 = hb * HEAD_CHUNK
-            kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
-                [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
-            )
-            score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
-                [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
-            )
+            if row < remainder:
+                src = cutoff + row
+                kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                    src : src + 1, h0 : h0 + HEAD_CHUNK
+                ]
+                score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                    score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
+                    ape[row : row + 1, h0 : h0 + HEAD_CHUNK],
+                )
+            else:
+                kv_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK], dtype=pl.FP32, value=0.0
+                )
+                score_state_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK], dtype=pl.FP32, value=NEG_INF
+                )
 
     for cache_row in pl.spmd(TOPK_HCA, name_hint="compressor_c128_cache_init"):
         for hb in pl.pipeline(HEAD_CHUNKS, stage=2):
@@ -104,19 +114,6 @@ def compressor_ratio128_prefill_fwd(
             cache_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = pl.full(
                 [1, HEAD_CHUNK], dtype=pl.BF16, value=0.0
             )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c128_remainder_state"):
-        for r in pl.range(remainder):
-            src = cutoff + r
-            for hb in pl.range(HEAD_CHUNKS):
-                h0 = hb * HEAD_CHUNK
-                kv_state_flat[r : r + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
-                    src : src + 1, h0 : h0 + HEAD_CHUNK
-                ]
-                score_state_flat[r : r + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
-                    score_proj_flat[src : src + 1, h0 : h0 + HEAD_CHUNK],
-                    ape[r : r + 1, h0 : h0 + HEAD_CHUNK],
-                )
 
     if should_compress:
         for block in pl.range(blocks):

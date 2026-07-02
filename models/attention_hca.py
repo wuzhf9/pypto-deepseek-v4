@@ -4,6 +4,7 @@ import pypto.language as pl
 
 from models.attention_out import attention_out_fwd
 from models.attention_qkv import attention_qkv_fwd
+from models.attention_swa import update_decode_window_cache, update_prefill_window_cache
 from models.compressor_ratio128 import (
     COMPRESS_RATIO,
     compressor_ratio128_decode_fwd,
@@ -49,59 +50,7 @@ DEFAULT_DECODE_START_POS = COMPRESS_RATIO - 1
 
 
 @pl.jit.inline
-def update_hca_prefill_cache(
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
-):
-    """Mirror the prefill window-cache update in ``Attention.forward``."""
-    kv.bind_dynamic(1, S_DYN)
-
-    tokens = pl.tensor.dim(kv, 1)
-    kv_flat = pl.reshape(kv, [tokens, HEAD_DIM])
-    cache_flat = pl.reshape(kv_cache_out, [WINDOW_SIZE, HEAD_DIM])
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_prefill_cache_write"):
-        if tokens <= WINDOW_SIZE:
-            for t in pl.range(tokens):
-                cache_flat[t : t + 1, 0:HEAD_DIM] = kv_flat[t : t + 1, 0:HEAD_DIM]
-        else:
-            cutoff = tokens % WINDOW_SIZE
-            for c in pl.range(WINDOW_SIZE):
-                if c < cutoff:
-                    src = tokens - cutoff + c
-                else:
-                    src = tokens - WINDOW_SIZE + c - cutoff
-                src_idx = pl.cast(src, pl.INDEX)
-                cache_flat[c : c + 1, 0:HEAD_DIM] = kv_flat[src_idx : src_idx + 1, 0:HEAD_DIM]
-
-    return pl.reshape(cache_flat, [B, WINDOW_SIZE, HEAD_DIM])
-
-
-@pl.jit.inline
-def update_hca_decode_cache(
-    kv_cache: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    cache_pos: pl.Tensor[[1], pl.INT32],
-    kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
-):
-    """Mirror ``kv_cache[:, start_pos % win] = kv.squeeze(1)``."""
-    kv.bind_dynamic(1, S_DYN)
-
-    cache_in_flat = pl.reshape(kv_cache, [WINDOW_SIZE, HEAD_DIM])
-    cache_out_flat = pl.reshape(kv_cache_out, [WINDOW_SIZE, HEAD_DIM])
-    kv_flat = pl.reshape(kv, [1, HEAD_DIM])
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_decode_cache_copy"):
-        cache_out_flat[0:WINDOW_SIZE, 0:HEAD_DIM] = cache_in_flat[0:WINDOW_SIZE, 0:HEAD_DIM]
-        raw_pos = pl.read(cache_pos, [0])
-        pos = pl.cast(raw_pos, pl.INDEX)
-        cache_out_flat[pos : pos + 1, 0:HEAD_DIM] = kv_flat[0:1, 0:HEAD_DIM]
-
-    return pl.reshape(cache_out_flat, [B, WINDOW_SIZE, HEAD_DIM])
-
-
-@pl.jit.inline
-def build_hca_prefill_kv_pool(
+def build_prefill_kv_pool(
     kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
@@ -117,7 +66,7 @@ def build_hca_prefill_kv_pool(
     compressed_flat = pl.reshape(compressed, [compressed_len, HEAD_DIM])
     pool_flat = pl.reshape(kv_pool, [tokens + compressed_len, HEAD_DIM])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_prefill_kv_pool"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_pool"):
         for t in pl.range(tokens):
             pool_flat[t : t + 1, 0:HEAD_DIM] = kv_flat[t : t + 1, 0:HEAD_DIM]
         for c in pl.range(compressed_len):
@@ -128,23 +77,27 @@ def build_hca_prefill_kv_pool(
 
 
 @pl.jit.inline
-def build_hca_decode_kv_pool(
+def build_decode_kv_pool(
     kv_cache: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
-    compressed_cache: pl.Tensor[[B, TOPK_HCA, HEAD_DIM], pl.BF16],
-    kv_pool: pl.Tensor[[B, WINDOW_SIZE + TOPK_HCA, HEAD_DIM], pl.BF16],
+    compressed_cache: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
+    kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
 ):
     """Build decode KV pool ``cat([window_cache, compressed_cache])``."""
-    cache_flat = pl.reshape(kv_cache, [WINDOW_SIZE, HEAD_DIM])
-    compressed_flat = pl.reshape(compressed_cache, [TOPK_HCA, HEAD_DIM])
-    pool_flat = pl.reshape(kv_pool, [WINDOW_SIZE + TOPK_HCA, HEAD_DIM])
+    compressed_cache.bind_dynamic(1, C_DYN)
+    kv_pool.bind_dynamic(1, K_DYN)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_decode_kv_pool"):
+    compressed_len = pl.tensor.dim(compressed_cache, 1)
+    cache_flat = pl.reshape(kv_cache, [WINDOW_SIZE, HEAD_DIM])
+    compressed_flat = pl.reshape(compressed_cache, [compressed_len, HEAD_DIM])
+    pool_flat = pl.reshape(kv_pool, [WINDOW_SIZE + compressed_len, HEAD_DIM])
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_kv_pool"):
         pool_flat[0:WINDOW_SIZE, 0:HEAD_DIM] = cache_flat[0:WINDOW_SIZE, 0:HEAD_DIM]
-        for c in pl.range(TOPK_HCA):
+        for c in pl.range(compressed_len):
             dst = WINDOW_SIZE + c
             pool_flat[dst : dst + 1, 0:HEAD_DIM] = compressed_flat[c : c + 1, 0:HEAD_DIM]
 
-    return pl.reshape(pool_flat, [B, WINDOW_SIZE + TOPK_HCA, HEAD_DIM])
+    return pl.reshape(pool_flat, [B, WINDOW_SIZE + compressed_len, HEAD_DIM])
 
 
 @pl.jit.inline
@@ -216,7 +169,7 @@ def attention_hca_prefill_fwd(
         q,
         kv,
     )
-    kv_cache_out = update_hca_prefill_cache(kv, kv_cache_out)
+    kv_cache_out = update_prefill_window_cache(kv, kv_cache_out)
     compressed, comp_kv_state_out, comp_score_state_out, comp_cache_out = compressor_ratio128_prefill_fwd(
         x,
         comp_wkv_t,
@@ -235,7 +188,7 @@ def attention_hca_prefill_fwd(
         comp_score_state_out,
         comp_cache_out,
     )
-    kv_pool = build_hca_prefill_kv_pool(kv, compressed, kv_pool)
+    kv_pool = build_prefill_kv_pool(kv, compressed, kv_pool)
     attn_o = sparse_attn_hca_fwd(q, kv_pool, attn_sink, topk_idxs, attn_o)
     out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
     return kv_cache_out, comp_kv_state_out, comp_score_state_out, comp_cache_out, out_final
@@ -313,7 +266,7 @@ def attention_hca_decode_fwd(
         q,
         kv,
     )
-    kv_cache_out = update_hca_decode_cache(kv_cache, kv, cache_pos, kv_cache_out)
+    kv_cache_out = update_decode_window_cache(kv_cache, kv, cache_pos, kv_cache_out)
     compressed, comp_kv_state_out, comp_score_state_out, comp_cache_out = compressor_ratio128_decode_fwd(
         x,
         comp_kv_state,
@@ -337,7 +290,7 @@ def attention_hca_decode_fwd(
         comp_score_state_out,
         comp_cache_out,
     )
-    kv_pool = build_hca_decode_kv_pool(kv_cache_out, comp_cache_out, kv_pool)
+    kv_pool = build_decode_kv_pool(kv_cache_out, comp_cache_out, kv_pool)
     attn_o = sparse_attn_hca_fwd(q, kv_pool, attn_sink, topk_idxs, attn_o)
     out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
     return kv_cache_out, comp_kv_state_out, comp_score_state_out, comp_cache_out, out_final
@@ -876,9 +829,6 @@ def main() -> int:
         "comp_cache_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
         "out": ratio_allclose(atol=1e-3, rtol=2.0 / 128, max_error_ratio=0.005),
     }
-    if args.case == "prefill" and args.seq_len < COMPRESS_RATIO:
-        compare_fn["comp_kv_state_out"] = ignore_output
-        compare_fn["comp_score_state_out"] = ignore_output
 
     cases = []
     if args.case in ("all", "prefill"):
@@ -936,6 +886,8 @@ __all__ = [
     "TOPK_HCA_TOTAL",
     "DEFAULT_SEQ_LEN",
     "DEFAULT_DECODE_START_POS",
+    "build_prefill_kv_pool",
+    "build_decode_kv_pool",
     "attention_hca_prefill_fwd",
     "attention_hca_decode_fwd",
     "attention_hca_prefill_test",

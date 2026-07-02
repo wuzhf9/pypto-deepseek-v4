@@ -33,7 +33,7 @@ DEFAULT_DECODE_START_POS = 1
 
 
 @pl.jit.inline
-def update_swa_prefill_cache(
+def update_prefill_window_cache(
     kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
 ):
@@ -44,7 +44,7 @@ def update_swa_prefill_cache(
     kv_flat = pl.reshape(kv, [tokens, HEAD_DIM])
     cache_flat = pl.reshape(kv_cache_out, [WINDOW_SIZE, HEAD_DIM])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_prefill_cache_write"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_window_cache_write"):
         if tokens <= WINDOW_SIZE:
             for t in pl.range(tokens):
                 cache_flat[t : t + 1, 0:HEAD_DIM] = kv_flat[t : t + 1, 0:HEAD_DIM]
@@ -62,7 +62,7 @@ def update_swa_prefill_cache(
 
 
 @pl.jit.inline
-def update_swa_decode_cache(
+def update_decode_window_cache(
     kv_cache: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
     kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     cache_pos: pl.Tensor[[1], pl.INT32],
@@ -75,7 +75,7 @@ def update_swa_decode_cache(
     cache_out_flat = pl.reshape(kv_cache_out, [WINDOW_SIZE, HEAD_DIM])
     kv_flat = pl.reshape(kv, [1, HEAD_DIM])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_decode_cache_copy"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_window_cache_copy"):
         cache_out_flat[0:WINDOW_SIZE, 0:HEAD_DIM] = cache_in_flat[0:WINDOW_SIZE, 0:HEAD_DIM]
         raw_pos = pl.read(cache_pos, [0])
         pos = pl.cast(raw_pos, pl.INDEX)
@@ -134,7 +134,7 @@ def attention_swa_prefill_fwd(
         q,
         kv,
     )
-    kv_cache_out = update_swa_prefill_cache(kv, kv_cache_out)
+    kv_cache_out = update_prefill_window_cache(kv, kv_cache_out)
     attn_o = sparse_attn_swa_fwd(q, kv, attn_sink, topk_idxs, attn_o)
     out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
     return kv_cache_out, out_final
@@ -187,7 +187,7 @@ def attention_swa_decode_fwd(
         q,
         kv,
     )
-    kv_cache_out = update_swa_decode_cache(kv_cache, kv, cache_pos, kv_cache_out)
+    kv_cache_out = update_decode_window_cache(kv_cache, kv, cache_pos, kv_cache_out)
     attn_o = sparse_attn_swa_fwd(q, kv_cache_out, attn_sink, topk_idxs, attn_o)
     out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
     return kv_cache_out, out_final
@@ -579,6 +579,8 @@ __all__ = [
     "ROPE_HALF",
     "WINDOW_SIZE",
     "TOPK_SWA",
+    "update_prefill_window_cache",
+    "update_decode_window_cache",
     "attention_swa_prefill_fwd",
     "attention_swa_decode_fwd",
     "attention_swa_prefill_test",

@@ -118,6 +118,11 @@ import models.rope as rope  # noqa: E402
 
 official_model = importlib.import_module("official.model")
 
+COMMON_PREFILL_SEQ_LENS = [3, 4, 7, 8, 13]
+COMMON_DECODE_START_POSITIONS = [1, 3, 4, 7, 8, 13]
+PREFILL_SEQ_LENS = [*COMMON_PREFILL_SEQ_LENS, 128, 130]
+DECODE_START_POSITIONS = [*COMMON_DECODE_START_POSITIONS, 126, 127]
+
 
 @pytest.fixture()
 def tiny_args(monkeypatch):
@@ -307,7 +312,7 @@ def _add_output_tensors(tensors: dict[str, torch.Tensor], args, seq_len: int, *,
     )
 
 
-@pytest.mark.parametrize("seq_len", [64, 130])
+@pytest.mark.parametrize("seq_len", PREFILL_SEQ_LENS)
 def test_attention_hca_prefill_golden_matches_official_model(tiny_args, seq_len: int) -> None:
     attn = _make_official_attention(tiny_args)
     x = torch.randn(1, seq_len, tiny_args.dim, dtype=torch.bfloat16)
@@ -328,7 +333,7 @@ def test_attention_hca_prefill_golden_matches_official_model(tiny_args, seq_len:
     torch.testing.assert_close(tensors["comp_score_state_out"][valid], attn.compressor.score_state[valid], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("start_pos", [126, 127])
+@pytest.mark.parametrize("start_pos", DECODE_START_POSITIONS)
 def test_attention_hca_decode_golden_matches_official_model(tiny_args, start_pos: int) -> None:
     attn = _make_official_attention(tiny_args)
     token = torch.randn(1, 1, tiny_args.dim, dtype=torch.bfloat16)

@@ -533,7 +533,7 @@ def golden_indexer_forward(tensors, start_pos: int):
     golden_compressor_ratio4_indexer_forward(comp_tensors, start_pos=start_pos)
 
     weights = torch.matmul(tensors["x"].float(), tensors["weights_proj_t"].float()).to(torch.bfloat16)
-    weights = weights.float() * INDEX_WEIGHTS_SCALE
+    weights = (weights * INDEX_WEIGHTS_SCALE).to(torch.bfloat16).float()
 
     score_full = torch.full((B, seq_len, INDEX_SCORE_LEN), NEG_INF, dtype=torch.float32)
     topk = torch.full((B, seq_len, INDEX_TOPK), -1, dtype=torch.int32)

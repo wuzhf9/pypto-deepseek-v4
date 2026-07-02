@@ -117,12 +117,15 @@ import models.rope as rope  # noqa: E402
 
 official_model = importlib.import_module("official.model")
 
+PREFILL_SEQ_LENS = [3, 4, 7, 8, 13]
+DECODE_START_POSITIONS = [1, 3, 4, 7, 8, 13]
+
 
 @pytest.fixture()
 def tiny_args(monkeypatch):
     args = official_model.ModelArgs(
         max_batch_size=1,
-        max_seq_len=8,
+        max_seq_len=32,
         dtype="bf16",
         scale_dtype="fp32",
         expert_dtype=None,
@@ -247,7 +250,7 @@ def _add_output_tensors(tensors: dict[str, torch.Tensor], args, seq_len: int) ->
     )
 
 
-@pytest.mark.parametrize("seq_len", [3, 5])
+@pytest.mark.parametrize("seq_len", PREFILL_SEQ_LENS)
 def test_attention_swa_prefill_golden_matches_official_model(tiny_args, seq_len: int) -> None:
     attn = _make_official_attention(tiny_args)
     x = torch.randn(1, seq_len, tiny_args.dim, dtype=torch.bfloat16)
@@ -262,22 +265,22 @@ def test_attention_swa_prefill_golden_matches_official_model(tiny_args, seq_len:
     torch.testing.assert_close(tensors["kv_cache_out"], attn.kv_cache, rtol=0, atol=0)
 
 
-def test_attention_swa_decode_golden_matches_official_model(tiny_args) -> None:
+@pytest.mark.parametrize("start_pos", DECODE_START_POSITIONS)
+def test_attention_swa_decode_golden_matches_official_model(tiny_args, start_pos: int) -> None:
     attn = _make_official_attention(tiny_args)
-    prompt_len = 3
-    prompt = torch.randn(1, prompt_len, tiny_args.dim, dtype=torch.bfloat16)
+    prompt = torch.randn(1, start_pos, tiny_args.dim, dtype=torch.bfloat16)
     token = torch.randn(1, 1, tiny_args.dim, dtype=torch.bfloat16)
 
     attn(prompt.clone(), start_pos=0)
     kv_cache_before = attn.kv_cache.clone()
-    expected = attn(token.clone(), start_pos=prompt_len)
+    expected = attn(token.clone(), start_pos=start_pos)
 
-    tensors = _base_tensors(attn, token, start_pos=prompt_len)
+    tensors = _base_tensors(attn, token, start_pos=start_pos)
     tensors["kv_cache"] = kv_cache_before
-    tensors["cache_pos"] = torch.tensor([prompt_len % tiny_args.window_size], dtype=torch.int32)
+    tensors["cache_pos"] = torch.tensor([start_pos % tiny_args.window_size], dtype=torch.int32)
     _add_output_tensors(tensors, tiny_args, seq_len=1)
 
-    attention_swa.golden_attention_swa_forward(tensors, start_pos=prompt_len)
+    attention_swa.golden_attention_swa_forward(tensors, start_pos=start_pos)
 
     torch.testing.assert_close(tensors["out"], expected, rtol=0, atol=0)
     torch.testing.assert_close(tensors["kv_cache_out"], attn.kv_cache, rtol=0, atol=0)
