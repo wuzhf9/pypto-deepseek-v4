@@ -155,6 +155,162 @@ def ignore_output(*_args: Any, **_kwargs: Any) -> tuple[bool, str]:
     return True, ""
 
 
+def topk_indices_by_score(
+    score_name: str,
+    *,
+    index_offset: int = 0,
+    index_offset_name: str | None = None,
+    invalid_index: int = -1,
+    dim: int = -1,
+    descending: bool = True,
+    atol: float | None = None,
+    rtol: float | None = None,
+    max_show: int = 10,
+) -> Callable:
+    """Return a comparator for top-k index tensors backed by a score output.
+
+    The score tensor should be validated separately. This comparator accepts
+    small score-driven reordering, but still checks that actual indices are
+    valid, unique, ordered by their actual paired scores, and no worse than the
+    top-k boundary in the actual score row within tolerance.
+    """
+
+    if dim != -1:
+        raise ValueError("topk_indices_by_score currently supports dim=-1 only")
+
+    def compare(
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        actual_outputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
+        rtol: float,
+        atol: float,
+        **_kwargs: Any,
+    ) -> tuple[bool, str]:
+        if score_name not in actual_outputs:
+            return False, f"score output {score_name!r} is missing from actual outputs"
+
+        eff_atol = atol if compare.atol_override is None else compare.atol_override
+        eff_rtol = rtol if compare.rtol_override is None else compare.rtol_override
+        offset = index_offset
+        if index_offset_name is not None:
+            if index_offset_name not in inputs:
+                return False, f"index offset input {index_offset_name!r} is missing"
+            offset = int(inputs[index_offset_name].detach().cpu().reshape(-1)[0].item())
+
+        actual_i = actual.detach().cpu().to(torch.int64)
+        expected_i = expected.detach().cpu().to(torch.int64)
+        scores = actual_outputs[score_name].detach().cpu().to(torch.float32)
+
+        if actual_i.shape != expected_i.shape:
+            return False, f"topk shape mismatch: actual={tuple(actual_i.shape)} expected={tuple(expected_i.shape)}"
+        if actual_i.shape[:-1] != scores.shape[:-1]:
+            return False, f"topk/score leading shape mismatch: topk={tuple(actual_i.shape)} score={tuple(scores.shape)}"
+
+        if torch.equal(actual_i, expected_i):
+            return True, ""
+
+        topk_rows = actual_i.reshape(-1, actual_i.shape[-1])
+        expected_rows = expected_i.reshape(-1, expected_i.shape[-1])
+        score_rows = scores.reshape(-1, scores.shape[-1])
+        failures: list[str] = []
+
+        def row_coord(row: int) -> tuple[int, ...]:
+            if actual_i.dim() == 1:
+                return ()
+            shape = actual_i.shape[:-1]
+            rem = row
+            coords = []
+            for size in reversed(shape):
+                coords.append(rem % size)
+                rem //= size
+            return tuple(reversed(coords))
+
+        for row in range(topk_rows.shape[0]):
+            a_row = topk_rows[row]
+            e_row = expected_rows[row]
+            s_row = score_rows[row]
+            valid_mask = e_row != invalid_index
+            valid_count = int(valid_mask.sum().item())
+            if valid_count == 0:
+                if not torch.equal(a_row, e_row):
+                    failures.append(f"row={row_coord(row)} expected all invalid, actual_prefix={a_row[:8].tolist()}")
+                continue
+            if not torch.all(valid_mask[:valid_count]).item() or torch.any(valid_mask[valid_count:]).item():
+                failures.append(f"row={row_coord(row)} expected valid topk entries are not a prefix")
+                continue
+            if not torch.all(a_row[valid_count:] == invalid_index).item():
+                failures.append(
+                    f"row={row_coord(row)} invalid suffix mismatch: actual_suffix_prefix={a_row[valid_count:valid_count + 8].tolist()}"
+                )
+                continue
+
+            a_valid = a_row[:valid_count]
+            if torch.any(a_valid == invalid_index).item():
+                failures.append(f"row={row_coord(row)} actual has invalid index inside valid prefix")
+                continue
+            local_idx = a_valid - offset
+            if torch.any(local_idx < 0).item() or torch.any(local_idx >= s_row.shape[0]).item():
+                failures.append(
+                    f"row={row_coord(row)} actual index out of score range: actual_prefix={a_valid[:8].tolist()} offset={offset}"
+                )
+                continue
+            if torch.unique(local_idx).numel() != local_idx.numel():
+                failures.append(f"row={row_coord(row)} actual topk contains duplicate indices: {a_valid[:16].tolist()}")
+                continue
+
+            paired = s_row.gather(0, local_idx)
+            if paired.numel() >= 2:
+                left = paired[:-1]
+                right = paired[1:]
+                tol = eff_atol + eff_rtol * torch.maximum(left.abs(), right.abs())
+                order_ok = left + tol >= right if descending else left <= right + tol
+                if not torch.all(order_ok).item():
+                    pos = int(torch.where(~order_ok)[0][0].item())
+                    failures.append(
+                        f"row={row_coord(row)} paired scores break order at {pos}: "
+                        f"indices={a_valid[max(0, pos - 1):pos + 3].tolist()} "
+                        f"scores={[float(x) for x in paired[max(0, pos - 1):pos + 3].tolist()]}"
+                    )
+                    continue
+
+            boundary_vals = torch.topk(s_row, k=valid_count, largest=descending, sorted=True).values
+            boundary = boundary_vals[-1]
+            boundary_tol = eff_atol + eff_rtol * torch.maximum(paired.abs(), boundary.abs())
+            if descending:
+                boundary_ok = paired + boundary_tol >= boundary
+            else:
+                boundary_ok = paired <= boundary + boundary_tol
+            if not torch.all(boundary_ok).item():
+                pos = int(torch.where(~boundary_ok)[0][0].item())
+                failures.append(
+                    f"row={row_coord(row)} selected score outside topk boundary at {pos}: "
+                    f"idx={int(a_valid[pos].item())} score={float(paired[pos].item()):.8g} "
+                    f"boundary={float(boundary.item()):.8g}"
+                )
+
+            if len(failures) >= max_show:
+                break
+
+        if not failures:
+            return True, ""
+
+        mismatch_count = int((actual_i != expected_i).sum().item())
+        return False, (
+            f"topk_indices_by_score fail: mismatch_count={mismatch_count}, "
+            f"score_name={score_name!r}, offset={offset}, invalid_index={invalid_index}\n"
+            + "\n".join(failures)
+        )
+
+    compare.atol_override = atol
+    compare.rtol_override = rtol
+    compare.__name__ = (
+        f"topk_indices_by_score(score_name={score_name!r}, atol={atol}, rtol={rtol})"
+    )
+    return compare
+
+
 def _save_tensors(dest_dir: Path, tensors: dict[str, torch.Tensor]) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     for name, tensor in tensors.items():
@@ -311,5 +467,6 @@ __all__ = [
     "TensorSpec",
     "RunResult",
     "ratio_allclose",
+    "topk_indices_by_score",
     "run_jit",
 ]

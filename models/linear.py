@@ -12,6 +12,8 @@ S_DYN = pl.dynamic("S_DYN")
 HIDDEN = M.dim
 Q_LORA_RANK = M.q_lora_rank
 HEAD_DIM = M.head_dim
+INDEX_N_HEADS = M.index_n_heads
+INDEX_Q_OUT = M.index_n_heads * M.index_head_dim
 INDEX_COMPRESS_OUT = 2 * M.index_head_dim
 ATTN_Q_OUT = M.n_heads * M.head_dim
 ATTN_OUT_IN = M.o_groups * M.o_lora_rank
@@ -27,25 +29,76 @@ DEFAULT_SEQ_LEN = 8
 assert_divisible(HIDDEN, K_TILE, "hidden linear input size")
 assert_divisible(Q_LORA_RANK, K_TILE, "q lora linear input size")
 assert_divisible(ATTN_OUT_IN, K_TILE, "attention output linear input size")
+assert_divisible(INDEX_N_HEADS, O_TILE, "64 linear output size")
 assert_divisible(HEAD_DIM, O_TILE, "512 linear output size")
 assert_divisible(INDEX_COMPRESS_OUT, O_TILE, "256 linear output size")
 assert_divisible(Q_LORA_RANK, O_TILE, "1024 linear output size")
 assert_divisible(HIDDEN, O_TILE, "4096 linear output size")
+assert_divisible(INDEX_Q_OUT, ATTN_Q_OUT_TILE, "8192 linear output size")
 assert_divisible(ATTN_Q_OUT, ATTN_Q_OUT_TILE, "32768 linear output size")
+assert_divisible(INDEX_N_HEADS // O_TILE, OUT_GROUP, "64 output blocks")
 assert_divisible(HEAD_DIM // O_TILE, OUT_GROUP, "512 output blocks")
 assert_divisible(INDEX_COMPRESS_OUT // O_TILE, OUT_GROUP, "256 output blocks")
 assert_divisible(Q_LORA_RANK // O_TILE, OUT_GROUP, "1024 output blocks")
 assert_divisible(HIDDEN // O_TILE, OUT_GROUP, "4096 output blocks")
+assert_divisible(INDEX_Q_OUT // ATTN_Q_OUT_TILE, ATTN_Q_OUT_GROUP, "8192 output tile blocks")
 assert_divisible(ATTN_Q_OUT // ATTN_Q_OUT_TILE, ATTN_Q_OUT_GROUP, "32768 output tile blocks")
 
 HIDDEN_K_BLOCKS = HIDDEN // K_TILE
 Q_LORA_K_BLOCKS = Q_LORA_RANK // K_TILE
 ATTN_OUT_K_BLOCKS = ATTN_OUT_IN // K_TILE
+INDEX_N_HEADS_O_BLOCKS = INDEX_N_HEADS // O_TILE
 HEAD_DIM_O_BLOCKS = HEAD_DIM // O_TILE
 INDEX_COMPRESS_O_BLOCKS = INDEX_COMPRESS_OUT // O_TILE
 Q_LORA_O_BLOCKS = Q_LORA_RANK // O_TILE
 HIDDEN_O_BLOCKS = HIDDEN // O_TILE
+INDEX_Q_OUT_BLOCKS = INDEX_Q_OUT // ATTN_Q_OUT_TILE
 ATTN_Q_OUT_BLOCKS = ATTN_Q_OUT // ATTN_Q_OUT_TILE
+
+
+@pl.jit.inline
+def linear_4096_to_64(
+    x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
+    weight_t: pl.Tensor[[HIDDEN, INDEX_N_HEADS], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
+):
+    """Compute ``x @ weight_t`` for ``weight_t`` shape ``[4096, 64]``."""
+    x.bind_dynamic(1, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, HIDDEN])
+    out_flat = pl.reshape(out, [tokens, INDEX_N_HEADS])
+    token_blocks = (tokens + T_TILE - 1) // T_TILE
+
+    for tb in pl.range(token_blocks):
+        t0 = tb * T_TILE
+        valid_tok = pl.min(T_TILE, tokens - t0)
+        out_tile_fp32 = pl.create_tensor([T_TILE, INDEX_N_HEADS], dtype=pl.FP32)
+
+        for og_idx in pl.spmd(INDEX_N_HEADS_O_BLOCKS // OUT_GROUP, name_hint="linear_4096_to_64"):
+            og = og_idx * OUT_GROUP
+            for o_inner in pl.pipeline(OUT_GROUP, stage=2):
+                o0 = (og + o_inner) * O_TILE
+                x0 = pl.slice(x_flat, [T_TILE, K_TILE], [t0, 0], valid_shape=[valid_tok, K_TILE])
+                w0 = pl.slice(weight_t, [K_TILE, O_TILE], [0, o0])
+                acc = pl.matmul(x0, w0, out_dtype=pl.FP32)
+                for kb in pl.pipeline(1, HIDDEN_K_BLOCKS, stage=2):
+                    k0 = kb * K_TILE
+                    xk = pl.slice(x_flat, [T_TILE, K_TILE], [t0, k0], valid_shape=[valid_tok, K_TILE])
+                    wk = pl.slice(weight_t, [K_TILE, O_TILE], [k0, o0])
+                    acc = pl.matmul_acc(acc, xk, wk)
+                out_tile_fp32[:, o0 : o0 + O_TILE] = acc
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear_4096_to_64_write"):
+            for ob in pl.range(INDEX_N_HEADS_O_BLOCKS):
+                o0 = ob * O_TILE
+                out_tile = pl.cast(out_tile_fp32[:, o0 : o0 + O_TILE], target_type=pl.BF16, mode="rint")
+                for row in pl.range(valid_tok):
+                    out_row = pl.slice(out_tile, [1, O_TILE], [row, 0])
+                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, o0])
+
+    return pl.reshape(out_flat, [B, tokens, INDEX_N_HEADS])
 
 
 @pl.jit.inline
@@ -274,6 +327,45 @@ def linear_4096_to_1024_fp32(
 
 
 @pl.jit.inline
+def linear_1024_to_8192(
+    x: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
+    weight_t: pl.Tensor[[Q_LORA_RANK, INDEX_Q_OUT], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
+):
+    """Compute ``x @ weight_t`` for ``weight_t`` shape ``[1024, 8192]``."""
+    x.bind_dynamic(1, S_DYN)
+    out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, Q_LORA_RANK])
+    out_flat = pl.reshape(out, [tokens, INDEX_Q_OUT])
+    token_blocks = (tokens + T_TILE - 1) // T_TILE
+
+    for tb in pl.range(token_blocks):
+        t0 = tb * T_TILE
+        valid_tok = pl.min(T_TILE, tokens - t0)
+
+        for og_idx in pl.spmd(INDEX_Q_OUT_BLOCKS // ATTN_Q_OUT_GROUP, name_hint="linear_1024_to_8192"):
+            og = og_idx * ATTN_Q_OUT_GROUP
+            for o_inner in pl.pipeline(ATTN_Q_OUT_GROUP, stage=2):
+                o0 = (og + o_inner) * ATTN_Q_OUT_TILE
+                x0 = pl.slice(x_flat, [T_TILE, K_TILE], [t0, 0], valid_shape=[valid_tok, K_TILE])
+                w0 = pl.slice(weight_t, [K_TILE, ATTN_Q_OUT_TILE], [0, o0])
+                acc = pl.matmul(x0, w0, out_dtype=pl.FP32)
+                for kb in pl.pipeline(1, Q_LORA_K_BLOCKS, stage=2):
+                    k0 = kb * K_TILE
+                    xk = pl.slice(x_flat, [T_TILE, K_TILE], [t0, k0], valid_shape=[valid_tok, K_TILE])
+                    wk = pl.slice(weight_t, [K_TILE, ATTN_Q_OUT_TILE], [k0, o0])
+                    acc = pl.matmul_acc(acc, xk, wk)
+                acc_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                for row in pl.range(valid_tok):
+                    out_row = pl.slice(acc_bf16, [1, ATTN_Q_OUT_TILE], [row, 0])
+                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, o0])
+
+    return pl.reshape(out_flat, [B, tokens, INDEX_Q_OUT])
+
+
+@pl.jit.inline
 def linear_1024_to_32768(
     x: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
     weight_t: pl.Tensor[[Q_LORA_RANK, ATTN_Q_OUT], pl.BF16],
@@ -362,6 +454,16 @@ def linear_4096_to_512_test(
 
 
 @pl.jit
+def linear_4096_to_64_test(
+    x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
+    weight_t: pl.Tensor[[HIDDEN, INDEX_N_HEADS], pl.BF16],
+    out: pl.Out[pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16]],
+):
+    out = linear_4096_to_64(x, weight_t, out)
+    return out
+
+
+@pl.jit
 def linear_4096_to_512_fp32_test(
     x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     weight_t: pl.Tensor[[HIDDEN, HEAD_DIM], pl.BF16],
@@ -398,6 +500,16 @@ def linear_4096_to_1024_fp32_test(
     out: pl.Out[pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.FP32]],
 ):
     out = linear_4096_to_1024_fp32(x, weight_t, out)
+    return out
+
+
+@pl.jit
+def linear_1024_to_8192_test(
+    x: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
+    weight_t: pl.Tensor[[Q_LORA_RANK, INDEX_Q_OUT], pl.BF16],
+    out: pl.Out[pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16]],
+):
+    out = linear_1024_to_8192(x, weight_t, out)
     return out
 
 
@@ -453,6 +565,10 @@ def build_4096_to_512_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return _build_tensor_specs(HIDDEN, HEAD_DIM, seq_len)
 
 
+def build_4096_to_64_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(HIDDEN, INDEX_N_HEADS, seq_len)
+
+
 def build_4096_to_512_fp32_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return _build_tensor_specs(HIDDEN, HEAD_DIM, seq_len, out_dtype="fp32")
 
@@ -473,6 +589,10 @@ def build_1024_to_32768_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return _build_tensor_specs(Q_LORA_RANK, ATTN_Q_OUT, seq_len)
 
 
+def build_1024_to_8192_specs(seq_len: int = DEFAULT_SEQ_LEN):
+    return _build_tensor_specs(Q_LORA_RANK, INDEX_Q_OUT, seq_len)
+
+
 def build_8192_to_4096_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return _build_tensor_specs(ATTN_OUT_IN, HIDDEN, seq_len)
 
@@ -491,11 +611,13 @@ def main() -> int:
     args = parser.parse_args()
 
     cases = [
+        ("4096-to-64", linear_4096_to_64_test, build_4096_to_64_specs),
         ("4096-to-512", linear_4096_to_512_test, build_4096_to_512_specs),
         ("4096-to-512-fp32", linear_4096_to_512_fp32_test, build_4096_to_512_fp32_specs),
         ("4096-to-256-fp32", linear_4096_to_256_fp32_test, build_4096_to_256_fp32_specs),
         ("4096-to-1024", linear_4096_to_1024_test, build_4096_to_1024_specs),
         ("4096-to-1024-fp32", linear_4096_to_1024_fp32_test, build_4096_to_1024_fp32_specs),
+        ("1024-to-8192", linear_1024_to_8192_test, build_1024_to_8192_specs),
         ("1024-to-32768", linear_1024_to_32768_test, build_1024_to_32768_specs),
         ("8192-to-4096", linear_8192_to_4096_test, build_8192_to_4096_specs),
     ]
@@ -537,6 +659,8 @@ __all__ = [
     "HIDDEN",
     "Q_LORA_RANK",
     "HEAD_DIM",
+    "INDEX_N_HEADS",
+    "INDEX_Q_OUT",
     "INDEX_COMPRESS_OUT",
     "ATTN_Q_OUT",
     "ATTN_OUT_IN",
@@ -547,26 +671,32 @@ __all__ = [
     "ATTN_Q_OUT_TILE",
     "ATTN_Q_OUT_GROUP",
     "DEFAULT_SEQ_LEN",
+    "linear_4096_to_64",
     "linear_4096_to_512",
     "linear_4096_to_512_fp32",
     "linear_4096_to_256_fp32",
     "linear_4096_to_1024",
     "linear_4096_to_1024_fp32",
+    "linear_1024_to_8192",
     "linear_1024_to_32768",
     "linear_8192_to_4096",
+    "linear_4096_to_64_test",
     "linear_4096_to_512_test",
     "linear_4096_to_512_fp32_test",
     "linear_4096_to_256_fp32_test",
     "linear_4096_to_1024_test",
     "linear_4096_to_1024_fp32_test",
+    "linear_1024_to_8192_test",
     "linear_1024_to_32768_test",
     "linear_8192_to_4096_test",
     "golden_linear",
+    "build_4096_to_64_specs",
     "build_4096_to_512_specs",
     "build_4096_to_512_fp32_specs",
     "build_4096_to_256_fp32_specs",
     "build_4096_to_1024_specs",
     "build_4096_to_1024_fp32_specs",
+    "build_1024_to_8192_specs",
     "build_1024_to_32768_specs",
     "build_8192_to_4096_specs",
 ]
