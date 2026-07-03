@@ -1,84 +1,16 @@
 """Tests for Indexer golden logic against official ``model.py``."""
 
 import importlib
-import sys
-import types
-from pathlib import Path
 
 import pytest
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-
-def _install_pypto_language_stub() -> None:
-    """Allow importing PyPTO kernel modules in host-only unit tests."""
-
-    if "pypto.language" in sys.modules:
-        return
-
-    class _Tensor:
-        def __class_getitem__(cls, _item):
-            return cls
-
-    class _Jit:
-        def __call__(self, fn):
-            return fn
-
-        def inline(self, fn):
-            return fn
-
-    language = types.ModuleType("pypto.language")
-    language.Tensor = _Tensor
-    language.Out = _Tensor
-    language.BF16 = object()
-    language.FP32 = object()
-    language.INT32 = object()
-    language.UINT32 = object()
-    language.INDEX = object()
-    language.jit = _Jit()
-    language.dynamic = lambda _name: 1
-
-    pypto = types.ModuleType("pypto")
-    pypto.language = language
-    sys.modules["pypto"] = pypto
-    sys.modules["pypto.language"] = language
-
-
-def _install_official_kernel_stub() -> None:
-    kernel = types.ModuleType("kernel")
-    kernel.act_quant = lambda x, *args, **kwargs: x
-    kernel.fp4_act_quant = lambda x, *args, **kwargs: x
-    kernel.fp8_gemm = None
-    kernel.fp4_gemm = None
-    kernel.sparse_attn = None
-    kernel.hc_split_sinkhorn = None
-    sys.modules["kernel"] = kernel
-
-
-_install_pypto_language_stub()
-_install_official_kernel_stub()
+from conftest import make_linear_reference
 
 import models.compressor_ratio4 as compressor_ratio4  # noqa: E402
 import models.indexer as indexer  # noqa: E402
 import models.rope as rope  # noqa: E402
 
 official_model = importlib.import_module("official.model")
-
-
-def _make_linear_reference():
-    def linear(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        assert bias is None
-        return torch.matmul(x.float(), weight.t().contiguous().float()).to(x.dtype)
-
-    return linear
-
 
 @pytest.fixture()
 def tiny_indexer_args(monkeypatch):
@@ -148,9 +80,8 @@ def tiny_indexer_args(monkeypatch):
     monkeypatch.setattr(official_model, "rotate_activation", lambda x, *args, **kwargs: x)
     monkeypatch.setattr(official_model, "fp4_act_quant", lambda x, *args, **kwargs: x)
     monkeypatch.setattr(official_model, "act_quant", lambda x, *args, **kwargs: x)
-    monkeypatch.setattr(official_model, "linear", _make_linear_reference())
+    monkeypatch.setattr(official_model, "linear", make_linear_reference())
     return args
-
 
 def _make_official_indexer(args) -> torch.nn.Module:
     torch.manual_seed(20260702)
@@ -187,18 +118,15 @@ def _make_official_indexer(args) -> torch.nn.Module:
     )
     return module
 
-
 def _pad_topk(expected: torch.Tensor, seq_len: int, topk: int) -> torch.Tensor:
     padded = torch.full((1, seq_len, topk), -1, dtype=torch.int32)
     if expected.shape[-1] > 0:
         padded[:, :, : expected.shape[-1]] = expected.to(torch.int32)
     return padded
 
-
 def _assert_score_state_matches(actual: torch.Tensor, expected: torch.Tensor) -> None:
     finite = torch.isfinite(expected)
     torch.testing.assert_close(actual[finite], expected[finite], rtol=0, atol=0)
-
 
 def _common_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor, args, start_pos: int, offset: int):
     freqs_cis = module.freqs_cis[start_pos : start_pos + x.shape[1]]
@@ -220,7 +148,6 @@ def _common_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor, 
         "comp_kv_state_out": torch.zeros_like(module.compressor.kv_state),
         "comp_score_state_out": torch.zeros_like(module.compressor.score_state),
     }
-
 
 def _prefill_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor, args, offset: int):
     seq_len = x.shape[1]
@@ -244,7 +171,6 @@ def _prefill_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor,
         }
     )
     return tensors
-
 
 def _decode_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor, args, start_pos: int, offset: int):
     should_compress = int((start_pos + 1) % 4 == 0)
@@ -276,7 +202,6 @@ def _decode_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor, 
     tensors["index_kv_cache_in"] = tensors["index_kv_cache"].clone()
     return tensors
 
-
 @pytest.mark.parametrize("seq_len", [3, 4, 7, 8, 13, 16, 32])
 def test_golden_indexer_prefill_matches_official_model(tiny_indexer_args, seq_len: int) -> None:
     module = _make_official_indexer(tiny_indexer_args)
@@ -298,7 +223,6 @@ def test_golden_indexer_prefill_matches_official_model(tiny_indexer_args, seq_le
     torch.testing.assert_close(tensors["index_kv_cache"], module.kv_cache, rtol=0, atol=0)
     torch.testing.assert_close(tensors["comp_kv_state_out"], module.compressor.kv_state, rtol=0, atol=0)
     _assert_score_state_matches(tensors["comp_score_state_out"], module.compressor.score_state)
-
 
 @pytest.mark.parametrize("start_pos", [1, 2, 3, 7])
 def test_golden_indexer_decode_matches_official_model(tiny_indexer_args, start_pos: int) -> None:

@@ -1,82 +1,15 @@
 """Tests for ratio-4 Indexer compressor golden logic against official ``model.py``."""
 
 import importlib
-import sys
-import types
-from pathlib import Path
 
 import pytest
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-
-def _install_pypto_language_stub() -> None:
-    """Allow importing PyPTO kernel modules in host-only unit tests."""
-
-    if "pypto.language" in sys.modules:
-        return
-
-    class _Tensor:
-        def __class_getitem__(cls, _item):
-            return cls
-
-    class _Jit:
-        def __call__(self, fn):
-            return fn
-
-        def inline(self, fn):
-            return fn
-
-    language = types.ModuleType("pypto.language")
-    language.Tensor = _Tensor
-    language.Out = _Tensor
-    language.BF16 = object()
-    language.FP32 = object()
-    language.INT32 = object()
-    language.INDEX = object()
-    language.jit = _Jit()
-    language.dynamic = lambda _name: 1
-
-    pypto = types.ModuleType("pypto")
-    pypto.language = language
-    sys.modules["pypto"] = pypto
-    sys.modules["pypto.language"] = language
-
-
-def _install_official_kernel_stub() -> None:
-    kernel = types.ModuleType("kernel")
-    kernel.act_quant = lambda x, *args, **kwargs: x
-    kernel.fp4_act_quant = lambda x, *args, **kwargs: x
-    kernel.fp8_gemm = None
-    kernel.fp4_gemm = None
-    kernel.sparse_attn = None
-    kernel.hc_split_sinkhorn = None
-    sys.modules["kernel"] = kernel
-
-
-_install_pypto_language_stub()
-_install_official_kernel_stub()
+from conftest import make_linear_reference
 
 import models.compressor_ratio4 as compressor_ratio4  # noqa: E402
 import models.rope as rope  # noqa: E402
 
 official_model = importlib.import_module("official.model")
-
-
-def _make_linear_reference():
-    def linear(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        assert bias is None
-        return torch.matmul(x.float(), weight.t().contiguous().float()).to(x.dtype)
-
-    return linear
-
 
 @pytest.fixture()
 def tiny_ratio4_args(monkeypatch):
@@ -126,9 +59,8 @@ def tiny_ratio4_args(monkeypatch):
     monkeypatch.setattr(rope, "INDEX_TAIL_OFFSET", args.index_head_dim - args.rope_head_dim)
     monkeypatch.setattr(official_model, "rotate_activation", lambda x, *args, **kwargs: x)
     monkeypatch.setattr(official_model, "fp4_act_quant", lambda x, *args, **kwargs: x)
-    monkeypatch.setattr(official_model, "linear", _make_linear_reference())
+    monkeypatch.setattr(official_model, "linear", make_linear_reference())
     return args
-
 
 def _make_official_indexer_compressor(args) -> torch.nn.Module:
     torch.manual_seed(20260702)
@@ -154,7 +86,6 @@ def _make_official_indexer_compressor(args) -> torch.nn.Module:
     )
     return compressor
 
-
 def _make_official_attention_compressor(args) -> torch.nn.Module:
     torch.manual_seed(20260702)
     with official_model.set_dtype(torch.bfloat16):
@@ -178,7 +109,6 @@ def _make_official_attention_compressor(args) -> torch.nn.Module:
         args.beta_slow,
     )
     return compressor
-
 
 def _compressor_tensors(compressor: torch.nn.Module, x: torch.Tensor, args) -> dict[str, torch.Tensor]:
     seq_len = x.shape[1]
@@ -209,7 +139,6 @@ def _compressor_tensors(compressor: torch.nn.Module, x: torch.Tensor, args) -> d
         "compressed": torch.zeros(1, compressed_len, args.index_head_dim, dtype=torch.bfloat16),
     }
 
-
 def _attention_compressor_tensors(compressor: torch.nn.Module, x: torch.Tensor, args) -> dict[str, torch.Tensor]:
     seq_len = x.shape[1]
     cutoff = seq_len - seq_len % 4
@@ -238,7 +167,6 @@ def _attention_compressor_tensors(compressor: torch.nn.Module, x: torch.Tensor, 
         "normed": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
         "compressed": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
     }
-
 
 def _compressor_decode_tensors(
     compressor: torch.nn.Module,
@@ -286,7 +214,6 @@ def _compressor_decode_tensors(
         "compressed_cache_out": torch.zeros_like(compressor.kv_cache),
     }
 
-
 def _attention_compressor_decode_tensors(
     compressor: torch.nn.Module,
     x: torch.Tensor,
@@ -333,13 +260,11 @@ def _attention_compressor_decode_tensors(
         "compressed_cache_out": torch.zeros_like(compressor.kv_cache),
     }
 
-
 def _assert_score_state_matches(actual: torch.Tensor, expected: torch.Tensor) -> None:
     valid = torch.isfinite(expected)
     torch.testing.assert_close(actual[valid], expected[valid], rtol=0, atol=0)
     assert torch.isneginf(expected[~valid]).all()
     assert (actual[~valid] <= compressor_ratio4.NEG_INF / 2).all()
-
 
 @pytest.mark.parametrize("seq_len", [3, 4, 6, 7, 8, 13, 16, 32])
 def test_golden_compressor_ratio4_indexer_prefill_matches_official_model(
@@ -368,7 +293,6 @@ def test_golden_compressor_ratio4_indexer_prefill_matches_official_model(
             rtol=0,
             atol=0,
         )
-
 
 @pytest.mark.parametrize("start_pos", [1, 2, 3, 7])
 def test_golden_compressor_ratio4_indexer_decode_matches_official_model(
@@ -402,7 +326,6 @@ def test_golden_compressor_ratio4_indexer_decode_matches_official_model(
             atol=0,
         )
 
-
 @pytest.mark.parametrize("seq_len", [3, 4, 6, 7, 8, 13, 16, 32])
 def test_golden_compressor_ratio4_attention_prefill_matches_official_model(
     tiny_ratio4_args,
@@ -430,7 +353,6 @@ def test_golden_compressor_ratio4_attention_prefill_matches_official_model(
             rtol=0,
             atol=0,
         )
-
 
 @pytest.mark.parametrize("start_pos", [1, 2, 3, 7])
 def test_golden_compressor_ratio4_attention_decode_matches_official_model(

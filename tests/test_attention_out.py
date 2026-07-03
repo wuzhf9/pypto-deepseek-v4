@@ -1,49 +1,7 @@
 """Tests for attention output projection golden weight layout."""
 
-import sys
-import types
-from pathlib import Path
-
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-
-def _install_pypto_language_stub() -> None:
-    """Allow importing PyPTO kernel modules in host-only unit tests."""
-
-    if "pypto.language" in sys.modules:
-        return
-
-    class _Tensor:
-        def __class_getitem__(cls, _item):
-            return cls
-
-    class _Jit:
-        def __call__(self, fn):
-            return fn
-
-        def inline(self, fn):
-            return fn
-
-    language = types.ModuleType("pypto.language")
-    language.Tensor = _Tensor
-    language.Out = _Tensor
-    language.BF16 = object()
-    language.FP32 = object()
-    language.INT32 = object()
-    language.jit = _Jit()
-    language.dynamic = lambda _name: 1
-
-    pypto = types.ModuleType("pypto")
-    pypto.language = language
-    sys.modules["pypto"] = pypto
-    sys.modules["pypto.language"] = language
-
-
-_install_pypto_language_stub()
+from conftest import official_apply_full_head_rope, official_apply_rotary_emb
 
 from models.attention_out import (  # noqa: E402
     ATTN_OUT_IN,
@@ -58,38 +16,6 @@ from models.attention_out import (  # noqa: E402
 from models.config import FLASH_CONFIG as M  # noqa: E402
 from models.rope import build_deepseek_v4_rope_tables, materialize_rope_range  # noqa: E402
 
-
-def _official_apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    inverse: bool,
-) -> torch.Tensor:
-    freqs_cis = torch.complex(cos.float(), sin.float())
-    x_complex = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-    if inverse:
-        freqs_cis = freqs_cis.conj()
-    freqs_cis = freqs_cis.view(1, x_complex.size(1), 1, x_complex.size(-1))
-    out = torch.view_as_real(x_complex * freqs_cis).flatten(-2)
-    return out.to(x.dtype)
-
-
-def _official_apply_full_head_rope(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    inverse: bool,
-) -> torch.Tensor:
-    out = x.clone()
-    out[..., -M.rope_head_dim :] = _official_apply_rotary_emb(
-        x[..., -M.rope_head_dim :],
-        cos,
-        sin,
-        inverse,
-    )
-    return out
-
-
 def _official_attention_out(
     o: torch.Tensor,
     wo_a_weight: torch.Tensor,
@@ -100,13 +26,12 @@ def _official_attention_out(
     """Mirror ``model.py:534,537-542`` with original weights."""
 
     seq_len = o.shape[1]
-    o = _official_apply_full_head_rope(o, cos, sin, inverse=True)
+    o = official_apply_full_head_rope(o, cos, sin, inverse=True)
     o_grouped = o.view(B, seq_len, O_GROUPS, -1)
     wo_a = wo_a_weight.view(O_GROUPS, O_LORA_RANK, -1)
     proj = torch.einsum("bsgd,grd->bsgr", o_grouped.float(), wo_a.float()).to(torch.bfloat16)
     out = torch.matmul(proj.flatten(2).float(), wo_b_weight.t().float()).to(torch.bfloat16)
     return o, proj.flatten(2), out
-
 
 def test_attention_out_golden_uses_same_transposed_weight_as_model_path() -> None:
     torch.manual_seed(20260630)

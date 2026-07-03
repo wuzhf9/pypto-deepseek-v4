@@ -1,116 +1,10 @@
 """Tests for HCA attention golden logic against official ``model.py``."""
 
 import importlib
-import sys
-import types
-from pathlib import Path
 
 import pytest
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-
-def _install_pypto_language_stub() -> None:
-    """Allow importing PyPTO kernel modules in host-only unit tests."""
-
-    if "pypto.language" in sys.modules:
-        return
-
-    class _Tensor:
-        def __class_getitem__(cls, _item):
-            return cls
-
-    class _Jit:
-        def __call__(self, fn):
-            return fn
-
-        def inline(self, fn):
-            return fn
-
-    language = types.ModuleType("pypto.language")
-    language.Tensor = _Tensor
-    language.Out = _Tensor
-    language.BF16 = object()
-    language.FP32 = object()
-    language.INT32 = object()
-    language.INDEX = object()
-    language.jit = _Jit()
-    language.dynamic = lambda _name: 1
-
-    pypto = types.ModuleType("pypto")
-    pypto.language = language
-    sys.modules["pypto"] = pypto
-    sys.modules["pypto.language"] = language
-
-
-def _torch_sparse_attn(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    from models.sparse_attn import golden_sparse_attn
-
-    tensors = {
-        "q": q,
-        "kv": kv,
-        "attn_sink": attn_sink,
-        "topk_idxs": topk_idxs,
-        "softmax_scale": softmax_scale,
-        "out": torch.empty_like(q),
-    }
-    golden_sparse_attn(tensors)
-    return tensors["out"]
-
-
-def _install_official_kernel_stub() -> None:
-    kernel = types.ModuleType("kernel")
-    kernel.act_quant = lambda x, *args, **kwargs: x
-    kernel.fp4_act_quant = lambda x, *args, **kwargs: x
-    kernel.fp8_gemm = None
-    kernel.fp4_gemm = None
-    kernel.sparse_attn = _torch_sparse_attn
-    kernel.hc_split_sinkhorn = None
-    sys.modules["kernel"] = kernel
-
-
-def _make_linear_reference():
-    def linear(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        assert bias is None
-        return torch.matmul(x.float(), weight.t().contiguous().float()).to(x.dtype)
-
-    return linear
-
-
-def _make_einsum_reference(original_einsum):
-    def einsum(equation, *operands, **kwargs):
-        if equation == "bsgd,grd->bsgr":
-            out_dtype = operands[0].dtype
-            return original_einsum(equation, *(operand.float() for operand in operands), **kwargs).to(out_dtype)
-        return original_einsum(equation, *operands, **kwargs)
-
-    return einsum
-
-
-def _make_square_reference(original_square):
-    def square(tensor, *args, **kwargs):
-        if tensor.dtype is torch.bfloat16:
-            return original_square(tensor.float(), *args, **kwargs)
-        return original_square(tensor, *args, **kwargs)
-
-    return square
-
-
-_install_pypto_language_stub()
-_install_official_kernel_stub()
+from conftest import make_einsum_reference, make_linear_reference, make_square_reference, torch_sparse_attn
 
 import models.attention_hca as attention_hca  # noqa: E402
 import models.compressor_ratio128 as compressor_ratio128  # noqa: E402
@@ -122,7 +16,6 @@ COMMON_PREFILL_SEQ_LENS = [3, 4, 7, 8, 13]
 COMMON_DECODE_START_POSITIONS = [1, 3, 4, 7, 8, 13]
 PREFILL_SEQ_LENS = [*COMMON_PREFILL_SEQ_LENS, 128, 130]
 DECODE_START_POSITIONS = [*COMMON_DECODE_START_POSITIONS, 126, 127]
-
 
 @pytest.fixture()
 def tiny_args(monkeypatch):
@@ -189,14 +82,13 @@ def tiny_args(monkeypatch):
     monkeypatch.setattr(rope, "HEAD_DIM", args.head_dim)
     monkeypatch.setattr(rope, "HEAD_TAIL_OFFSET", args.head_dim - args.rope_head_dim)
 
-    monkeypatch.setattr(official_model, "sparse_attn", _torch_sparse_attn)
+    monkeypatch.setattr(official_model, "sparse_attn", torch_sparse_attn)
     monkeypatch.setattr(official_model, "act_quant", lambda x, *args, **kwargs: x)
     monkeypatch.setattr(official_model, "fp4_act_quant", lambda x, *args, **kwargs: x)
-    monkeypatch.setattr(official_model, "linear", _make_linear_reference())
-    monkeypatch.setattr(torch, "einsum", _make_einsum_reference(torch.einsum))
-    monkeypatch.setattr(torch.Tensor, "square", _make_square_reference(torch.Tensor.square))
+    monkeypatch.setattr(official_model, "linear", make_linear_reference())
+    monkeypatch.setattr(torch, "einsum", make_einsum_reference(torch.einsum))
+    monkeypatch.setattr(torch.Tensor, "square", make_square_reference(torch.Tensor.square))
     return args
-
 
 def _make_official_attention(args) -> torch.nn.Module:
     torch.manual_seed(20260701)
@@ -220,11 +112,9 @@ def _make_official_attention(args) -> torch.nn.Module:
         attn.compressor.norm.weight.copy_(torch.rand(args.head_dim, dtype=torch.float32) + 0.5)
     return attn
 
-
 def _rope_cos_sin(attn: torch.nn.Module, start_pos: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
     freqs = attn.freqs_cis[start_pos : start_pos + seq_len]
     return freqs.real.contiguous(), freqs.imag.contiguous()
-
 
 def _compressor_cos_sin(attn: torch.nn.Module, seq_len: int, start_pos: int) -> tuple[torch.Tensor, torch.Tensor]:
     if start_pos == 0:
@@ -241,7 +131,6 @@ def _compressor_cos_sin(attn: torch.nn.Module, seq_len: int, start_pos: int) -> 
         )
     return freqs.real.contiguous(), freqs.imag.contiguous()
 
-
 def _topk_idxs(attn: torch.nn.Module, seq_len: int, start_pos: int) -> torch.Tensor:
     window_topk = official_model.get_window_topk_idxs(attn.window_size, 1, seq_len, start_pos).int()
     offset = seq_len if start_pos == 0 else attn.window_size
@@ -254,7 +143,6 @@ def _topk_idxs(attn: torch.nn.Module, seq_len: int, start_pos: int) -> torch.Ten
     if pad_compress > 0:
         compress_topk = torch.nn.functional.pad(compress_topk, (0, pad_compress), value=-1)
     return torch.cat([window_topk, compress_topk], dim=-1)
-
 
 def _base_tensors(attn: torch.nn.Module, x: torch.Tensor, start_pos: int) -> dict[str, torch.Tensor]:
     seq_len = x.shape[1]
@@ -280,7 +168,6 @@ def _base_tensors(attn: torch.nn.Module, x: torch.Tensor, start_pos: int) -> dic
         "comp_cos": comp_cos,
         "comp_sin": comp_sin,
     }
-
 
 def _add_output_tensors(tensors: dict[str, torch.Tensor], args, seq_len: int, *, decode: bool) -> None:
     compressed_len = 1 if decode else max(1, seq_len // 128)
@@ -311,7 +198,6 @@ def _add_output_tensors(tensors: dict[str, torch.Tensor], args, seq_len: int, *,
         }
     )
 
-
 @pytest.mark.parametrize("seq_len", PREFILL_SEQ_LENS)
 def test_attention_hca_prefill_golden_matches_official_model(tiny_args, seq_len: int) -> None:
     attn = _make_official_attention(tiny_args)
@@ -331,7 +217,6 @@ def test_attention_hca_prefill_golden_matches_official_model(tiny_args, seq_len:
     torch.testing.assert_close(tensors["comp_kv_state_out"], attn.compressor.kv_state, rtol=0, atol=0)
     valid = torch.isfinite(attn.compressor.score_state)
     torch.testing.assert_close(tensors["comp_score_state_out"][valid], attn.compressor.score_state[valid], rtol=0, atol=0)
-
 
 @pytest.mark.parametrize("start_pos", DECODE_START_POSITIONS)
 def test_attention_hca_decode_golden_matches_official_model(tiny_args, start_pos: int) -> None:

@@ -1,70 +1,14 @@
 """Tests for MoE Gate golden logic against official ``model.py``."""
 
 import importlib
-import sys
-import types
-from pathlib import Path
 
 import pytest
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-
-def _install_pypto_language_stub() -> None:
-    """Allow importing PyPTO kernel modules in host-only unit tests."""
-
-    if "pypto.language" in sys.modules:
-        return
-
-    class _Tensor:
-        def __class_getitem__(cls, _item):
-            return cls
-
-    class _Jit:
-        def __call__(self, fn):
-            return fn
-
-        def inline(self, fn):
-            return fn
-
-    language = types.ModuleType("pypto.language")
-    language.Tensor = _Tensor
-    language.Out = _Tensor
-    language.BF16 = object()
-    language.FP32 = object()
-    language.INT32 = object()
-    language.INT64 = object()
-    language.INDEX = object()
-    language.jit = _Jit()
-    language.dynamic = lambda _name: 1
-
-    pypto = types.ModuleType("pypto")
-    pypto.language = language
-    sys.modules["pypto"] = pypto
-    sys.modules["pypto.language"] = language
-
-
-def _install_official_kernel_stub() -> None:
-    kernel = types.ModuleType("kernel")
-    kernel.act_quant = lambda x, *args, **kwargs: x
-    kernel.fp4_act_quant = lambda x, *args, **kwargs: x
-    kernel.fp8_gemm = None
-    kernel.fp4_gemm = None
-    kernel.sparse_attn = None
-    kernel.hc_split_sinkhorn = None
-    sys.modules["kernel"] = kernel
-
-
-_install_pypto_language_stub()
-_install_official_kernel_stub()
+from conftest import make_linear_reference
 
 import models.gate as gate  # noqa: E402
 
 official_model = importlib.import_module("official.model")
-
 
 DIM = 16
 N_EXPERTS = 8
@@ -72,19 +16,6 @@ TOPK = 3
 VOCAB = 32
 ROUTE_SCALE = 1.5
 SEQ_LENS = [1, 3, 13]
-
-
-def _make_linear_reference():
-    def linear(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        assert bias is None
-        return torch.matmul(x.float(), weight.t().contiguous().float()).to(x.dtype)
-
-    return linear
-
 
 @pytest.fixture()
 def tiny_gate_args(monkeypatch):
@@ -125,9 +56,8 @@ def tiny_gate_args(monkeypatch):
     monkeypatch.setattr(gate, "TOPK", args.n_activated_experts)
     monkeypatch.setattr(gate, "VOCAB", args.vocab_size)
     monkeypatch.setattr(gate, "ROUTE_SCALE", args.route_scale)
-    monkeypatch.setattr(official_model, "linear", _make_linear_reference())
+    monkeypatch.setattr(official_model, "linear", make_linear_reference())
     return args
-
 
 def _make_official_gate(args, *, layer_id: int) -> torch.nn.Module:
     torch.manual_seed(20260703 + layer_id)
@@ -144,7 +74,6 @@ def _make_official_gate(args, *, layer_id: int) -> torch.nn.Module:
             module.tid2eid.copy_((base + token_offsets) % args.n_routed_experts)
     return module
 
-
 def _base_tensors(module: torch.nn.Module, x: torch.Tensor) -> dict[str, torch.Tensor]:
     bsz, seq_len, _ = x.shape
     return {
@@ -155,7 +84,6 @@ def _base_tensors(module: torch.nn.Module, x: torch.Tensor) -> dict[str, torch.T
         "indices": torch.zeros(bsz, seq_len, TOPK, dtype=torch.int32),
         "weights": torch.zeros(bsz, seq_len, TOPK, dtype=torch.float32),
     }
-
 
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 def test_golden_gate_hash_matches_official_model(tiny_gate_args, seq_len: int) -> None:
@@ -173,7 +101,6 @@ def test_golden_gate_hash_matches_official_model(tiny_gate_args, seq_len: int) -
 
     torch.testing.assert_close(tensors["indices"], expected_indices.view(1, seq_len, TOPK).to(torch.int32), rtol=0, atol=0)
     torch.testing.assert_close(tensors["weights"], expected_weights.view(1, seq_len, TOPK), rtol=0, atol=0)
-
 
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 def test_golden_gate_topk_matches_official_model(tiny_gate_args, seq_len: int) -> None:
