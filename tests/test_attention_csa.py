@@ -4,8 +4,15 @@ import importlib
 
 import pytest
 import torch
-import torch.nn.functional as F
-from conftest import make_einsum_reference, make_linear_reference, make_square_reference, torch_sparse_attn
+from conftest import (
+    compressor_cos_sin,
+    make_einsum_reference,
+    make_linear_reference,
+    make_square_reference,
+    pad_last_dim,
+    rope_cos_sin,
+    torch_sparse_attn,
+)
 
 import models.attention_csa as attention_csa  # noqa: E402
 import models.compressor_ratio4 as compressor_ratio4  # noqa: E402
@@ -166,35 +173,11 @@ def _make_official_attention(args) -> torch.nn.Module:
         _copy_param(attn.indexer.compressor.norm.weight, torch.rand(args.index_head_dim, dtype=torch.float32) + 0.5)
     return attn
 
-def _pad_last_dim(tensor: torch.Tensor, width: int, value: int = -1) -> torch.Tensor:
-    if tensor.shape[-1] == width:
-        return tensor.to(torch.int32)
-    return F.pad(tensor.to(torch.int32), (0, width - tensor.shape[-1]), value=value)
-
-def _rope_cos_sin(attn: torch.nn.Module, start_pos: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-    freqs = attn.freqs_cis[start_pos : start_pos + seq_len]
-    return freqs.real.contiguous(), freqs.imag.contiguous()
-
-def _compressor_cos_sin(attn: torch.nn.Module, seq_len: int, start_pos: int) -> tuple[torch.Tensor, torch.Tensor]:
-    if start_pos == 0:
-        cutoff = seq_len - seq_len % 4
-        freqs = attn.freqs_cis[:cutoff:4]
-        if freqs.shape[0] == 0:
-            freqs = attn.freqs_cis[:1]
-    elif (start_pos + 1) % 4 == 0:
-        freqs = attn.freqs_cis[start_pos + 1 - 4 : start_pos + 2 - 4]
-    else:
-        return (
-            torch.zeros(1, attn.rope_head_dim // 2, dtype=torch.float32),
-            torch.zeros(1, attn.rope_head_dim // 2, dtype=torch.float32),
-        )
-    return freqs.real.contiguous(), freqs.imag.contiguous()
-
 def _base_tensors(attn: torch.nn.Module, x: torch.Tensor, args, start_pos: int) -> dict[str, torch.Tensor]:
     seq_len = x.shape[1]
     blocks = seq_len // 4
-    cos, sin = _rope_cos_sin(attn, start_pos, seq_len)
-    comp_cos, comp_sin = _compressor_cos_sin(attn, seq_len, start_pos)
+    cos, sin = rope_cos_sin(attn, start_pos, seq_len)
+    comp_cos, comp_sin = compressor_cos_sin(attn, 4, seq_len, start_pos)
     window_topk = official_model.get_window_topk_idxs(args.window_size, 1, seq_len, start_pos)
     offset = seq_len if start_pos == 0 else args.window_size
     return {
@@ -205,7 +188,7 @@ def _base_tensors(attn: torch.nn.Module, x: torch.Tensor, args, start_pos: int) 
         "wkv_t": attn.wkv.weight.detach().t().contiguous().to(torch.bfloat16),
         "kv_norm_w": attn.kv_norm.weight.detach().clone(),
         "attn_sink": attn.attn_sink.detach().clone(),
-        "window_topk_idxs": _pad_last_dim(window_topk, args.window_size),
+        "window_topk_idxs": pad_last_dim(window_topk, args.window_size),
         "wo_a_t": attn.wo_a.weight.detach().t().contiguous().to(torch.bfloat16),
         "wo_b_t": attn.wo_b.weight.detach().t().contiguous().to(torch.bfloat16),
         "cos": cos,

@@ -4,7 +4,15 @@ import importlib
 
 import pytest
 import torch
-from conftest import make_einsum_reference, make_linear_reference, make_square_reference, torch_sparse_attn
+from conftest import (
+    compressor_cos_sin,
+    make_einsum_reference,
+    make_linear_reference,
+    make_square_reference,
+    pad_last_dim,
+    rope_cos_sin,
+    torch_sparse_attn,
+)
 
 import models.attention_hca as attention_hca  # noqa: E402
 import models.compressor_ratio128 as compressor_ratio128  # noqa: E402
@@ -112,42 +120,23 @@ def _make_official_attention(args) -> torch.nn.Module:
         attn.compressor.norm.weight.copy_(torch.rand(args.head_dim, dtype=torch.float32) + 0.5)
     return attn
 
-def _rope_cos_sin(attn: torch.nn.Module, start_pos: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-    freqs = attn.freqs_cis[start_pos : start_pos + seq_len]
-    return freqs.real.contiguous(), freqs.imag.contiguous()
-
-def _compressor_cos_sin(attn: torch.nn.Module, seq_len: int, start_pos: int) -> tuple[torch.Tensor, torch.Tensor]:
-    if start_pos == 0:
-        cutoff = seq_len - seq_len % 128
-        freqs = attn.freqs_cis[:cutoff:128]
-        if freqs.shape[0] == 0:
-            freqs = attn.freqs_cis[:1]
-    elif (start_pos + 1) % 128 == 0:
-        freqs = attn.freqs_cis[start_pos + 1 - 128 : start_pos + 2 - 128]
-    else:
-        return (
-            torch.zeros(1, attn.rope_head_dim // 2, dtype=torch.float32),
-            torch.zeros(1, attn.rope_head_dim // 2, dtype=torch.float32),
-        )
-    return freqs.real.contiguous(), freqs.imag.contiguous()
-
 def _topk_idxs(attn: torch.nn.Module, seq_len: int, start_pos: int) -> torch.Tensor:
     window_topk = official_model.get_window_topk_idxs(attn.window_size, 1, seq_len, start_pos).int()
     offset = seq_len if start_pos == 0 else attn.window_size
     compress_topk = official_model.get_compress_topk_idxs(128, 1, seq_len, start_pos, offset).int()
     compressed_slots = attn.kv_cache.shape[1] - attn.window_size
-    pad_window = attn.window_size - window_topk.shape[-1]
-    pad_compress = compressed_slots - compress_topk.shape[-1]
-    if pad_window > 0:
-        window_topk = torch.nn.functional.pad(window_topk, (0, pad_window), value=-1)
-    if pad_compress > 0:
-        compress_topk = torch.nn.functional.pad(compress_topk, (0, pad_compress), value=-1)
-    return torch.cat([window_topk, compress_topk], dim=-1)
+    return torch.cat(
+        [
+            pad_last_dim(window_topk, attn.window_size),
+            pad_last_dim(compress_topk, compressed_slots),
+        ],
+        dim=-1,
+    )
 
 def _base_tensors(attn: torch.nn.Module, x: torch.Tensor, start_pos: int) -> dict[str, torch.Tensor]:
     seq_len = x.shape[1]
-    cos, sin = _rope_cos_sin(attn, start_pos, seq_len)
-    comp_cos, comp_sin = _compressor_cos_sin(attn, seq_len, start_pos)
+    cos, sin = rope_cos_sin(attn, start_pos, seq_len)
+    comp_cos, comp_sin = compressor_cos_sin(attn, 128, seq_len, start_pos)
     return {
         "x": x.clone(),
         "wq_a_t": attn.wq_a.weight.t().contiguous(),

@@ -5,6 +5,7 @@ import types
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -118,6 +119,38 @@ def make_square_reference(original_square):
         return original_square(tensor, *args, **kwargs)
 
     return square
+
+
+def pad_last_dim(tensor: torch.Tensor, width: int, value: int = -1) -> torch.Tensor:
+    if tensor.shape[-1] == width:
+        return tensor.to(torch.int32)
+    return F.pad(tensor.to(torch.int32), (0, width - tensor.shape[-1]), value=value)
+
+
+def rope_cos_sin(attn: torch.nn.Module, start_pos: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    freqs = attn.freqs_cis[start_pos : start_pos + seq_len]
+    return freqs.real.contiguous(), freqs.imag.contiguous()
+
+
+def compressor_cos_sin(
+    attn: torch.nn.Module,
+    ratio: int,
+    seq_len: int,
+    start_pos: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if start_pos == 0:
+        cutoff = seq_len - seq_len % ratio
+        freqs = attn.freqs_cis[:cutoff:ratio]
+        if freqs.shape[0] == 0:
+            freqs = attn.freqs_cis[:1]
+    elif (start_pos + 1) % ratio == 0:
+        freqs = attn.freqs_cis[start_pos + 1 - ratio : start_pos + 2 - ratio]
+    else:
+        return (
+            torch.zeros(1, attn.rope_head_dim // 2, dtype=torch.float32),
+            torch.zeros(1, attn.rope_head_dim // 2, dtype=torch.float32),
+        )
+    return freqs.real.contiguous(), freqs.imag.contiguous()
 
 
 def official_apply_rotary_emb(

@@ -4,7 +4,7 @@ import importlib
 
 import pytest
 import torch
-from conftest import make_einsum_reference, make_linear_reference, make_square_reference, torch_sparse_attn
+from conftest import make_einsum_reference, make_linear_reference, make_square_reference, rope_cos_sin, torch_sparse_attn
 
 import models.attention_swa as attention_swa  # noqa: E402
 import models.rope as rope  # noqa: E402
@@ -97,13 +97,9 @@ def _make_official_attention(args) -> torch.nn.Module:
         attn.wo_b.weight.copy_(torch.randn(args.dim, args.o_groups * args.o_lora_rank, dtype=torch.bfloat16) * 0.1)
     return attn
 
-def _rope_cos_sin(attn: torch.nn.Module, start_pos: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-    freqs = attn.freqs_cis[start_pos : start_pos + seq_len]
-    return freqs.real.contiguous(), freqs.imag.contiguous()
-
 def _base_tensors(attn: torch.nn.Module, x: torch.Tensor, start_pos: int) -> dict[str, torch.Tensor]:
     seq_len = x.shape[1]
-    cos, sin = _rope_cos_sin(attn, start_pos, seq_len)
+    cos, sin = rope_cos_sin(attn, start_pos, seq_len)
     topk_idxs = official_model.get_window_topk_idxs(attn.window_size, x.shape[0], seq_len, start_pos).int()
     return {
         "x": x.clone(),
