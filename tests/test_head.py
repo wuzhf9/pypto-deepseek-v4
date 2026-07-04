@@ -57,10 +57,11 @@ def _head_tensors(
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    seq_len = x.shape[1]
+    hc_fn_t = torch.zeros(HC_DIM, head_model.HC_PAD, dtype=torch.float32)
+    hc_fn_t[:, :HC_MULT] = hc_fn.t().contiguous()
     return {
         "x": x.clone(),
-        "hc_fn": hc_fn.clone(),
+        "hc_fn_t": hc_fn_t,
         "hc_scale": hc_scale.clone(),
         "hc_base": hc_base.clone(),
         "norm_w": norm.weight.detach().clone(),
@@ -98,8 +99,8 @@ def test_build_head_specs_shapes_and_dtypes(monkeypatch) -> None:
     assert tensors["x"].dtype == torch.bfloat16
     assert tensors["x_pad"].shape == (1, padded_seq_len, HC_MULT, HIDDEN)
     assert tensors["x_pad"].dtype == torch.bfloat16
-    assert tensors["hc_fn"].shape == (head_model.HC_PAD, HC_DIM)
-    assert tensors["hc_fn"].dtype == torch.float32
+    assert tensors["hc_fn_t"].shape == (HC_DIM, head_model.HC_PAD)
+    assert tensors["hc_fn_t"].dtype == torch.float32
     assert tensors["hc_scale"].shape == (1,)
     assert tensors["hc_base"].shape == (head_model.HC_PAD,)
     assert tensors["norm_w"].shape == (HIDDEN,)

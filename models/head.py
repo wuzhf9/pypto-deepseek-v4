@@ -49,7 +49,7 @@ VOCAB_BLOCKS = VOCAB // VOCAB_TILE
 def hc_head_fwd(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
-    hc_fn: pl.Tensor[[HC_PAD, HC_DIM], pl.FP32],
+    hc_fn_t: pl.Tensor[[HC_DIM, HC_PAD], pl.FP32],
     hc_scale: pl.Tensor[[1], pl.FP32],
     hc_base: pl.Tensor[[HC_PAD], pl.FP32],
     pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -104,16 +104,16 @@ def hc_head_fwd(
                 pl.slice(x_flat, [T_TILE, LINEAR_K_CHUNK], [t0, 0]),
                 target_type=pl.FP32,
             )
-            w0 = pl.slice(hc_fn, [HC_PAD, LINEAR_K_CHUNK], [0, 0])
-            acc = pl.matmul(x0, w0, b_trans=True, out_dtype=pl.FP32)
+            w0 = pl.slice(hc_fn_t, [LINEAR_K_CHUNK, HC_PAD], [0, 0])
+            acc = pl.matmul(x0, w0, out_dtype=pl.FP32)
             for kb in pl.pipeline(1, LINEAR_K_BLOCKS, stage=2):
                 k0 = kb * LINEAR_K_CHUNK
                 x_chunk = pl.cast(
                     pl.slice(x_flat, [T_TILE, LINEAR_K_CHUNK], [t0, k0]),
                     target_type=pl.FP32,
                 )
-                w_chunk = pl.slice(hc_fn, [HC_PAD, LINEAR_K_CHUNK], [0, k0])
-                acc = pl.matmul_acc(acc, x_chunk, w_chunk, b_trans=True)
+                w_chunk = pl.slice(hc_fn_t, [LINEAR_K_CHUNK, HC_PAD], [k0, 0])
+                acc = pl.matmul_acc(acc, x_chunk, w_chunk)
             scaled = pl.row_expand_mul(acc, inv)
             base = pl.reshape(pl.slice(hc_base, [HC_PAD], [0]), [1, HC_PAD])
             logits = pl.add(
@@ -205,7 +205,7 @@ def lm_head_fwd(
 def head_fwd(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
-    hc_fn: pl.Tensor[[HC_PAD, HC_DIM], pl.FP32],
+    hc_fn_t: pl.Tensor[[HC_DIM, HC_PAD], pl.FP32],
     hc_scale: pl.Tensor[[1], pl.FP32],
     hc_base: pl.Tensor[[HC_PAD], pl.FP32],
     norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -224,7 +224,7 @@ def head_fwd(
     hc_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
     normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
     logits_pad = pl.create_tensor([T_TILE, VOCAB], dtype=pl.FP32)
-    hc_out = hc_head_fwd(x, x_pad, hc_fn, hc_scale, hc_base, pre, hc_out_pad, hc_out)
+    hc_out = hc_head_fwd(x, x_pad, hc_fn_t, hc_scale, hc_base, pre, hc_out_pad, hc_out)
     normed = rmsnorm_4096(hc_out, norm_w, normed)
     logits = lm_head_fwd(normed, head_w, logits_pad, logits)
     return logits
@@ -234,7 +234,7 @@ def head_fwd(
 def head_test(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
-    hc_fn: pl.Tensor[[HC_PAD, HC_DIM], pl.FP32],
+    hc_fn_t: pl.Tensor[[HC_DIM, HC_PAD], pl.FP32],
     hc_scale: pl.Tensor[[1], pl.FP32],
     hc_base: pl.Tensor[[HC_PAD], pl.FP32],
     norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -246,7 +246,7 @@ def head_test(
     logits = head_fwd(
         x,
         x_pad,
-        hc_fn,
+        hc_fn_t,
         hc_scale,
         hc_base,
         norm_w,
@@ -267,7 +267,7 @@ def golden_head(tensors):
     x_flat = x.flatten(2).float()
 
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + NORM_EPS)
-    hc_fn = tensors["hc_fn"][:HC_MULT].float()
+    hc_fn = tensors["hc_fn_t"][:, :HC_MULT].transpose(0, 1).contiguous().float()
     hc_base = tensors["hc_base"][:HC_MULT].float()
     mixes = F.linear(x_flat, hc_fn) * rsqrt
     pre = torch.sigmoid(mixes * tensors["hc_scale"].float() + hc_base) + HC_EPS
@@ -292,9 +292,9 @@ def build_head_specs(seq_len: int = DEFAULT_SEQ_LEN):
     def init_x():
         return torch.randn(B, seq_len, HC_MULT, HIDDEN) * 0.2
 
-    def init_hc_fn():
-        weight = torch.zeros(HC_PAD, HC_DIM)
-        weight[:HC_MULT] = torch.randn(HC_MULT, HC_DIM) * 0.02
+    def init_hc_fn_t():
+        weight = torch.zeros(HC_DIM, HC_PAD)
+        weight[:, :HC_MULT] = torch.randn(HC_DIM, HC_MULT) * 0.02
         return weight
 
     def init_hc_scale():
@@ -314,7 +314,7 @@ def build_head_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return [
         TensorSpec("x", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16, init_value=init_x),
         TensorSpec("x_pad", [B, padded_seq_len, HC_MULT, HIDDEN], torch.bfloat16),
-        TensorSpec("hc_fn", [HC_PAD, HC_DIM], torch.float32, init_value=init_hc_fn),
+        TensorSpec("hc_fn_t", [HC_DIM, HC_PAD], torch.float32, init_value=init_hc_fn_t),
         TensorSpec("hc_scale", [1], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [HC_PAD], torch.float32, init_value=init_hc_base),
         TensorSpec("norm_w", [HIDDEN], torch.bfloat16, init_value=init_norm_w),

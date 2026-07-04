@@ -492,10 +492,10 @@ def _block_tensors(
     tensors = {
         "x": x.clone(),
         "out": torch.zeros_like(x),
-        "attn_hc_fn": module.hc_attn_fn.detach().clone(),
+        "attn_hc_fn_t": module.hc_attn_fn.detach().t().contiguous(),
         "attn_hc_scale": module.hc_attn_scale.detach().clone(),
         "attn_hc_base": module.hc_attn_base.detach().clone(),
-        "ffn_hc_fn": module.hc_ffn_fn.detach().clone(),
+        "ffn_hc_fn_t": module.hc_ffn_fn.detach().t().contiguous(),
         "ffn_hc_scale": module.hc_ffn_scale.detach().clone(),
         "ffn_hc_base": module.hc_ffn_base.detach().clone(),
         "attn_norm_w": module.attn_norm.weight.detach().clone(),

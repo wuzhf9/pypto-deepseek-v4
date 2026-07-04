@@ -114,7 +114,7 @@ def test_golden_hc_pre_matches_official_block(tiny_block_args, monkeypatch, seq_
 
     tensors = {
         "x": x.clone(),
-        "hc_fn": block.hc_attn_fn.detach().clone(),
+        "hc_fn_t": block.hc_attn_fn.detach().t().contiguous(),
         "hc_scale": block.hc_attn_scale.detach().clone(),
         "hc_base": block.hc_attn_base.detach().clone(),
         "x_mixed": torch.zeros(1, seq_len, DIM, dtype=torch.bfloat16),

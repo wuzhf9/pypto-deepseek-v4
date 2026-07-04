@@ -72,7 +72,7 @@ assert HC_MULT == 4, "Block kernel currently expects DeepSeek V4 Flash hc_mult=4
 @pl.jit
 def block_swa_hash_prefill_fwd(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
-    attn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    attn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     attn_hc_scale: pl.Tensor[[3], pl.FP32],
     attn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -87,7 +87,7 @@ def block_swa_hash_prefill_fwd(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    ffn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     ffn_hc_scale: pl.Tensor[[3], pl.FP32],
     ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -135,7 +135,7 @@ def block_swa_hash_prefill_fwd(
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
-        attn_hc_fn,
+        attn_hc_fn_t,
         attn_hc_scale,
         attn_hc_base,
         attn_hc_mixes,
@@ -170,7 +170,7 @@ def block_swa_hash_prefill_fwd(
     hc_pre_fwd(
         attn_hc_out,
         ffn_hc_x_pad,
-        ffn_hc_fn,
+        ffn_hc_fn_t,
         ffn_hc_scale,
         ffn_hc_base,
         ffn_hc_mixes,
@@ -206,7 +206,7 @@ def block_swa_hash_decode_fwd(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     kv_cache: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
     cache_pos: pl.Tensor[[1], pl.INT32],
-    attn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    attn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     attn_hc_scale: pl.Tensor[[3], pl.FP32],
     attn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -221,7 +221,7 @@ def block_swa_hash_decode_fwd(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    ffn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     ffn_hc_scale: pl.Tensor[[3], pl.FP32],
     ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -269,7 +269,7 @@ def block_swa_hash_decode_fwd(
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
-        attn_hc_fn,
+        attn_hc_fn_t,
         attn_hc_scale,
         attn_hc_base,
         attn_hc_mixes,
@@ -306,7 +306,7 @@ def block_swa_hash_decode_fwd(
     hc_pre_fwd(
         attn_hc_out,
         ffn_hc_x_pad,
-        ffn_hc_fn,
+        ffn_hc_fn_t,
         ffn_hc_scale,
         ffn_hc_base,
         ffn_hc_mixes,
@@ -340,7 +340,7 @@ def block_swa_hash_decode_fwd(
 @pl.jit
 def block_csa_hash_prefill_fwd(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
-    attn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    attn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     attn_hc_scale: pl.Tensor[[3], pl.FP32],
     attn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -372,7 +372,7 @@ def block_csa_hash_prefill_fwd(
     idx_comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     idx_comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     idx_comp_block_count: pl.Tensor[[1], pl.INT32],
-    ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    ffn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     ffn_hc_scale: pl.Tensor[[3], pl.FP32],
     ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -427,7 +427,7 @@ def block_csa_hash_prefill_fwd(
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
-        attn_hc_fn,
+        attn_hc_fn_t,
         attn_hc_scale,
         attn_hc_base,
         attn_hc_mixes,
@@ -486,7 +486,7 @@ def block_csa_hash_prefill_fwd(
     hc_pre_fwd(
         attn_hc_out,
         ffn_hc_x_pad,
-        ffn_hc_fn,
+        ffn_hc_fn_t,
         ffn_hc_scale,
         ffn_hc_base,
         ffn_hc_mixes,
@@ -540,7 +540,7 @@ def block_csa_hash_decode_fwd(
     comp_slot: pl.Tensor[[1], pl.INT32],
     comp_cache_slot: pl.Tensor[[1], pl.INT32],
     comp_should_compress: pl.Tensor[[1], pl.INT32],
-    attn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    attn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     attn_hc_scale: pl.Tensor[[3], pl.FP32],
     attn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -570,7 +570,7 @@ def block_csa_hash_decode_fwd(
     idx_comp_norm_w: pl.Tensor[[INDEX_HEAD_DIM], pl.BF16],
     idx_comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     idx_comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    ffn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     ffn_hc_scale: pl.Tensor[[3], pl.FP32],
     ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -625,7 +625,7 @@ def block_csa_hash_decode_fwd(
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
-        attn_hc_fn,
+        attn_hc_fn_t,
         attn_hc_scale,
         attn_hc_base,
         attn_hc_mixes,
@@ -692,7 +692,7 @@ def block_csa_hash_decode_fwd(
     hc_pre_fwd(
         attn_hc_out,
         ffn_hc_x_pad,
-        ffn_hc_fn,
+        ffn_hc_fn_t,
         ffn_hc_scale,
         ffn_hc_base,
         ffn_hc_mixes,
@@ -735,7 +735,7 @@ def block_csa_hash_decode_fwd(
 @pl.jit
 def block_csa_topk_prefill_fwd(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
-    attn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    attn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     attn_hc_scale: pl.Tensor[[3], pl.FP32],
     attn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -767,7 +767,7 @@ def block_csa_topk_prefill_fwd(
     idx_comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     idx_comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     idx_comp_block_count: pl.Tensor[[1], pl.INT32],
-    ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    ffn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     ffn_hc_scale: pl.Tensor[[3], pl.FP32],
     ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -821,7 +821,7 @@ def block_csa_topk_prefill_fwd(
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
-        attn_hc_fn,
+        attn_hc_fn_t,
         attn_hc_scale,
         attn_hc_base,
         attn_hc_mixes,
@@ -880,7 +880,7 @@ def block_csa_topk_prefill_fwd(
     hc_pre_fwd(
         attn_hc_out,
         ffn_hc_x_pad,
-        ffn_hc_fn,
+        ffn_hc_fn_t,
         ffn_hc_scale,
         ffn_hc_base,
         ffn_hc_mixes,
@@ -933,7 +933,7 @@ def block_csa_topk_decode_fwd(
     comp_slot: pl.Tensor[[1], pl.INT32],
     comp_cache_slot: pl.Tensor[[1], pl.INT32],
     comp_should_compress: pl.Tensor[[1], pl.INT32],
-    attn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    attn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     attn_hc_scale: pl.Tensor[[3], pl.FP32],
     attn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -963,7 +963,7 @@ def block_csa_topk_decode_fwd(
     idx_comp_norm_w: pl.Tensor[[INDEX_HEAD_DIM], pl.BF16],
     idx_comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     idx_comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    ffn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     ffn_hc_scale: pl.Tensor[[3], pl.FP32],
     ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -1017,7 +1017,7 @@ def block_csa_topk_decode_fwd(
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
-        attn_hc_fn,
+        attn_hc_fn_t,
         attn_hc_scale,
         attn_hc_base,
         attn_hc_mixes,
@@ -1084,7 +1084,7 @@ def block_csa_topk_decode_fwd(
     hc_pre_fwd(
         attn_hc_out,
         ffn_hc_x_pad,
-        ffn_hc_fn,
+        ffn_hc_fn_t,
         ffn_hc_scale,
         ffn_hc_base,
         ffn_hc_mixes,
@@ -1126,7 +1126,7 @@ def block_csa_topk_decode_fwd(
 @pl.jit
 def block_hca_topk_prefill_fwd(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
-    attn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    attn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     attn_hc_scale: pl.Tensor[[3], pl.FP32],
     attn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -1148,7 +1148,7 @@ def block_hca_topk_prefill_fwd(
     comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_block_count: pl.Tensor[[1], pl.INT32],
-    ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    ffn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     ffn_hc_scale: pl.Tensor[[3], pl.FP32],
     ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -1199,7 +1199,7 @@ def block_hca_topk_prefill_fwd(
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
-        attn_hc_fn,
+        attn_hc_fn_t,
         attn_hc_scale,
         attn_hc_base,
         attn_hc_mixes,
@@ -1245,7 +1245,7 @@ def block_hca_topk_prefill_fwd(
     hc_pre_fwd(
         attn_hc_out,
         ffn_hc_x_pad,
-        ffn_hc_fn,
+        ffn_hc_fn_t,
         ffn_hc_scale,
         ffn_hc_base,
         ffn_hc_mixes,
@@ -1286,7 +1286,7 @@ def block_hca_topk_decode_fwd(
     comp_slot: pl.Tensor[[1], pl.INT32],
     comp_cache_slot: pl.Tensor[[1], pl.INT32],
     comp_should_compress: pl.Tensor[[1], pl.INT32],
-    attn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    attn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     attn_hc_scale: pl.Tensor[[3], pl.FP32],
     attn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -1307,7 +1307,7 @@ def block_hca_topk_decode_fwd(
     comp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    ffn_hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    ffn_hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     ffn_hc_scale: pl.Tensor[[3], pl.FP32],
     ffn_hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     ffn_norm_w: pl.Tensor[[HIDDEN], pl.BF16],
@@ -1358,7 +1358,7 @@ def block_hca_topk_decode_fwd(
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
-        attn_hc_fn,
+        attn_hc_fn_t,
         attn_hc_scale,
         attn_hc_base,
         attn_hc_mixes,
@@ -1410,7 +1410,7 @@ def block_hca_topk_decode_fwd(
     hc_pre_fwd(
         attn_hc_out,
         ffn_hc_x_pad,
-        ffn_hc_fn,
+        ffn_hc_fn_t,
         ffn_hc_scale,
         ffn_hc_base,
         ffn_hc_mixes,
@@ -1459,7 +1459,7 @@ def _run_hc_pre(tensors: dict[str, torch.Tensor], *, prefix: str, x: torch.Tenso
     bsz, seq_len = x.shape[:2]
     hc_tensors = {
         "x": x,
-        "hc_fn": _prefixed(tensors, prefix, "hc_fn"),
+        "hc_fn_t": _prefixed(tensors, prefix, "hc_fn_t"),
         "hc_scale": _prefixed(tensors, prefix, "hc_scale"),
         "hc_base": _prefixed(tensors, prefix, "hc_base"),
         "x_mixed": _optional_tensor(tensors, f"{prefix}_hc_x_mixed", (bsz, seq_len, HIDDEN), x.dtype),
@@ -1629,8 +1629,8 @@ def _build_swa_hash_specs(seq_len: int, start_pos: int, *, decode: bool):
     def init_x():
         return (torch.randn(B, seq_len, HC_MULT, HIDDEN, dtype=torch.float32) * 0.05).to(torch.bfloat16)
 
-    def init_hc_fn():
-        return torch.randn(MIX_HC, HC_DIM, dtype=torch.float32) * 0.01
+    def init_hc_fn_t():
+        return torch.randn(HC_DIM, MIX_HC, dtype=torch.float32) * 0.01
 
     def init_hc_scale():
         return torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
@@ -1712,7 +1712,7 @@ def _build_swa_hash_specs(seq_len: int, start_pos: int, *, decode: bool):
 
     specs.extend(
         [
-            TensorSpec("attn_hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
+            TensorSpec("attn_hc_fn_t", [HC_DIM, MIX_HC], torch.float32, init_value=init_hc_fn_t),
             TensorSpec("attn_hc_scale", [3], torch.float32, init_value=init_hc_scale),
             TensorSpec("attn_hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
             TensorSpec("attn_norm_w", [HIDDEN], torch.bfloat16, init_value=init_norm_w),
@@ -1732,7 +1732,7 @@ def _build_swa_hash_specs(seq_len: int, start_pos: int, *, decode: bool):
             TensorSpec("wo_b_t", [ATTN_OUT_IN, HIDDEN], torch.bfloat16, init_value=init_wo_b_t),
             TensorSpec("cos", [seq_len, ROPE_HALF], torch.float32, init_value=local_cos),
             TensorSpec("sin", [seq_len, ROPE_HALF], torch.float32, init_value=local_sin),
-            TensorSpec("ffn_hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
+            TensorSpec("ffn_hc_fn_t", [HC_DIM, MIX_HC], torch.float32, init_value=init_hc_fn_t),
             TensorSpec("ffn_hc_scale", [3], torch.float32, init_value=init_hc_scale),
             TensorSpec("ffn_hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
             TensorSpec("ffn_norm_w", [HIDDEN], torch.bfloat16, init_value=init_norm_w),
@@ -1811,8 +1811,8 @@ def _build_csa_specs(seq_len: int, start_pos: int, *, decode: bool, hash_route: 
     def init_x():
         return (torch.randn(B, seq_len, HC_MULT, HIDDEN, dtype=torch.float32) * 0.05).to(torch.bfloat16)
 
-    def init_hc_fn():
-        return torch.randn(MIX_HC, HC_DIM, dtype=torch.float32) * 0.01
+    def init_hc_fn_t():
+        return torch.randn(HC_DIM, MIX_HC, dtype=torch.float32) * 0.01
 
     def init_hc_scale():
         return torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
@@ -1958,7 +1958,7 @@ def _build_csa_specs(seq_len: int, start_pos: int, *, decode: bool, hash_route: 
 
     specs.extend(
         [
-            TensorSpec("attn_hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
+            TensorSpec("attn_hc_fn_t", [HC_DIM, MIX_HC], torch.float32, init_value=init_hc_fn_t),
             TensorSpec("attn_hc_scale", [3], torch.float32, init_value=init_hc_scale),
             TensorSpec("attn_hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
             TensorSpec("attn_norm_w", [HIDDEN], torch.bfloat16, init_value=init_norm_w),
@@ -2005,7 +2005,7 @@ def _build_csa_specs(seq_len: int, start_pos: int, *, decode: bool, hash_route: 
         specs.append(TensorSpec("idx_comp_block_count", [1], torch.int32, init_value=torch.tensor([block_count], dtype=torch.int32)))
     specs.extend(
         [
-            TensorSpec("ffn_hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
+            TensorSpec("ffn_hc_fn_t", [HC_DIM, MIX_HC], torch.float32, init_value=init_hc_fn_t),
             TensorSpec("ffn_hc_scale", [3], torch.float32, init_value=init_hc_scale),
             TensorSpec("ffn_hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
             TensorSpec("ffn_norm_w", [HIDDEN], torch.bfloat16, init_value=init_norm_w),
@@ -2115,8 +2115,8 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
     def init_x():
         return (torch.randn(B, seq_len, HC_MULT, HIDDEN, dtype=torch.float32) * 0.05).to(torch.bfloat16)
 
-    def init_hc_fn():
-        return torch.randn(MIX_HC, HC_DIM, dtype=torch.float32) * 0.01
+    def init_hc_fn_t():
+        return torch.randn(HC_DIM, MIX_HC, dtype=torch.float32) * 0.01
 
     def init_hc_scale():
         return torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
@@ -2239,7 +2239,7 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
 
     specs.extend(
         [
-            TensorSpec("attn_hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
+            TensorSpec("attn_hc_fn_t", [HC_DIM, MIX_HC], torch.float32, init_value=init_hc_fn_t),
             TensorSpec("attn_hc_scale", [3], torch.float32, init_value=init_hc_scale),
             TensorSpec("attn_hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
             TensorSpec("attn_norm_w", [HIDDEN], torch.bfloat16, init_value=init_norm_w),
@@ -2266,7 +2266,7 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
         specs.append(TensorSpec("comp_block_count", [1], torch.int32, init_value=torch.tensor([block_count], dtype=torch.int32)))
     specs.extend(
         [
-            TensorSpec("ffn_hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
+            TensorSpec("ffn_hc_fn_t", [HC_DIM, MIX_HC], torch.float32, init_value=init_hc_fn_t),
             TensorSpec("ffn_hc_scale", [3], torch.float32, init_value=init_hc_scale),
             TensorSpec("ffn_hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
             TensorSpec("ffn_norm_w", [HIDDEN], torch.bfloat16, init_value=init_norm_w),

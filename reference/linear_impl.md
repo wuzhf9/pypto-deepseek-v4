@@ -13,7 +13,7 @@ weight: [out_features, in_features]
 output: [..., out_features]
 ```
 
-PyPTO linear kernel 统一接收加载阶段预转置后的权重：
+除 LM head 外，PyPTO linear kernel 统一接收加载阶段预转置后的权重：
 
 ```text
 x:        [1, S_DYN, in_features]
@@ -21,7 +21,7 @@ weight_t: [in_features, out_features]
 out:      [1, S_DYN, out_features]
 ```
 
-也就是说，权重加载逻辑负责把官方 checkpoint 中的 `[out, in]` 转成
+也就是说，普通 dense 权重加载逻辑负责把官方 checkpoint 中的 `[out, in]` 转成
 `[in, out]`，kernel 内部只做：
 
 ```text
@@ -32,6 +32,12 @@ out = x @ weight_t
 中 `wq_a: [D, Q_LORA]` 的写法，避免在 kernel 内使用 `b_trans=True` 或
 `pl.transpose`。当前不实现 bias；`model.py` 中普通 `Linear` 调用均未启用
 bias。MoE gate 的 `gate.bias` 是 router 逻辑的一部分，应在 MoE/gate 模块中单独处理。
+
+LM head 是当前明确保留官方布局的例外：`head.weight` 保持 `[vocab, hidden]`
+传入，在 kernel 内按 vocab tile 读取 `[VOCAB_TILE, K_TILE]` 并使用
+`b_trans=True` 完成 `F.linear(last_hidden, head.weight)`。这样可以避免把超大
+`[129280, 4096]` 权重转成 `[4096, 129280]` 后产生大 stride 访问问题，同时计算语义
+仍然和官方 `model.py` 完全一致。
 
 ## Shape 列表
 
@@ -52,7 +58,7 @@ bias。MoE gate 的 `gate.bias` 是 router 逻辑的一部分，应在 MoE/gate 
 | `[4096, 2048]` | `[2048, 4096]` | `Expert` / shared expert | `w2`, line 592 | MoE down projection |
 | `[24, 16384]` | `[16384, 24]` | `Block` HC pre | `hc_attn_fn/hc_ffn_fn`, lines 666-667; `F.linear`, line 678 | HC pre-mixing logits |
 | `[4, 16384]` | `[16384, 4]` | `ParallelHead` HC head | transformer `hc_head_fn`, line 797; `F.linear`, line 732 | final HC head mixing logits |
-| `[129280, 4096]` | `[4096, 129280]` | `ParallelHead` LM head | `weight`, line 713; `F.linear`, line 716 | final logits projection |
+| `[129280, 4096]` | `[129280, 4096]` | `ParallelHead` LM head | `weight`, line 713; `F.linear`, line 716 | final logits projection，保留官方布局并在 kernel 内使用 `b_trans=True` |
 
 ## 实现原则
 
@@ -62,8 +68,8 @@ bias。MoE gate 的 `gate.bias` 是 router 逻辑的一部分，应在 MoE/gate 
 - 权重加载代码负责完成一次性转置，并保证转置后的 tensor 为连续 BF16 布局。
 - kernel 内不使用 `b_trans=True`、`pl.transpose` 或临时 transpose tile。
 - 不在 `linear.py` 中实现 fp8/fp4、activation quant、scale 或 bias。
-- 对于只处理最后 token 的 head 类路径，可以在对应模块中提供更窄的 wrapper，但底层
-  linear 计算仍保持 `x @ weight_t` 语义。
+- LM head 不走 `linear.py`，在 `models/head.py` 中直接保留官方 `[vocab, hidden]`
+  权重布局，并使用 `b_trans=True` 对齐 `F.linear`。
 
 ## Kernel 计算结构
 

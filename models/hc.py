@@ -43,7 +43,7 @@ assert_divisible(HC_DIM, K_TILE, "HC flattened size")
 def hc_pre_fwd(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
-    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
@@ -111,11 +111,11 @@ def hc_pre_fwd(
                 x_fp32 = pl.cast(x_lin, target_type=pl.FP32)
                 x_sq = pl.mul(x_fp32, x_fp32)
                 sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(x_sq), [1, T_TILE]))
-                w_lin = pl.slice(hc_fn, [MIX_PAD, K_TILE], [0, k0], valid_shape=[MIX_HC, K_TILE])
+                w_lin = pl.slice(hc_fn_t, [K_TILE, MIX_PAD], [k0, 0], valid_shape=[K_TILE, MIX_HC])
                 if kb == 0:
-                    mix_acc = pl.matmul(x_fp32, w_lin, b_trans=True, out_dtype=pl.FP32)
+                    mix_acc = pl.matmul(x_fp32, w_lin, out_dtype=pl.FP32)
                 else:
-                    mix_acc = pl.matmul_acc(mix_acc, x_fp32, w_lin, b_trans=True)
+                    mix_acc = pl.matmul_acc(mix_acc, x_fp32, w_lin)
 
             mean_sq = pl.add(pl.mul(sq_sum, HC_DIM_INV), RMS_NORM_EPS)
             inv_rms = pl.reshape(pl.rsqrt(mean_sq, high_precision=True), [T_TILE, 1])
@@ -322,7 +322,7 @@ def hc_pre_fwd(
 def hc_pre_test(
     x: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
-    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_fn_t: pl.Tensor[[HC_DIM, MIX_HC], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
     mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
@@ -338,7 +338,7 @@ def hc_pre_test(
     x_mixed = hc_pre_fwd(
         x,
         x_pad,
-        hc_fn,
+        hc_fn_t,
         hc_scale,
         hc_base,
         mixes,
@@ -447,13 +447,13 @@ def split_sinkhorn_golden(
 def golden_hc_pre(tensors):
     """Torch reference for ``Block.hc_pre``."""
     x = tensors["x"].float()
-    hc_fn = tensors["hc_fn"].float()
+    hc_fn_t = tensors["hc_fn_t"].float()
     hc_scale = tensors["hc_scale"].float()
     hc_base = tensors["hc_base"].float()
 
     x_flat = x.flatten(2)
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + RMS_NORM_EPS)
-    mixes = F.linear(x_flat, hc_fn) * rsqrt
+    mixes = F.linear(x_flat, hc_fn_t.transpose(0, 1).contiguous()) * rsqrt
     pre, post, comb = split_sinkhorn_golden(mixes, hc_scale, hc_base)
     x_mixed = torch.sum(pre.unsqueeze(-1) * x, dim=2).to(tensors["x_mixed"].dtype)
 
@@ -490,8 +490,8 @@ def _build_hc_pre_specs(seq_len: int):
     def init_x():
         return (torch.randn(B, seq_len, HC_MULT, HIDDEN, dtype=torch.float32) * 0.5).to(torch.bfloat16)
 
-    def init_hc_fn():
-        return (torch.randn(MIX_HC, HC_DIM, dtype=torch.float32) * (HC_DIM**-0.5)).contiguous()
+    def init_hc_fn_t():
+        return (torch.randn(HC_DIM, MIX_HC, dtype=torch.float32) * (HC_DIM**-0.5)).contiguous()
 
     def init_hc_scale():
         return torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
@@ -502,7 +502,7 @@ def _build_hc_pre_specs(seq_len: int):
     return [
         TensorSpec("x", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16, init_value=init_x),
         TensorSpec("x_pad", [B, seq_pad, HC_MULT, HIDDEN], torch.bfloat16),
-        TensorSpec("hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
+        TensorSpec("hc_fn_t", [HC_DIM, MIX_HC], torch.float32, init_value=init_hc_fn_t),
         TensorSpec("hc_scale", [3], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
         TensorSpec("mixes", [B, seq_pad, MIX_PAD], torch.float32),

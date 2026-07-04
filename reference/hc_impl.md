@@ -44,6 +44,7 @@ padded scratch tensor：
 ```text
 x:              [B, S_DYN,     HC_MULT, HIDDEN] bf16
 x_pad:          [B, S_PAD_DYN, HC_MULT, HIDDEN] bf16
+hc_fn_t:        [HC_DIM, MIX_HC] fp32
 mixes:          [B, S_PAD_DYN, MIX_PAD] fp32
 pre:            [B, S_PAD_DYN, HC_PAD] fp32
 comb_logits:    [B, S_PAD_DYN, HC_MULT * HC_MULT] fp32
@@ -136,7 +137,7 @@ valid_shapes=[T_TILE, HC_MULT])` 是当前验证通过的稳定写法，也和
    - tail 位置补 0
 2. `hc_pre_linear`
    - `x_pad.flatten(2)` 上计算 RMS square sum
-   - 计算 `x_flat @ hc_fn.T`
+   - 计算 `x_flat @ hc_fn_t`
    - 乘 `rsqrt(mean_square + eps)`
    - 写入 padded `mixes`
 3. `hc_pre_split`

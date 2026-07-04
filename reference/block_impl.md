@@ -93,7 +93,7 @@ out:     [B, S_DYN, HC_MULT, HIDDEN] BF16
 attention 段的 `hc_pre/hc_post` 使用：
 
 ```text
-hc_attn_fn:    [MIX_HC, HC_MULT * HIDDEN] FP32
+hc_attn_fn_t:  [HC_MULT * HIDDEN, MIX_HC] FP32
 hc_attn_scale: [3] FP32
 hc_attn_base:  [MIX_HC] FP32
 ```
@@ -126,7 +126,7 @@ attn_hc_comb
 ffn 段的 `hc_pre/hc_post` 使用：
 
 ```text
-hc_ffn_fn:    [MIX_HC, HC_MULT * HIDDEN] FP32
+hc_ffn_fn_t:  [HC_MULT * HIDDEN, MIX_HC] FP32
 hc_ffn_scale: [3] FP32
 hc_ffn_base:  [MIX_HC] FP32
 ```
