@@ -554,7 +554,29 @@ PyPTO 并非完全不支持在 kernel 内创建带动态维度的 tensor。但 D
 大多仍基于固定编译 shape 或固定 tile shape，不能直接证明当前 Block 中所有动态 padding scratch
 都可以安全迁移到 kernel 内部。
 
-后续如果要精简 Block 接口，应先做独立验证：
+已在 `models/head.py` 中验证过 `[B, S_DYN, HIDDEN]` 这类直接动态维 scratch：`head_fwd`
+内部用 `tokens = pl.tensor.dim(x, 1)` 创建 `hc_out/normed = pl.create_tensor([B, tokens,
+HIDDEN], dtype=pl.BF16)`，并把它们继续传给 `hc_head_fwd`、`rmsnorm_4096` 和 `lm_head_fwd`。
+固定 shape 的 `logits_pad = pl.create_tensor([T_TILE, VOCAB], dtype=pl.FP32)` 也已迁入内部。
+远端 Ascend 已通过默认 `S=8`、`S=13` 和 `S=1` 验证。因此不带 padding 表达式、动态维直接
+来自已有输入的中间 tensor，可以优先迁移到 kernel 内部。
+
+已在 `models/head.py` 中做过一次针对 padded dynamic scratch 的实验：在 `head_fwd` 内部用
+`tokens = pl.tensor.dim(x, 1)` 计算
+`padded_tokens = ((tokens + T_TILE - 1) // T_TILE) * T_TILE`，再创建
+`x_pad/pre/hc_out_pad` 并传入 `hc_head_fwd`。本地 golden 测试可以通过，但远端 Ascend
+编译失败，报错为：
+
+```text
+@pl.jit: missing inferred tensor metadata for parameter 'x_pad'
+```
+
+这个结果说明当前 PyPTO 可以支持由已有动态维直接创建 tensor，但对于经过表达式计算得到的新
+padded dynamic 维度，作为子 kernel 参数传递时还无法稳定推断 tensor metadata。因此 Block
+中这类 padded scratch 仍应保留为外部参数，或者把使用 scratch 的逻辑直接展开在同一个 kernel
+内，避免把内部创建的 padded dynamic tensor 再传给子 kernel。
+
+后续如果要继续精简 Block 接口，应先做独立验证：
 
 1. 在最小 kernel 中创建 `[B, tokens, HIDDEN]` 这种直接来自 `pl.tensor.dim` 的 scratch。
 2. 再验证 `tokens` 经过向上取整后的 padded shape，例如 `[B, padded_tokens, ...]`。

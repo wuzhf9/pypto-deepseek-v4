@@ -67,23 +67,21 @@ def gate_hash_fwd(
     gate_w_t: pl.Tensor[[HIDDEN, N_EXPERTS], pl.BF16],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[B, S_DYN], pl.INT64],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
     indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
     weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
 ):
     """Run official ``Gate.forward`` hash-routing path."""
     x.bind_dynamic(1, S_DYN)
     input_ids.bind_dynamic(1, S_DYN)
-    logits.bind_dynamic(1, S_DYN)
-    scores.bind_dynamic(1, S_DYN)
     indices.bind_dynamic(1, S_DYN)
     weights.bind_dynamic(1, S_DYN)
 
+    tokens = pl.tensor.dim(x, 1)
+    logits = pl.create_tensor([B, tokens, N_EXPERTS], dtype=pl.FP32)
+    scores = pl.create_tensor([B, tokens, N_EXPERTS], dtype=pl.FP32)
     logits = linear_4096_to_256_fp32(x, gate_w_t, logits)
     scores = _sqrt_softplus_scores(logits, scores)
 
-    tokens = pl.tensor.dim(x, 1)
     input_flat = pl.reshape(input_ids, [tokens])
     scores_flat = pl.reshape(scores, [tokens, N_EXPERTS])
     indices_flat = pl.reshape(indices, [tokens, TOPK])
@@ -113,22 +111,20 @@ def gate_topk_fwd(
     x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     gate_w_t: pl.Tensor[[HIDDEN, N_EXPERTS], pl.BF16],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
     indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
     weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
 ):
     """Run official ``Gate.forward`` score-routing path."""
     x.bind_dynamic(1, S_DYN)
-    logits.bind_dynamic(1, S_DYN)
-    scores.bind_dynamic(1, S_DYN)
     indices.bind_dynamic(1, S_DYN)
     weights.bind_dynamic(1, S_DYN)
 
+    tokens = pl.tensor.dim(x, 1)
+    logits = pl.create_tensor([B, tokens, N_EXPERTS], dtype=pl.FP32)
+    scores = pl.create_tensor([B, tokens, N_EXPERTS], dtype=pl.FP32)
     logits = linear_4096_to_256_fp32(x, gate_w_t, logits)
     scores = _sqrt_softplus_scores(logits, scores)
 
-    tokens = pl.tensor.dim(x, 1)
     scores_flat = pl.reshape(scores, [tokens, N_EXPERTS])
     indices_flat = pl.reshape(indices, [tokens, TOPK])
     weights_flat = pl.reshape(weights, [tokens, TOPK])
@@ -173,12 +169,10 @@ def gate_hash_test(
     gate_w_t: pl.Tensor[[HIDDEN, N_EXPERTS], pl.BF16],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
     input_ids: pl.Tensor[[B, S_DYN], pl.INT64],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
     indices: pl.Out[pl.Tensor[[B, S_DYN, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[B, S_DYN, TOPK], pl.FP32]],
 ):
-    indices, weights = gate_hash_fwd(x, gate_w_t, tid2eid, input_ids, logits, scores, indices, weights)
+    indices, weights = gate_hash_fwd(x, gate_w_t, tid2eid, input_ids, indices, weights)
     return indices, weights
 
 
@@ -187,12 +181,10 @@ def gate_topk_test(
     x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     gate_w_t: pl.Tensor[[HIDDEN, N_EXPERTS], pl.BF16],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
     indices: pl.Out[pl.Tensor[[B, S_DYN, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[B, S_DYN, TOPK], pl.FP32]],
 ):
-    indices, weights = gate_topk_fwd(x, gate_w_t, gate_bias, logits, scores, indices, weights)
+    indices, weights = gate_topk_fwd(x, gate_w_t, gate_bias, indices, weights)
     return indices, weights
 
 
@@ -263,8 +255,6 @@ def _build_tensor_specs(seq_len: int, *, hash_route: bool):
         specs.append(TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias))
     specs.extend(
         [
-            TensorSpec("logits", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("scores", [B, seq_len, N_EXPERTS], torch.float32),
             TensorSpec("indices", [B, seq_len, TOPK], torch.int32, is_output=True),
             TensorSpec("weights", [B, seq_len, TOPK], torch.float32, is_output=True),
         ]

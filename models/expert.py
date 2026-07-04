@@ -24,22 +24,20 @@ def expert_shared_fwd(
     w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
     w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
     w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
-    gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Expert.forward(x, weights=None)``."""
     x.bind_dynamic(1, S_DYN)
-    gate.bind_dynamic(1, S_DYN)
-    up.bind_dynamic(1, S_DYN)
-    hidden.bind_dynamic(1, S_DYN)
     out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    gate = pl.create_tensor([B, tokens, MOE_INTER_DIM], dtype=pl.BF16)
+    up = pl.create_tensor([B, tokens, MOE_INTER_DIM], dtype=pl.BF16)
+    hidden = pl.create_tensor([B, tokens, MOE_INTER_DIM], dtype=pl.BF16)
 
     gate = linear_4096_to_2048(x, w1_t, gate)
     up = linear_4096_to_2048(x, w3_t, up)
 
-    tokens = pl.tensor.dim(x, 1)
     gate_flat = pl.reshape(gate, [tokens, MOE_INTER_DIM])
     up_flat = pl.reshape(up, [tokens, MOE_INTER_DIM])
     hidden_flat = pl.reshape(hidden, [tokens, MOE_INTER_DIM])
@@ -87,23 +85,21 @@ def expert_routed_fwd(
     w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
     w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
     w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
-    gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Expert.forward(x, weights=weights)``."""
     x.bind_dynamic(1, S_DYN)
     weights.bind_dynamic(1, S_DYN)
-    gate.bind_dynamic(1, S_DYN)
-    up.bind_dynamic(1, S_DYN)
-    hidden.bind_dynamic(1, S_DYN)
     out.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    gate = pl.create_tensor([B, tokens, MOE_INTER_DIM], dtype=pl.BF16)
+    up = pl.create_tensor([B, tokens, MOE_INTER_DIM], dtype=pl.BF16)
+    hidden = pl.create_tensor([B, tokens, MOE_INTER_DIM], dtype=pl.BF16)
 
     gate = linear_4096_to_2048(x, w1_t, gate)
     up = linear_4096_to_2048(x, w3_t, up)
 
-    tokens = pl.tensor.dim(x, 1)
     weights_flat = pl.reshape(weights, [tokens, 1])
     gate_flat = pl.reshape(gate, [tokens, MOE_INTER_DIM])
     up_flat = pl.reshape(up, [tokens, MOE_INTER_DIM])
@@ -153,12 +149,9 @@ def expert_shared_test(
     w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
     w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
     w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
-    gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
-    return expert_shared_fwd(x, w1_t, w2_t, w3_t, gate, up, hidden, out)
+    return expert_shared_fwd(x, w1_t, w2_t, w3_t, out)
 
 
 @pl.jit
@@ -168,12 +161,9 @@ def expert_routed_test(
     w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
     w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
     w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
-    gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
-    return expert_routed_fwd(x, weights, w1_t, w2_t, w3_t, gate, up, hidden, out)
+    return expert_routed_fwd(x, weights, w1_t, w2_t, w3_t, out)
 
 
 def _golden_expert(tensors, *, routed: bool):
@@ -191,9 +181,6 @@ def _golden_expert(tensors, *, routed: bool):
     hidden = hidden.to(torch.bfloat16)
     out = torch.matmul(hidden.float(), tensors["w2_t"].float()).to(torch.bfloat16)
 
-    tensors["gate"][:] = gate.to(torch.bfloat16)
-    tensors["up"][:] = up.to(torch.bfloat16)
-    tensors["hidden"][:] = hidden
     tensors["out"][:] = out
 
 
@@ -233,9 +220,6 @@ def _build_tensor_specs(seq_len: int, *, routed: bool):
             TensorSpec("w1_t", [HIDDEN, MOE_INTER_DIM], torch.bfloat16, init_value=init_w1_t),
             TensorSpec("w2_t", [MOE_INTER_DIM, HIDDEN], torch.bfloat16, init_value=init_w2_t),
             TensorSpec("w3_t", [HIDDEN, MOE_INTER_DIM], torch.bfloat16, init_value=init_w3_t),
-            TensorSpec("gate", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("up", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("hidden", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
             TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
         ]
     )

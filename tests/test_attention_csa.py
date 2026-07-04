@@ -213,44 +213,16 @@ def _base_tensors(attn: torch.nn.Module, x: torch.Tensor, args, start_pos: int) 
     }
 
 def _add_output_tensors(tensors: dict[str, torch.Tensor], args, seq_len: int, *, decode: bool) -> None:
-    compressed_len = 1 if decode else max(1, seq_len // 4)
     score_len = args.max_seq_len // 4
-    kv_pool_len = args.window_size + score_len if decode else seq_len + compressed_len
     tensors.update(
         {
-            "q_a": torch.zeros(1, seq_len, args.q_lora_rank, dtype=torch.bfloat16),
-            "q_proj": torch.zeros(1, seq_len, args.n_heads * args.head_dim, dtype=torch.bfloat16),
-            "kv_proj": torch.zeros(1, seq_len, args.head_dim, dtype=torch.bfloat16),
-            "kv_normed": torch.zeros(1, seq_len, args.head_dim, dtype=torch.bfloat16),
-            "qr": torch.zeros(1, seq_len, args.q_lora_rank, dtype=torch.bfloat16),
-            "q": torch.zeros(1, seq_len, args.n_heads, args.head_dim, dtype=torch.bfloat16),
-            "kv": torch.zeros(1, seq_len, args.head_dim, dtype=torch.bfloat16),
-            "attn_comp_kv_proj": torch.zeros(1, seq_len, 2 * args.head_dim, dtype=torch.float32),
-            "attn_comp_score_proj": torch.zeros(1, seq_len, 2 * args.head_dim, dtype=torch.float32),
-            "attn_comp_pooled": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
-            "attn_comp_normed": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
-            "attn_compressed": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
-            "kv_pool": torch.zeros(1, kv_pool_len, args.head_dim, dtype=torch.bfloat16),
             "kv_cache_out": torch.zeros(1, args.window_size, args.head_dim, dtype=torch.bfloat16),
             "attn_comp_kv_state_out": torch.zeros(1, 8, 2 * args.head_dim, dtype=torch.float32),
             "attn_comp_score_state_out": torch.zeros(1, 8, 2 * args.head_dim, dtype=torch.float32),
             "attn_comp_cache_out": torch.zeros(1, score_len, args.head_dim, dtype=torch.bfloat16),
-            "idx_q_proj": torch.zeros(1, seq_len, args.index_n_heads * args.index_head_dim, dtype=torch.bfloat16),
-            "idx_q_rope": torch.zeros(1, seq_len, args.index_n_heads, args.index_head_dim, dtype=torch.bfloat16),
-            "idx_weights": torch.zeros(1, seq_len, args.index_n_heads, dtype=torch.bfloat16),
-            "idx_comp_kv_proj": torch.zeros(1, seq_len, 2 * args.index_head_dim, dtype=torch.float32),
-            "idx_comp_score_proj": torch.zeros(1, seq_len, 2 * args.index_head_dim, dtype=torch.float32),
-            "idx_comp_pooled": torch.zeros(1, compressed_len, args.index_head_dim, dtype=torch.bfloat16),
-            "idx_comp_normed": torch.zeros(1, compressed_len, args.index_head_dim, dtype=torch.bfloat16),
-            "idx_score": torch.zeros(1, seq_len, score_len, dtype=torch.float32),
-            "idx_topk_idxs": torch.full((1, seq_len, args.index_topk), -1, dtype=torch.int32),
             "idx_kv_cache_out": torch.zeros(1, score_len, args.index_head_dim, dtype=torch.bfloat16),
             "idx_comp_kv_state_out": torch.zeros(1, 8, 2 * args.index_head_dim, dtype=torch.float32),
             "idx_comp_score_state_out": torch.zeros(1, 8, 2 * args.index_head_dim, dtype=torch.float32),
-            "csa_topk_idxs": torch.full((1, seq_len, args.window_size + args.index_topk), -1, dtype=torch.int32),
-            "attn_o": torch.zeros(1, seq_len, args.n_heads, args.head_dim, dtype=torch.bfloat16),
-            "o_inv": torch.zeros(1, seq_len, args.n_heads, args.head_dim, dtype=torch.bfloat16),
-            "proj": torch.zeros(1, seq_len, args.o_groups * args.o_lora_rank, dtype=torch.bfloat16),
             "out": torch.zeros(1, seq_len, args.dim, dtype=torch.bfloat16),
         }
     )

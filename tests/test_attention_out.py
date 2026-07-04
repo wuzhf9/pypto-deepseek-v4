@@ -22,7 +22,7 @@ def _official_attention_out(
     wo_b_weight: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Mirror ``model.py:534,537-542`` with original weights."""
 
     seq_len = o.shape[1]
@@ -31,7 +31,7 @@ def _official_attention_out(
     wo_a = wo_a_weight.view(O_GROUPS, O_LORA_RANK, -1)
     proj = torch.einsum("bsgd,grd->bsgr", o_grouped.float(), wo_a.float()).to(torch.bfloat16)
     out = torch.matmul(proj.flatten(2).float(), wo_b_weight.t().float()).to(torch.bfloat16)
-    return o, proj.flatten(2), out
+    return out
 
 def test_attention_out_golden_uses_same_transposed_weight_as_model_path() -> None:
     torch.manual_seed(20260630)
@@ -44,7 +44,7 @@ def test_attention_out_golden_uses_same_transposed_weight_as_model_path() -> Non
     freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(max_seq_len=start_pos + seq_len)
     cos, sin = materialize_rope_range(freqs_cos, freqs_sin, start_pos, seq_len)
 
-    expected_o_inv, expected_proj, expected_out = _official_attention_out(
+    expected_out = _official_attention_out(
         o,
         wo_a_weight,
         wo_b_weight,
@@ -58,12 +58,8 @@ def test_attention_out_golden_uses_same_transposed_weight_as_model_path() -> Non
         "wo_b_t": wo_b_weight.t().contiguous(),
         "cos": cos,
         "sin": sin,
-        "o_inv": torch.zeros(B, seq_len, N_HEADS, M.head_dim, dtype=torch.bfloat16),
-        "proj": torch.zeros(B, seq_len, ATTN_OUT_IN, dtype=torch.bfloat16),
         "out": torch.zeros(B, seq_len, HIDDEN, dtype=torch.bfloat16),
     }
     golden_attention_out(tensors)
 
-    torch.testing.assert_close(tensors["o_inv"], expected_o_inv, rtol=0, atol=0)
-    torch.testing.assert_close(tensors["proj"], expected_proj, rtol=0, atol=0)
     torch.testing.assert_close(tensors["out"], expected_out, rtol=0, atol=0)

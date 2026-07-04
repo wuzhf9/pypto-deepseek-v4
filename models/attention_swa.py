@@ -98,17 +98,7 @@ def attention_swa_prefill_fwd(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Attention.forward`` for ``compress_ratio == 0, start_pos == 0``."""
@@ -117,7 +107,13 @@ def attention_swa_prefill_fwd(
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
 
-    qr, q, kv = attention_qkv_fwd(
+    tokens = pl.tensor.dim(x, 1)
+    qr = pl.create_tensor([B, tokens, Q_LORA_RANK], dtype=pl.BF16)
+    q = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.BF16)
+    attn_o = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+
+    attention_qkv_fwd(
         x,
         wq_a_t,
         q_norm_w,
@@ -126,18 +122,14 @@ def attention_swa_prefill_fwd(
         kv_norm_w,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
         qr,
         q,
         kv,
     )
     kv_cache_out = update_prefill_window_cache(kv, kv_cache_out)
-    attn_o = sparse_attn_swa_fwd(q, kv, attn_sink, topk_idxs, attn_o)
-    out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
-    return kv_cache_out, out_final
+    sparse_attn_swa_fwd(q, kv, attn_sink, topk_idxs, attn_o)
+    attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, out)
+    return kv_cache_out, out
 
 
 @pl.jit.inline
@@ -156,21 +148,22 @@ def attention_swa_decode_fwd(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Attention.forward`` for ``compress_ratio == 0, start_pos > 0``."""
-    qr, q, kv = attention_qkv_fwd(
+    x.bind_dynamic(1, S_DYN)
+    topk_idxs.bind_dynamic(1, S_DYN)
+    cos.bind_dynamic(0, S_DYN)
+    sin.bind_dynamic(0, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    qr = pl.create_tensor([B, tokens, Q_LORA_RANK], dtype=pl.BF16)
+    q = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.BF16)
+    attn_o = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+
+    attention_qkv_fwd(
         x,
         wq_a_t,
         q_norm_w,
@@ -179,18 +172,14 @@ def attention_swa_decode_fwd(
         kv_norm_w,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
         qr,
         q,
         kv,
     )
     kv_cache_out = update_decode_window_cache(kv_cache, kv, cache_pos, kv_cache_out)
-    attn_o = sparse_attn_swa_fwd(q, kv_cache_out, attn_sink, topk_idxs, attn_o)
-    out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
-    return kv_cache_out, out_final
+    sparse_attn_swa_fwd(q, kv_cache_out, attn_sink, topk_idxs, attn_o)
+    attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, out)
+    return kv_cache_out, out
 
 
 @pl.jit
@@ -207,17 +196,7 @@ def attention_swa_prefill_test(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return attention_swa_prefill_fwd(
@@ -233,17 +212,7 @@ def attention_swa_prefill_test(
         wo_b_t,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
         kv_cache_out,
-        attn_o,
-        o_inv,
-        proj,
         out,
     )
 
@@ -264,17 +233,7 @@ def attention_swa_decode_test(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return attention_swa_decode_fwd(
@@ -292,17 +251,7 @@ def attention_swa_decode_test(
         wo_b_t,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
         kv_cache_out,
-        attn_o,
-        o_inv,
-        proj,
         out,
     )
 
@@ -339,22 +288,18 @@ def golden_attention_swa_forward(tensors, start_pos: int):
 
     # q
     qr = q = torch.matmul(x.float(), tensors["wq_a_t"].float()).to(torch.bfloat16)
-    q_a = q
     q = q.float()
     q = (q * torch.rsqrt(q.square().mean(-1, keepdim=True) + EPS) * tensors["q_norm_w"].float()).to(torch.bfloat16)
     qr = q
     q = torch.matmul(q.float(), tensors["wq_b_t"].float()).to(torch.bfloat16)
-    q_proj = q
     q = q.unflatten(-1, (N_HEADS, HEAD_DIM))
     q = (q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + EPS)).to(torch.bfloat16)
     q = _apply_rope_golden(q, tensors["cos"], tensors["sin"], inverse=False)
 
     # win kv
     kv = torch.matmul(x.float(), tensors["wkv_t"].float()).to(torch.bfloat16)
-    kv_proj = kv
     kv = kv.float()
     kv = (kv * torch.rsqrt(kv.square().mean(-1, keepdim=True) + EPS) * tensors["kv_norm_w"].float()).to(torch.bfloat16)
-    kv_normed = kv
     kv = _apply_rope_golden(kv, tensors["cos"], tensors["sin"], inverse=False)
 
     # FP8 act_quant on non-RoPE dims is intentionally removed in this bf16 path.
@@ -382,17 +327,7 @@ def golden_attention_swa_forward(tensors, start_pos: int):
     proj = torch.einsum("bsgd,grd->bsgr", o.float(), wo_a.float()).to(torch.bfloat16)
     out = torch.matmul(proj.flatten(2).float(), tensors["wo_b_t"].float()).to(torch.bfloat16)
 
-    tensors["q_a"][:] = q_a
-    tensors["q_proj"][:] = q_proj
-    tensors["kv_proj"][:] = kv_proj
-    tensors["kv_normed"][:] = kv_normed
-    tensors["qr"][:] = qr
-    tensors["q"][:] = q
-    tensors["kv"][:] = kv
     tensors["kv_cache_out"][:] = kv_cache_out
-    tensors["attn_o"][:] = attn_o
-    tensors["o_inv"][:] = o_inv
-    tensors["proj"][:] = proj.flatten(2)
     tensors["out"][:] = out
 
 
@@ -476,17 +411,7 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
         specs = [x_spec, *weight_specs]
     specs.extend(
         [
-            TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16),
-            TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16),
             TensorSpec("kv_cache_out", [B, WINDOW_SIZE, HEAD_DIM], torch.bfloat16, is_output=True, init_value=0.0),
-            TensorSpec("attn_o", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
             TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
         ]
     )

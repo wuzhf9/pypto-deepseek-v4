@@ -143,7 +143,6 @@ def _common_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor, 
         "comp_ape": module.compressor.ape.detach().clone(),
         "comp_norm_w": module.compressor.norm.weight.detach().clone(),
         "topk_idxs": torch.full((1, x.shape[1], args.index_topk), -1, dtype=torch.int32),
-        "index_score": torch.zeros(1, x.shape[1], args.max_seq_len // 4, dtype=torch.float32),
         "index_kv_cache": module.kv_cache.detach().clone(),
         "comp_kv_state_out": torch.zeros_like(module.compressor.kv_state),
         "comp_score_state_out": torch.zeros_like(module.compressor.score_state),
@@ -164,10 +163,6 @@ def _prefill_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor,
             "comp_cos": freqs_cis.real.contiguous(),
             "comp_sin": freqs_cis.imag.contiguous(),
             "comp_block_count": torch.tensor([blocks], dtype=torch.int32),
-            "comp_kv_proj": torch.zeros(1, seq_len, 2 * args.index_head_dim, dtype=torch.float32),
-            "comp_score_proj": torch.zeros(1, seq_len, 2 * args.index_head_dim, dtype=torch.float32),
-            "comp_pooled": torch.zeros(1, compressed_len, args.index_head_dim, dtype=torch.bfloat16),
-            "comp_normed": torch.zeros(1, compressed_len, args.index_head_dim, dtype=torch.bfloat16),
         }
     )
     return tensors
@@ -193,10 +188,6 @@ def _decode_tensors(module: torch.nn.Module, x: torch.Tensor, qr: torch.Tensor, 
             "comp_should_compress": torch.tensor([should_compress], dtype=torch.int32),
             "comp_cos": comp_cos,
             "comp_sin": comp_sin,
-            "comp_kv_proj": torch.zeros(1, 1, 2 * args.index_head_dim, dtype=torch.float32),
-            "comp_score_proj": torch.zeros(1, 1, 2 * args.index_head_dim, dtype=torch.float32),
-            "comp_pooled": torch.zeros(1, 1, args.index_head_dim, dtype=torch.bfloat16),
-            "comp_normed": torch.zeros(1, 1, args.index_head_dim, dtype=torch.bfloat16),
         }
     )
     tensors["index_kv_cache_in"] = tensors["index_kv_cache"].clone()

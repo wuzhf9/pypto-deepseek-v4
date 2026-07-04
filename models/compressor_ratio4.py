@@ -68,10 +68,6 @@ def compressor_ratio4_indexer_prefill_fwd(
     cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     block_count: pl.Tensor[[1], pl.INT32],
-    kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
     compressed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
     kv_state_out: pl.Tensor[[B, STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
     score_state_out: pl.Tensor[[B, STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
@@ -81,10 +77,6 @@ def compressor_ratio4_indexer_prefill_fwd(
     x.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, C_DYN)
     sin.bind_dynamic(0, C_DYN)
-    kv_proj.bind_dynamic(1, S_DYN)
-    score_proj.bind_dynamic(1, S_DYN)
-    pooled.bind_dynamic(1, C_DYN)
-    normed.bind_dynamic(1, C_DYN)
     compressed.bind_dynamic(1, C_DYN)
 
     tokens = pl.tensor.dim(x, 1)
@@ -93,6 +85,11 @@ def compressor_ratio4_indexer_prefill_fwd(
     should_compress = blocks > 0
     cutoff = blocks * COMPRESS_RATIO
     remainder = tokens - cutoff
+
+    kv_proj = pl.create_tensor([B, tokens, INDEX_PROJ_DIM], dtype=pl.FP32)
+    score_proj = pl.create_tensor([B, tokens, INDEX_PROJ_DIM], dtype=pl.FP32)
+    pooled = pl.create_tensor([B, padded_blocks, INDEX_HEAD_DIM], dtype=pl.BF16)
+    normed = pl.create_tensor([B, padded_blocks, INDEX_HEAD_DIM], dtype=pl.BF16)
 
     kv_proj = linear_4096_to_256_fp32(x, wkv_t, kv_proj)
     score_proj = linear_4096_to_256_fp32(x, wgate_t, score_proj)
@@ -347,10 +344,6 @@ def compressor_ratio4_indexer_prefill_test(
     cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     block_count: pl.Tensor[[1], pl.INT32],
-    kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
     compressed: pl.Out[pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16]],
     kv_state_out: pl.Out[pl.Tensor[[B, STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     score_state_out: pl.Out[pl.Tensor[[B, STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
@@ -365,10 +358,6 @@ def compressor_ratio4_indexer_prefill_test(
         cos,
         sin,
         block_count,
-        kv_proj,
-        score_proj,
-        pooled,
-        normed,
         compressed,
         kv_state_out,
         score_state_out,
@@ -392,10 +381,6 @@ def compressor_ratio4_indexer_decode_fwd(
     norm_w: pl.Tensor[[INDEX_HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
     compressed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
     kv_state_out: pl.Tensor[[B, STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
     score_state_out: pl.Tensor[[B, STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
@@ -403,10 +388,13 @@ def compressor_ratio4_indexer_decode_fwd(
 ):
     """Run official Indexer ``Compressor.forward`` for ``compress_ratio == 4`` decode."""
     x.bind_dynamic(1, S_DYN)
-    kv_proj.bind_dynamic(1, S_DYN)
-    score_proj.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
+    kv_proj = pl.create_tensor([B, tokens, INDEX_PROJ_DIM], dtype=pl.FP32)
+    score_proj = pl.create_tensor([B, tokens, INDEX_PROJ_DIM], dtype=pl.FP32)
+    pooled = pl.create_tensor([B, 1, INDEX_HEAD_DIM], dtype=pl.BF16)
+    normed = pl.create_tensor([B, 1, INDEX_HEAD_DIM], dtype=pl.BF16)
+
     kv_proj = linear_4096_to_256_fp32(x, wkv_t, kv_proj)
     score_proj = linear_4096_to_256_fp32(x, wgate_t, score_proj)
 
@@ -635,10 +623,6 @@ def compressor_ratio4_indexer_decode_test(
     norm_w: pl.Tensor[[INDEX_HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
     compressed: pl.Out[pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16]],
     kv_state_out: pl.Out[pl.Tensor[[B, STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     score_state_out: pl.Out[pl.Tensor[[B, STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
@@ -658,10 +642,6 @@ def compressor_ratio4_indexer_decode_test(
         norm_w,
         cos,
         sin,
-        kv_proj,
-        score_proj,
-        pooled,
-        normed,
         compressed,
         kv_state_out,
         score_state_out,
@@ -680,10 +660,6 @@ def compressor_ratio4_attention_prefill_fwd(
     cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     block_count: pl.Tensor[[1], pl.INT32],
-    kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, C_DYN, ATTN_HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, C_DYN, ATTN_HEAD_DIM], pl.BF16],
     compressed: pl.Tensor[[B, C_DYN, ATTN_HEAD_DIM], pl.BF16],
     kv_state_out: pl.Tensor[[B, STATE_ROWS, ATTN_PROJ_DIM], pl.FP32],
     score_state_out: pl.Tensor[[B, STATE_ROWS, ATTN_PROJ_DIM], pl.FP32],
@@ -693,10 +669,6 @@ def compressor_ratio4_attention_prefill_fwd(
     x.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, C_DYN)
     sin.bind_dynamic(0, C_DYN)
-    kv_proj.bind_dynamic(1, S_DYN)
-    score_proj.bind_dynamic(1, S_DYN)
-    pooled.bind_dynamic(1, C_DYN)
-    normed.bind_dynamic(1, C_DYN)
     compressed.bind_dynamic(1, C_DYN)
 
     tokens = pl.tensor.dim(x, 1)
@@ -705,6 +677,11 @@ def compressor_ratio4_attention_prefill_fwd(
     should_compress = blocks > 0
     cutoff = blocks * COMPRESS_RATIO
     remainder = tokens - cutoff
+
+    kv_proj = pl.create_tensor([B, tokens, ATTN_PROJ_DIM], dtype=pl.FP32)
+    score_proj = pl.create_tensor([B, tokens, ATTN_PROJ_DIM], dtype=pl.FP32)
+    pooled = pl.create_tensor([B, padded_blocks, ATTN_HEAD_DIM], dtype=pl.BF16)
+    normed = pl.create_tensor([B, padded_blocks, ATTN_HEAD_DIM], dtype=pl.BF16)
 
     kv_proj = linear_4096_to_1024_fp32(x, wkv_t, kv_proj)
     score_proj = linear_4096_to_1024_fp32(x, wgate_t, score_proj)
@@ -959,10 +936,6 @@ def compressor_ratio4_attention_prefill_test(
     cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     block_count: pl.Tensor[[1], pl.INT32],
-    kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, C_DYN, ATTN_HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, C_DYN, ATTN_HEAD_DIM], pl.BF16],
     compressed: pl.Out[pl.Tensor[[B, C_DYN, ATTN_HEAD_DIM], pl.BF16]],
     kv_state_out: pl.Out[pl.Tensor[[B, STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     score_state_out: pl.Out[pl.Tensor[[B, STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
@@ -977,10 +950,6 @@ def compressor_ratio4_attention_prefill_test(
         cos,
         sin,
         block_count,
-        kv_proj,
-        score_proj,
-        pooled,
-        normed,
         compressed,
         kv_state_out,
         score_state_out,
@@ -1004,10 +973,6 @@ def compressor_ratio4_attention_decode_fwd(
     norm_w: pl.Tensor[[ATTN_HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, 1, ATTN_HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, 1, ATTN_HEAD_DIM], pl.BF16],
     compressed: pl.Tensor[[B, 1, ATTN_HEAD_DIM], pl.BF16],
     kv_state_out: pl.Tensor[[B, STATE_ROWS, ATTN_PROJ_DIM], pl.FP32],
     score_state_out: pl.Tensor[[B, STATE_ROWS, ATTN_PROJ_DIM], pl.FP32],
@@ -1015,10 +980,13 @@ def compressor_ratio4_attention_decode_fwd(
 ):
     """Run official Attention ``Compressor.forward`` for ``compress_ratio == 4`` decode."""
     x.bind_dynamic(1, S_DYN)
-    kv_proj.bind_dynamic(1, S_DYN)
-    score_proj.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
+    kv_proj = pl.create_tensor([B, tokens, ATTN_PROJ_DIM], dtype=pl.FP32)
+    score_proj = pl.create_tensor([B, tokens, ATTN_PROJ_DIM], dtype=pl.FP32)
+    pooled = pl.create_tensor([B, 1, ATTN_HEAD_DIM], dtype=pl.BF16)
+    normed = pl.create_tensor([B, 1, ATTN_HEAD_DIM], dtype=pl.BF16)
+
     kv_proj = linear_4096_to_1024_fp32(x, wkv_t, kv_proj)
     score_proj = linear_4096_to_1024_fp32(x, wgate_t, score_proj)
 
@@ -1247,10 +1215,6 @@ def compressor_ratio4_attention_decode_test(
     norm_w: pl.Tensor[[ATTN_HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, 1, ATTN_HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, 1, ATTN_HEAD_DIM], pl.BF16],
     compressed: pl.Out[pl.Tensor[[B, 1, ATTN_HEAD_DIM], pl.BF16]],
     kv_state_out: pl.Out[pl.Tensor[[B, STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     score_state_out: pl.Out[pl.Tensor[[B, STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
@@ -1270,10 +1234,6 @@ def compressor_ratio4_attention_decode_test(
         norm_w,
         cos,
         sin,
-        kv_proj,
-        score_proj,
-        pooled,
-        normed,
         compressed,
         kv_state_out,
         score_state_out,
@@ -1487,10 +1447,6 @@ def build_indexer_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
             torch.int32,
             init_value=torch.tensor([actual_compressed_len], dtype=torch.int32),
         ),
-        TensorSpec("kv_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("score_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("pooled", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("normed", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("compressed", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("kv_state_out", [B, STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
         TensorSpec("score_state_out", [B, STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
@@ -1573,10 +1529,6 @@ def build_indexer_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
         TensorSpec("norm_w", [INDEX_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("cos", [1, ROPE_HALF], torch.float32, init_value=local_cos),
         TensorSpec("sin", [1, ROPE_HALF], torch.float32, init_value=local_sin),
-        TensorSpec("kv_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("score_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("pooled", [B, 1, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("normed", [B, 1, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("compressed", [B, 1, INDEX_HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("kv_state_out", [B, STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
         TensorSpec("score_state_out", [B, STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
@@ -1628,10 +1580,6 @@ def build_attention_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
             torch.int32,
             init_value=torch.tensor([actual_compressed_len], dtype=torch.int32),
         ),
-        TensorSpec("kv_proj", [B, seq_len, ATTN_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("score_proj", [B, seq_len, ATTN_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("pooled", [B, compressed_len, ATTN_HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("normed", [B, compressed_len, ATTN_HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("compressed", [B, compressed_len, ATTN_HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("kv_state_out", [B, STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
         TensorSpec("score_state_out", [B, STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
@@ -1714,10 +1662,6 @@ def build_attention_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
         TensorSpec("norm_w", [ATTN_HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("cos", [1, ROPE_HALF], torch.float32, init_value=local_cos),
         TensorSpec("sin", [1, ROPE_HALF], torch.float32, init_value=local_sin),
-        TensorSpec("kv_proj", [B, seq_len, ATTN_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("score_proj", [B, seq_len, ATTN_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("pooled", [B, 1, ATTN_HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("normed", [B, 1, ATTN_HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("compressed", [B, 1, ATTN_HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("kv_state_out", [B, STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
         TensorSpec("score_state_out", [B, STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),

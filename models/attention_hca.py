@@ -121,26 +121,11 @@ def attention_hca_prefill_fwd(
     comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_block_count: pl.Tensor[[1], pl.INT32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
     comp_kv_state_out: pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32],
     comp_score_state_out: pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32],
     comp_cache_out: pl.Tensor[[B, TOPK_HCA, HEAD_DIM], pl.BF16],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Attention.forward`` for ``compress_ratio == 128, start_pos == 0``."""
@@ -152,7 +137,15 @@ def attention_hca_prefill_fwd(
     comp_sin.bind_dynamic(0, C_DYN)
     kv_pool.bind_dynamic(1, K_DYN)
 
-    qr, q, kv = attention_qkv_fwd(
+    tokens = pl.tensor.dim(x, 1)
+    compressed_len = pl.tensor.dim(comp_cos, 0)
+    qr = pl.create_tensor([B, tokens, Q_LORA_RANK], dtype=pl.BF16)
+    q = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.BF16)
+    compressed = pl.create_tensor([B, compressed_len, HEAD_DIM], dtype=pl.BF16)
+    attn_o = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+
+    attention_qkv_fwd(
         x,
         wq_a_t,
         q_norm_w,
@@ -161,16 +154,12 @@ def attention_hca_prefill_fwd(
         kv_norm_w,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
         qr,
         q,
         kv,
     )
     kv_cache_out = update_prefill_window_cache(kv, kv_cache_out)
-    compressed, comp_kv_state_out, comp_score_state_out, comp_cache_out = compressor_ratio128_prefill_fwd(
+    compressor_ratio128_prefill_fwd(
         x,
         comp_wkv_t,
         comp_wgate_t,
@@ -179,19 +168,15 @@ def attention_hca_prefill_fwd(
         comp_cos,
         comp_sin,
         comp_block_count,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
         compressed,
         comp_kv_state_out,
         comp_score_state_out,
         comp_cache_out,
     )
-    kv_pool = build_prefill_kv_pool(kv, compressed, kv_pool)
-    attn_o = sparse_attn_hca_fwd(q, kv_pool, attn_sink, topk_idxs, attn_o)
-    out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
-    return kv_cache_out, comp_kv_state_out, comp_score_state_out, comp_cache_out, out_final
+    build_prefill_kv_pool(kv, compressed, kv_pool)
+    sparse_attn_hca_fwd(q, kv_pool, attn_sink, topk_idxs, attn_o)
+    attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, out)
+    return kv_cache_out, comp_kv_state_out, comp_score_state_out, comp_cache_out, out
 
 
 @pl.jit.inline
@@ -222,34 +207,27 @@ def attention_hca_decode_fwd(
     comp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    compressed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    kv_pool: pl.Tensor[[B, WINDOW_SIZE + TOPK_HCA, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
     comp_kv_state_out: pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32],
     comp_score_state_out: pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32],
     comp_cache_out: pl.Tensor[[B, TOPK_HCA, HEAD_DIM], pl.BF16],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Attention.forward`` for ``compress_ratio == 128, start_pos > 0``."""
+    x.bind_dynamic(1, S_DYN)
     topk_idxs.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
 
-    qr, q, kv = attention_qkv_fwd(
+    tokens = pl.tensor.dim(x, 1)
+    qr = pl.create_tensor([B, tokens, Q_LORA_RANK], dtype=pl.BF16)
+    q = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.BF16)
+    compressed = pl.create_tensor([B, 1, HEAD_DIM], dtype=pl.BF16)
+    kv_pool = pl.create_tensor([B, WINDOW_SIZE + TOPK_HCA, HEAD_DIM], dtype=pl.BF16)
+    attn_o = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+
+    attention_qkv_fwd(
         x,
         wq_a_t,
         q_norm_w,
@@ -258,16 +236,12 @@ def attention_hca_decode_fwd(
         kv_norm_w,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
         qr,
         q,
         kv,
     )
     kv_cache_out = update_decode_window_cache(kv_cache, kv, cache_pos, kv_cache_out)
-    compressed, comp_kv_state_out, comp_score_state_out, comp_cache_out = compressor_ratio128_decode_fwd(
+    compressor_ratio128_decode_fwd(
         x,
         comp_kv_state,
         comp_score_state,
@@ -281,19 +255,15 @@ def attention_hca_decode_fwd(
         comp_norm_w,
         comp_cos,
         comp_sin,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
         compressed,
         comp_kv_state_out,
         comp_score_state_out,
         comp_cache_out,
     )
-    kv_pool = build_decode_kv_pool(kv_cache_out, comp_cache_out, kv_pool)
-    attn_o = sparse_attn_hca_fwd(q, kv_pool, attn_sink, topk_idxs, attn_o)
-    out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
-    return kv_cache_out, comp_kv_state_out, comp_score_state_out, comp_cache_out, out_final
+    build_decode_kv_pool(kv_cache_out, comp_cache_out, kv_pool)
+    sparse_attn_hca_fwd(q, kv_pool, attn_sink, topk_idxs, attn_o)
+    attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, out)
+    return kv_cache_out, comp_kv_state_out, comp_score_state_out, comp_cache_out, out
 
 
 @pl.jit
@@ -317,26 +287,11 @@ def attention_hca_prefill_test(
     comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_block_count: pl.Tensor[[1], pl.INT32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     comp_kv_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32]],
     comp_score_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32]],
     comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_HCA, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return attention_hca_prefill_fwd(
@@ -359,26 +314,11 @@ def attention_hca_prefill_test(
         comp_cos,
         comp_sin,
         comp_block_count,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
-        compressed,
         kv_pool,
         kv_cache_out,
         comp_kv_state_out,
         comp_score_state_out,
         comp_cache_out,
-        attn_o,
-        o_inv,
-        proj,
         out,
     )
 
@@ -411,26 +351,10 @@ def attention_hca_decode_test(
     comp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    compressed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    kv_pool: pl.Tensor[[B, WINDOW_SIZE + TOPK_HCA, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     comp_kv_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32]],
     comp_score_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32]],
     comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_HCA, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return attention_hca_decode_fwd(
@@ -460,26 +384,10 @@ def attention_hca_decode_test(
         comp_norm_w,
         comp_cos,
         comp_sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
-        compressed,
-        kv_pool,
         kv_cache_out,
         comp_kv_state_out,
         comp_score_state_out,
         comp_cache_out,
-        attn_o,
-        o_inv,
-        proj,
         out,
     )
 
@@ -516,23 +424,21 @@ def golden_attention_hca_forward(tensors, start_pos: int):
 
     # q
     qr = q = torch.matmul(x.float(), tensors["wq_a_t"].float()).to(torch.bfloat16)
-    q_a = q
     q = q.float()
     q = (q * torch.rsqrt(q.square().mean(-1, keepdim=True) + EPS) * tensors["q_norm_w"].float()).to(torch.bfloat16)
     qr = q
     q = torch.matmul(q.float(), tensors["wq_b_t"].float()).to(torch.bfloat16)
-    q_proj = q
     q = q.unflatten(-1, (N_HEADS, HEAD_DIM))
     q = (q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + EPS)).to(torch.bfloat16)
     q = _apply_rope_golden(q, tensors["cos"], tensors["sin"], inverse=False)
 
     # win kv
     kv = torch.matmul(x.float(), tensors["wkv_t"].float()).to(torch.bfloat16)
-    kv_proj = kv
     kv = kv.float()
     kv = (kv * torch.rsqrt(kv.square().mean(-1, keepdim=True) + EPS) * tensors["kv_norm_w"].float()).to(torch.bfloat16)
-    kv_normed = kv
     kv = _apply_rope_golden(kv, tensors["cos"], tensors["sin"], inverse=False)
+
+    comp_len = tensors["comp_cos"].shape[0]
 
     comp_tensors = {
         "x": x,
@@ -542,11 +448,11 @@ def golden_attention_hca_forward(tensors, start_pos: int):
         "norm_w": tensors["comp_norm_w"],
         "cos": tensors["comp_cos"],
         "sin": tensors["comp_sin"],
-        "kv_proj": tensors["comp_kv_proj"].clone(),
-        "score_proj": tensors["comp_score_proj"].clone(),
-        "pooled": tensors["comp_pooled"].clone(),
-        "normed": tensors["comp_normed"].clone(),
-        "compressed": tensors["compressed"].clone(),
+        "kv_proj": torch.empty(B, x.shape[1], HEAD_DIM, dtype=torch.float32),
+        "score_proj": torch.empty(B, x.shape[1], HEAD_DIM, dtype=torch.float32),
+        "pooled": torch.empty(B, comp_len, HEAD_DIM, dtype=torch.bfloat16),
+        "normed": torch.empty(B, comp_len, HEAD_DIM, dtype=torch.bfloat16),
+        "compressed": torch.empty(B, comp_len, HEAD_DIM, dtype=torch.bfloat16),
         "kv_state_out": tensors["comp_kv_state_out"].clone(),
         "score_state_out": tensors["comp_score_state_out"].clone(),
         "compressed_cache_out": tensors["comp_cache_out"].clone(),
@@ -596,26 +502,12 @@ def golden_attention_hca_forward(tensors, start_pos: int):
     proj = torch.einsum("bsgd,grd->bsgr", o.float(), wo_a.float()).to(torch.bfloat16)
     out = torch.matmul(proj.flatten(2).float(), tensors["wo_b_t"].float()).to(torch.bfloat16)
 
-    tensors["q_a"][:] = q_a
-    tensors["q_proj"][:] = q_proj
-    tensors["kv_proj"][:] = kv_proj
-    tensors["kv_normed"][:] = kv_normed
-    tensors["qr"][:] = qr
-    tensors["q"][:] = q
-    tensors["kv"][:] = kv
-    tensors["kv_pool"][:, : kv_pool.shape[1]] = kv_pool
+    if "kv_pool" in tensors:
+        tensors["kv_pool"][:, : kv_pool.shape[1]] = kv_pool
     tensors["kv_cache_out"][:] = kv_cache_out
-    tensors["comp_kv_proj"][:] = comp_tensors["kv_proj"]
-    tensors["comp_score_proj"][:] = comp_tensors["score_proj"]
-    tensors["comp_pooled"][:] = comp_tensors["pooled"]
-    tensors["comp_normed"][:] = comp_tensors["normed"]
-    tensors["compressed"][:] = comp_tensors["compressed"]
     tensors["comp_kv_state_out"][:] = comp_tensors["kv_state_out"]
     tensors["comp_score_state_out"][:] = comp_tensors["score_state_out"]
     tensors["comp_cache_out"][:] = comp_tensors["compressed_cache_out"]
-    tensors["attn_o"][:] = attn_o
-    tensors["o_inv"][:] = o_inv
-    tensors["proj"][:] = proj.flatten(2)
     tensors["out"][:] = out
 
 
@@ -755,37 +647,24 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
         TensorSpec("comp_sin", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_sin),
     ]
     if not decode:
-        specs.append(
-            TensorSpec(
-                "comp_block_count",
-                [1],
-                torch.int32,
-                init_value=torch.tensor([seq_len // COMPRESS_RATIO], dtype=torch.int32),
-            )
+        specs.extend(
+            [
+                TensorSpec(
+                    "comp_block_count",
+                    [1],
+                    torch.int32,
+                    init_value=torch.tensor([seq_len // COMPRESS_RATIO], dtype=torch.int32),
+                ),
+                TensorSpec("kv_pool", [B, kv_pool_len, HEAD_DIM], torch.bfloat16),
+            ]
         )
 
     specs.extend(
         [
-            TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16),
-            TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("comp_kv_proj", [B, seq_len, HEAD_DIM], torch.float32),
-            TensorSpec("comp_score_proj", [B, seq_len, HEAD_DIM], torch.float32),
-            TensorSpec("comp_pooled", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("comp_normed", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("compressed", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_pool", [B, kv_pool_len, HEAD_DIM], torch.bfloat16),
             TensorSpec("kv_cache_out", [B, WINDOW_SIZE, HEAD_DIM], torch.bfloat16, is_output=True, init_value=0.0),
             TensorSpec("comp_kv_state_out", [B, COMPRESS_RATIO, HEAD_DIM], torch.float32, is_output=True),
             TensorSpec("comp_score_state_out", [B, COMPRESS_RATIO, HEAD_DIM], torch.float32, is_output=True),
             TensorSpec("comp_cache_out", [B, TOPK_HCA, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("attn_o", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
             TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
         ]
     )

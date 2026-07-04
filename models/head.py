@@ -212,9 +212,6 @@ def head_fwd(
     head_w: pl.Tensor[[VOCAB, HIDDEN], pl.FP32],
     pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     hc_out_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
-    logits_pad: pl.Tensor[[T_TILE, VOCAB], pl.FP32],
-    hc_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     logits: pl.Tensor[[B, VOCAB], pl.FP32],
 ):
     """Run single-card DeepSeek head: HC head, final RMSNorm, and LM head."""
@@ -222,13 +219,15 @@ def head_fwd(
     x_pad.bind_dynamic(1, S_PAD_DYN)
     pre.bind_dynamic(1, S_PAD_DYN)
     hc_out_pad.bind_dynamic(1, S_PAD_DYN)
-    hc_out.bind_dynamic(1, S_DYN)
-    normed.bind_dynamic(1, S_DYN)
 
+    tokens = pl.tensor.dim(x, 1)
+    hc_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    logits_pad = pl.create_tensor([T_TILE, VOCAB], dtype=pl.FP32)
     hc_out = hc_head_fwd(x, x_pad, hc_fn, hc_scale, hc_base, pre, hc_out_pad, hc_out)
     normed = rmsnorm_4096(hc_out, norm_w, normed)
     logits = lm_head_fwd(normed, head_w, logits_pad, logits)
-    return hc_out, normed, logits
+    return logits
 
 
 @pl.jit
@@ -242,12 +241,9 @@ def head_test(
     head_w: pl.Tensor[[VOCAB, HIDDEN], pl.FP32],
     pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     hc_out_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
-    logits_pad: pl.Tensor[[T_TILE, VOCAB], pl.FP32],
-    hc_out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
-    normed: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
     logits: pl.Out[pl.Tensor[[B, VOCAB], pl.FP32]],
 ):
-    hc_out, normed, logits = head_fwd(
+    logits = head_fwd(
         x,
         x_pad,
         hc_fn,
@@ -257,12 +253,9 @@ def head_test(
         head_w,
         pre,
         hc_out_pad,
-        logits_pad,
-        hc_out,
-        normed,
         logits,
     )
-    return hc_out, normed, logits
+    return logits
 
 
 def golden_head(tensors):
@@ -286,10 +279,6 @@ def golden_head(tensors):
 
     logits = F.linear(normed[:, -1].float(), tensors["head_w"].float())
 
-    if "hc_out" in tensors:
-        tensors["hc_out"][:] = hc_out
-    if "normed" in tensors:
-        tensors["normed"][:] = normed
     tensors["logits"][:] = logits
 
 
@@ -332,9 +321,6 @@ def build_head_specs(seq_len: int = DEFAULT_SEQ_LEN):
         TensorSpec("head_w", [VOCAB, HIDDEN], torch.float32, init_value=init_head_w),
         TensorSpec("pre", [B, padded_seq_len, HC_PAD], torch.float32),
         TensorSpec("hc_out_pad", [B, padded_seq_len, HIDDEN], torch.bfloat16),
-        TensorSpec("logits_pad", [T_TILE, VOCAB], torch.float32),
-        TensorSpec("hc_out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
-        TensorSpec("normed", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
         TensorSpec("logits", [B, VOCAB], torch.float32, is_output=True),
     ]
 
@@ -365,8 +351,6 @@ def main() -> int:
         runtime_cfg=runtime_cfg,
         compile_only=args.compile_only,
         compare_fn={
-            "hc_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
-            "normed": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
             "logits": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
         },
     )

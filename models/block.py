@@ -107,23 +107,7 @@ def block_swa_hash_prefill_fwd(
     attn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     attn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     attn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    attn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
-    attn_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
     ffn_hc_pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -131,23 +115,23 @@ def block_swa_hash_prefill_fwd(
     ffn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     ffn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     ffn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    ffn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    moe_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     """Run ordinary Block.forward for SWA attention + hash MoE, prefill path."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    attn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    attn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    attn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_out = pl.create_tensor([B, tokens, HC_MULT, HIDDEN], dtype=pl.BF16)
+    ffn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    ffn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    ffn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    ffn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
@@ -178,17 +162,7 @@ def block_swa_hash_prefill_fwd(
         wo_b_t,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
         kv_cache_out,
-        attn_o,
-        o_inv,
-        proj,
         attn_out,
     )
     hc_post_fwd(attn_out, x, attn_hc_post, attn_hc_comb, attn_hc_out)
@@ -221,15 +195,6 @@ def block_swa_hash_prefill_fwd(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         moe_out,
     )
     hc_post_fwd(moe_out, attn_hc_out, ffn_hc_post, ffn_hc_comb, out)
@@ -276,23 +241,7 @@ def block_swa_hash_decode_fwd(
     attn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     attn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     attn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    attn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
-    attn_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
     ffn_hc_pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -300,23 +249,23 @@ def block_swa_hash_decode_fwd(
     ffn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     ffn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     ffn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    ffn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    moe_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     """Run ordinary Block.forward for SWA attention + hash MoE, decode path."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    attn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    attn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    attn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_out = pl.create_tensor([B, tokens, HC_MULT, HIDDEN], dtype=pl.BF16)
+    ffn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    ffn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    ffn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    ffn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
@@ -349,17 +298,7 @@ def block_swa_hash_decode_fwd(
         wo_b_t,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
         kv_cache_out,
-        attn_o,
-        o_inv,
-        proj,
         attn_out,
     )
     hc_post_fwd(attn_out, x, attn_hc_post, attn_hc_comb, attn_hc_out)
@@ -392,15 +331,6 @@ def block_swa_hash_decode_fwd(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         moe_out,
     )
     hc_post_fwd(moe_out, attn_hc_out, ffn_hc_post, ffn_hc_comb, out)
@@ -462,45 +392,14 @@ def block_csa_hash_prefill_fwd(
     attn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     attn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     attn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    attn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    attn_compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     attn_comp_kv_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_score_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16]],
-    idx_q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    idx_q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    idx_weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    idx_comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_pooled: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    idx_comp_normed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    idx_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
-    idx_topk_idxs: pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32],
     idx_kv_cache_out: pl.Out[pl.Tensor[[B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], pl.BF16]],
     idx_comp_kv_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     idx_comp_score_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
-    csa_topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
-    attn_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
     ffn_hc_pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -508,23 +407,23 @@ def block_csa_hash_prefill_fwd(
     ffn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     ffn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     ffn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    ffn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    moe_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     """Run ordinary Block.forward for CSA attention + hash MoE, prefill path."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    attn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    attn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    attn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_out = pl.create_tensor([B, tokens, HC_MULT, HIDDEN], dtype=pl.BF16)
+    ffn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    ffn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    ffn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    ffn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
@@ -572,39 +471,14 @@ def block_csa_hash_prefill_fwd(
         idx_comp_cos,
         idx_comp_sin,
         idx_comp_block_count,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        attn_comp_kv_proj,
-        attn_comp_score_proj,
-        attn_comp_pooled,
-        attn_comp_normed,
-        attn_compressed,
         kv_pool,
         kv_cache_out,
         attn_comp_kv_state_out,
         attn_comp_score_state_out,
         attn_comp_cache_out,
-        idx_q_proj,
-        idx_q_rope,
-        idx_weights,
-        idx_comp_kv_proj,
-        idx_comp_score_proj,
-        idx_comp_pooled,
-        idx_comp_normed,
-        idx_score,
-        idx_topk_idxs,
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
-        csa_topk_idxs,
-        attn_o,
-        o_inv,
-        proj,
         attn_out,
     )
     hc_post_fwd(attn_out, x, attn_hc_post, attn_hc_comb, attn_hc_out)
@@ -637,15 +511,6 @@ def block_csa_hash_prefill_fwd(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         moe_out,
     )
     hc_post_fwd(moe_out, attn_hc_out, ffn_hc_post, ffn_hc_comb, out)
@@ -725,45 +590,14 @@ def block_csa_hash_decode_fwd(
     attn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     attn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     attn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    attn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    attn_comp_normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    attn_compressed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, WINDOW_SIZE + TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     attn_comp_kv_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_score_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16]],
-    idx_q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    idx_q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    idx_weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    idx_comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_pooled: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    idx_comp_normed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    idx_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
-    idx_topk_idxs: pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32],
     idx_kv_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, INDEX_HEAD_DIM], pl.BF16]],
     idx_comp_kv_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     idx_comp_score_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
-    csa_topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
-    attn_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
     ffn_hc_pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -771,23 +605,23 @@ def block_csa_hash_decode_fwd(
     ffn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     ffn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     ffn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    ffn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    moe_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     """Run ordinary Block.forward for CSA attention + hash MoE, decode path."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    attn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    attn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    attn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_out = pl.create_tensor([B, tokens, HC_MULT, HIDDEN], dtype=pl.BF16)
+    ffn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    ffn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    ffn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    ffn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
@@ -844,39 +678,13 @@ def block_csa_hash_decode_fwd(
         idx_comp_norm_w,
         idx_comp_cos,
         idx_comp_sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        attn_comp_kv_proj,
-        attn_comp_score_proj,
-        attn_comp_pooled,
-        attn_comp_normed,
-        attn_compressed,
-        kv_pool,
         kv_cache_out,
         attn_comp_kv_state_out,
         attn_comp_score_state_out,
         attn_comp_cache_out,
-        idx_q_proj,
-        idx_q_rope,
-        idx_weights,
-        idx_comp_kv_proj,
-        idx_comp_score_proj,
-        idx_comp_pooled,
-        idx_comp_normed,
-        idx_score,
-        idx_topk_idxs,
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
-        csa_topk_idxs,
-        attn_o,
-        o_inv,
-        proj,
         attn_out,
     )
     hc_post_fwd(attn_out, x, attn_hc_post, attn_hc_comb, attn_hc_out)
@@ -909,15 +717,6 @@ def block_csa_hash_decode_fwd(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         moe_out,
     )
     hc_post_fwd(moe_out, attn_hc_out, ffn_hc_post, ffn_hc_comb, out)
@@ -987,45 +786,14 @@ def block_csa_topk_prefill_fwd(
     attn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     attn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     attn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    attn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    attn_compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     attn_comp_kv_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_score_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16]],
-    idx_q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    idx_q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    idx_weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    idx_comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_pooled: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    idx_comp_normed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    idx_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
-    idx_topk_idxs: pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32],
     idx_kv_cache_out: pl.Out[pl.Tensor[[B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], pl.BF16]],
     idx_comp_kv_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     idx_comp_score_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
-    csa_topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
-    attn_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
     ffn_hc_pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -1033,23 +801,23 @@ def block_csa_topk_prefill_fwd(
     ffn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     ffn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     ffn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    ffn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    moe_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     """Run ordinary Block.forward for CSA attention + topk MoE, prefill path."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    attn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    attn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    attn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_out = pl.create_tensor([B, tokens, HC_MULT, HIDDEN], dtype=pl.BF16)
+    ffn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    ffn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    ffn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    ffn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
@@ -1097,39 +865,14 @@ def block_csa_topk_prefill_fwd(
         idx_comp_cos,
         idx_comp_sin,
         idx_comp_block_count,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        attn_comp_kv_proj,
-        attn_comp_score_proj,
-        attn_comp_pooled,
-        attn_comp_normed,
-        attn_compressed,
         kv_pool,
         kv_cache_out,
         attn_comp_kv_state_out,
         attn_comp_score_state_out,
         attn_comp_cache_out,
-        idx_q_proj,
-        idx_q_rope,
-        idx_weights,
-        idx_comp_kv_proj,
-        idx_comp_score_proj,
-        idx_comp_pooled,
-        idx_comp_normed,
-        idx_score,
-        idx_topk_idxs,
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
-        csa_topk_idxs,
-        attn_o,
-        o_inv,
-        proj,
         attn_out,
     )
     hc_post_fwd(attn_out, x, attn_hc_post, attn_hc_comb, attn_hc_out)
@@ -1161,15 +904,6 @@ def block_csa_topk_prefill_fwd(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         moe_out,
     )
     hc_post_fwd(moe_out, attn_hc_out, ffn_hc_post, ffn_hc_comb, out)
@@ -1248,45 +982,14 @@ def block_csa_topk_decode_fwd(
     attn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     attn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     attn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    attn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    attn_comp_normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    attn_compressed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, WINDOW_SIZE + TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     attn_comp_kv_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_score_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16]],
-    idx_q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    idx_q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    idx_weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    idx_comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_pooled: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    idx_comp_normed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    idx_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
-    idx_topk_idxs: pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32],
     idx_kv_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, INDEX_HEAD_DIM], pl.BF16]],
     idx_comp_kv_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     idx_comp_score_state_out: pl.Out[pl.Tensor[[B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
-    csa_topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
-    attn_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
     ffn_hc_pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -1294,23 +997,23 @@ def block_csa_topk_decode_fwd(
     ffn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     ffn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     ffn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    ffn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    moe_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     """Run ordinary Block.forward for CSA attention + topk MoE, decode path."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    attn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    attn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    attn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_out = pl.create_tensor([B, tokens, HC_MULT, HIDDEN], dtype=pl.BF16)
+    ffn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    ffn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    ffn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    ffn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
@@ -1367,39 +1070,13 @@ def block_csa_topk_decode_fwd(
         idx_comp_norm_w,
         idx_comp_cos,
         idx_comp_sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        attn_comp_kv_proj,
-        attn_comp_score_proj,
-        attn_comp_pooled,
-        attn_comp_normed,
-        attn_compressed,
-        kv_pool,
         kv_cache_out,
         attn_comp_kv_state_out,
         attn_comp_score_state_out,
         attn_comp_cache_out,
-        idx_q_proj,
-        idx_q_rope,
-        idx_weights,
-        idx_comp_kv_proj,
-        idx_comp_score_proj,
-        idx_comp_pooled,
-        idx_comp_normed,
-        idx_score,
-        idx_topk_idxs,
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
-        csa_topk_idxs,
-        attn_o,
-        o_inv,
-        proj,
         attn_out,
     )
     hc_post_fwd(attn_out, x, attn_hc_post, attn_hc_comb, attn_hc_out)
@@ -1431,15 +1108,6 @@ def block_csa_topk_decode_fwd(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         moe_out,
     )
     hc_post_fwd(moe_out, attn_hc_out, ffn_hc_post, ffn_hc_comb, out)
@@ -1499,32 +1167,11 @@ def block_hca_topk_prefill_fwd(
     attn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     attn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     attn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    attn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     comp_kv_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO128, HEAD_DIM], pl.FP32]],
     comp_score_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO128, HEAD_DIM], pl.FP32]],
     comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_HCA, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
-    attn_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
     ffn_hc_pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -1532,23 +1179,23 @@ def block_hca_topk_prefill_fwd(
     ffn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     ffn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     ffn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    ffn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    moe_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     """Run ordinary Block.forward for HCA attention + topk MoE, prefill path."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    attn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    attn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    attn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_out = pl.create_tensor([B, tokens, HC_MULT, HIDDEN], dtype=pl.BF16)
+    ffn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    ffn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    ffn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    ffn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
@@ -1586,26 +1233,11 @@ def block_hca_topk_prefill_fwd(
         comp_cos,
         comp_sin,
         comp_block_count,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
-        compressed,
         kv_pool,
         kv_cache_out,
         comp_kv_state_out,
         comp_score_state_out,
         comp_cache_out,
-        attn_o,
-        o_inv,
-        proj,
         attn_out,
     )
     hc_post_fwd(attn_out, x, attn_hc_post, attn_hc_comb, attn_hc_out)
@@ -1637,15 +1269,6 @@ def block_hca_topk_prefill_fwd(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         moe_out,
     )
     hc_post_fwd(moe_out, attn_hc_out, ffn_hc_post, ffn_hc_comb, out)
@@ -1703,32 +1326,11 @@ def block_hca_topk_decode_fwd(
     attn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     attn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     attn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    attn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    attn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    compressed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, WINDOW_SIZE + TOPK_HCA, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     comp_kv_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO128, HEAD_DIM], pl.FP32]],
     comp_score_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO128, HEAD_DIM], pl.FP32]],
     comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_HCA, HEAD_DIM], pl.BF16]],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
-    attn_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    attn_hc_out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_x_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT, HIDDEN], pl.BF16],
     ffn_hc_mixes: pl.Tensor[[B, S_PAD_DYN, MIX_PAD], pl.FP32],
     ffn_hc_pre: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
@@ -1736,23 +1338,23 @@ def block_hca_topk_decode_fwd(
     ffn_hc_x_mixed_pad: pl.Tensor[[B, S_PAD_DYN, HIDDEN], pl.BF16],
     ffn_hc_post_pad: pl.Tensor[[B, S_PAD_DYN, HC_PAD], pl.FP32],
     ffn_hc_comb_pad: pl.Tensor[[B, S_PAD_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_hc_x_mixed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    ffn_hc_post: pl.Tensor[[B, S_DYN, HC_PAD], pl.FP32],
-    ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
-    ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
-    moe_out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     """Run ordinary Block.forward for HCA attention + topk MoE, decode path."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    attn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    attn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    attn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    attn_hc_out = pl.create_tensor([B, tokens, HC_MULT, HIDDEN], dtype=pl.BF16)
+    ffn_hc_x_mixed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    ffn_hc_post = pl.create_tensor([B, tokens, HC_PAD], dtype=pl.FP32)
+    ffn_hc_comb = pl.create_tensor([B, tokens, HC_MULT * HC_MULT], dtype=pl.FP32)
+    ffn_normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+    moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
     hc_pre_fwd(
         x,
         attn_hc_x_pad,
@@ -1797,26 +1399,10 @@ def block_hca_topk_decode_fwd(
         comp_norm_w,
         comp_cos,
         comp_sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
-        compressed,
-        kv_pool,
         kv_cache_out,
         comp_kv_state_out,
         comp_score_state_out,
         comp_cache_out,
-        attn_o,
-        o_inv,
-        proj,
         attn_out,
     )
     hc_post_fwd(attn_out, x, attn_hc_post, attn_hc_comb, attn_hc_out)
@@ -1848,15 +1434,6 @@ def block_hca_topk_decode_fwd(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         moe_out,
     )
     hc_post_fwd(moe_out, attn_hc_out, ffn_hc_post, ffn_hc_comb, out)
@@ -1867,15 +1444,27 @@ def _prefixed(tensors: dict[str, torch.Tensor], prefix: str, key: str) -> torch.
     return tensors[f"{prefix}_{key}"]
 
 
+def _optional_tensor(
+    tensors: dict[str, torch.Tensor],
+    key: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if key in tensors:
+        return tensors[key]
+    return torch.empty(shape, dtype=dtype)
+
+
 def _run_hc_pre(tensors: dict[str, torch.Tensor], *, prefix: str, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bsz, seq_len = x.shape[:2]
     hc_tensors = {
         "x": x,
         "hc_fn": _prefixed(tensors, prefix, "hc_fn"),
         "hc_scale": _prefixed(tensors, prefix, "hc_scale"),
         "hc_base": _prefixed(tensors, prefix, "hc_base"),
-        "x_mixed": _prefixed(tensors, prefix, "hc_x_mixed"),
-        "post": _prefixed(tensors, prefix, "hc_post"),
-        "comb": _prefixed(tensors, prefix, "hc_comb"),
+        "x_mixed": _optional_tensor(tensors, f"{prefix}_hc_x_mixed", (bsz, seq_len, HIDDEN), x.dtype),
+        "post": _optional_tensor(tensors, f"{prefix}_hc_post", (bsz, seq_len, HC_PAD), torch.float32),
+        "comb": _optional_tensor(tensors, f"{prefix}_hc_comb", (bsz, seq_len, HC_MULT * HC_MULT), torch.float32),
     }
     golden_hc_pre(hc_tensors)
     return hc_tensors["x_mixed"], hc_tensors["post"], hc_tensors["comb"]
@@ -1893,12 +1482,13 @@ def _run_hc_post(
     out_key = f"{prefix}_hc_out"
     if out_key not in tensors and prefix == "ffn":
         out_key = "out"
+    out = tensors[out_key] if out_key in tensors else torch.empty_like(residual)
     hc_tensors = {
         "x": x,
         "residual": residual,
         "post": post,
         "comb": comb,
-        "out": tensors[out_key],
+        "out": out,
     }
     golden_hc_post(hc_tensors)
     return hc_tensors["out"]
@@ -1914,7 +1504,7 @@ def _run_hidden_rmsnorm(
     norm_tensors = {
         "x": x,
         "norm_w": tensors[norm_w_key],
-        "out": tensors[out_key],
+        "out": tensors[out_key] if out_key in tensors else torch.empty_like(x),
     }
     golden_rmsnorm(norm_tensors)
     return norm_tensors["out"]
@@ -1926,10 +1516,10 @@ def _run_attention(
     x: torch.Tensor,
     start_pos: int,
     attention_kind: str,
-) -> None:
+) -> torch.Tensor:
     attention_tensors = dict(tensors)
     attention_tensors["x"] = x
-    attention_tensors["out"] = tensors["attn_out"]
+    attention_tensors["out"] = tensors["attn_out"] if "attn_out" in tensors else torch.empty_like(x)
 
     if attention_kind == "swa":
         golden_attention_swa_forward(attention_tensors, start_pos=start_pos)
@@ -1939,13 +1529,15 @@ def _run_attention(
         golden_attention_csa_forward(attention_tensors, start_pos=start_pos)
     else:
         raise ValueError(f"unsupported attention_kind: {attention_kind!r}")
+    return attention_tensors["out"]
 
 
-def _run_moe(tensors: dict[str, torch.Tensor], *, x: torch.Tensor, hash_route: bool) -> None:
+def _run_moe(tensors: dict[str, torch.Tensor], *, x: torch.Tensor, hash_route: bool) -> torch.Tensor:
     moe_tensors = dict(tensors)
     moe_tensors["x"] = x
-    moe_tensors["out"] = tensors["moe_out"]
+    moe_tensors["out"] = tensors["moe_out"] if "moe_out" in tensors else torch.empty_like(x)
     golden_moe_forward(moe_tensors, hash_route=hash_route)
+    return moe_tensors["out"]
 
 
 def golden_block_forward(
@@ -1970,11 +1562,11 @@ def golden_block_forward(
     attn_residual = x
     attn_x, attn_post, attn_comb = _run_hc_pre(tensors, prefix="attn", x=x)
     attn_normed = _run_hidden_rmsnorm(tensors, x=attn_x, norm_w_key="attn_norm_w", out_key="attn_normed")
-    _run_attention(tensors, x=attn_normed, start_pos=start_pos, attention_kind=attention_kind)
+    attn_out = _run_attention(tensors, x=attn_normed, start_pos=start_pos, attention_kind=attention_kind)
     attn_hc_out = _run_hc_post(
         tensors,
         prefix="attn",
-        x=tensors["attn_out"],
+        x=attn_out,
         residual=attn_residual,
         post=attn_post,
         comb=attn_comb,
@@ -1983,11 +1575,11 @@ def golden_block_forward(
     ffn_residual = attn_hc_out
     ffn_x, ffn_post, ffn_comb = _run_hc_pre(tensors, prefix="ffn", x=attn_hc_out)
     ffn_normed = _run_hidden_rmsnorm(tensors, x=ffn_x, norm_w_key="ffn_norm_w", out_key="ffn_normed")
-    _run_moe(tensors, x=ffn_normed, hash_route=hash_route)
+    moe_out = _run_moe(tensors, x=ffn_normed, hash_route=hash_route)
     out = _run_hc_post(
         tensors,
         prefix="ffn",
-        x=tensors["moe_out"],
+        x=moe_out,
         residual=ffn_residual,
         post=ffn_post,
         comb=ffn_comb,
@@ -2160,23 +1752,7 @@ def _build_swa_hash_specs(seq_len: int, start_pos: int, *, decode: bool):
             TensorSpec("attn_hc_x_mixed_pad", [B, seq_pad, HIDDEN], torch.bfloat16),
             TensorSpec("attn_hc_post_pad", [B, seq_pad, HC_PAD], torch.float32),
             TensorSpec("attn_hc_comb_pad", [B, seq_pad, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("attn_hc_x_mixed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("attn_hc_post", [B, seq_len, HC_PAD], torch.float32),
-            TensorSpec("attn_hc_comb", [B, seq_len, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("attn_normed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16),
-            TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16),
             TensorSpec("kv_cache_out", [B, WINDOW_SIZE, HEAD_DIM], torch.bfloat16, is_output=True, init_value=0.0),
-            TensorSpec("attn_o", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
-            TensorSpec("attn_out", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("attn_hc_out", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_x_pad", [B, seq_pad, HC_MULT, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_mixes", [B, seq_pad, MIX_PAD], torch.float32),
             TensorSpec("ffn_hc_pre", [B, seq_pad, HC_PAD], torch.float32),
@@ -2184,20 +1760,6 @@ def _build_swa_hash_specs(seq_len: int, start_pos: int, *, decode: bool):
             TensorSpec("ffn_hc_x_mixed_pad", [B, seq_pad, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_post_pad", [B, seq_pad, HC_PAD], torch.float32),
             TensorSpec("ffn_hc_comb_pad", [B, seq_pad, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("ffn_hc_x_mixed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("ffn_hc_post", [B, seq_len, HC_PAD], torch.float32),
-            TensorSpec("ffn_hc_comb", [B, seq_len, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("ffn_normed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("logits", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("scores", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("indices", [B, seq_len, TOPK], torch.int32),
-            TensorSpec("weights", [B, seq_len, TOPK], torch.float32),
-            TensorSpec("route_y", [B, seq_len, TOPK, HIDDEN], torch.bfloat16),
-            TensorSpec("shared_gate", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_up", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_hidden", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_y", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("moe_out", [B, seq_len, HIDDEN], torch.bfloat16),
             TensorSpec("out", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16, is_output=True),
         ]
     )
@@ -2474,45 +2036,14 @@ def _build_csa_specs(seq_len: int, start_pos: int, *, decode: bool, hash_route: 
             TensorSpec("attn_hc_x_mixed_pad", [B, seq_pad, HIDDEN], torch.bfloat16),
             TensorSpec("attn_hc_post_pad", [B, seq_pad, HC_PAD], torch.float32),
             TensorSpec("attn_hc_comb_pad", [B, seq_pad, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("attn_hc_x_mixed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("attn_hc_post", [B, seq_len, HC_PAD], torch.float32),
-            TensorSpec("attn_hc_comb", [B, seq_len, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("attn_normed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16),
-            TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("attn_comp_kv_proj", [B, seq_len, ATTN_PROJ_DIM], torch.float32),
-            TensorSpec("attn_comp_score_proj", [B, seq_len, ATTN_PROJ_DIM], torch.float32),
-            TensorSpec("attn_comp_pooled", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("attn_comp_normed", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("attn_compressed", [B, compressed_len, HEAD_DIM], torch.bfloat16),
             TensorSpec("kv_pool", [B, kv_pool_len, HEAD_DIM], torch.bfloat16),
             TensorSpec("kv_cache_out", [B, WINDOW_SIZE, HEAD_DIM], torch.bfloat16, is_output=True, init_value=0.0),
             TensorSpec("attn_comp_kv_state_out", [B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
             TensorSpec("attn_comp_score_state_out", [B, RATIO4_STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
             TensorSpec("attn_comp_cache_out", [B, TOPK_CSA_COMPRESSED, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("idx_q_proj", [B, seq_len, INDEX_Q_OUT], torch.bfloat16),
-            TensorSpec("idx_q_rope", [B, seq_len, INDEX_N_HEADS, INDEX_HEAD_DIM], torch.bfloat16),
-            TensorSpec("idx_weights", [B, seq_len, INDEX_N_HEADS], torch.bfloat16),
-            TensorSpec("idx_comp_kv_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32),
-            TensorSpec("idx_comp_score_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32),
-            TensorSpec("idx_comp_pooled", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16),
-            TensorSpec("idx_comp_normed", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16),
-            TensorSpec("idx_score", [B, seq_len, INDEX_SCORE_LEN], torch.float32),
-            TensorSpec("idx_topk_idxs", [B, seq_len, INDEX_TOPK], torch.int32, init_value=-1),
             TensorSpec("idx_kv_cache_out", [B, TOPK_CSA_COMPRESSED, INDEX_HEAD_DIM], torch.bfloat16, is_output=True),
             TensorSpec("idx_comp_kv_state_out", [B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
             TensorSpec("idx_comp_score_state_out", [B, RATIO4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
-            TensorSpec("csa_topk_idxs", [B, seq_len, TOPK_CSA_TOTAL], torch.int32, init_value=-1),
-            TensorSpec("attn_o", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
-            TensorSpec("attn_out", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("attn_hc_out", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_x_pad", [B, seq_pad, HC_MULT, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_mixes", [B, seq_pad, MIX_PAD], torch.float32),
             TensorSpec("ffn_hc_pre", [B, seq_pad, HC_PAD], torch.float32),
@@ -2520,20 +2051,6 @@ def _build_csa_specs(seq_len: int, start_pos: int, *, decode: bool, hash_route: 
             TensorSpec("ffn_hc_x_mixed_pad", [B, seq_pad, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_post_pad", [B, seq_pad, HC_PAD], torch.float32),
             TensorSpec("ffn_hc_comb_pad", [B, seq_pad, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("ffn_hc_x_mixed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("ffn_hc_post", [B, seq_len, HC_PAD], torch.float32),
-            TensorSpec("ffn_hc_comb", [B, seq_len, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("ffn_normed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("logits", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("scores", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("indices", [B, seq_len, TOPK], torch.int32),
-            TensorSpec("weights", [B, seq_len, TOPK], torch.float32),
-            TensorSpec("route_y", [B, seq_len, TOPK, HIDDEN], torch.bfloat16),
-            TensorSpec("shared_gate", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_up", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_hidden", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_y", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("moe_out", [B, seq_len, HIDDEN], torch.bfloat16),
             TensorSpec("out", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16, is_output=True),
         ]
     )
@@ -2768,32 +2285,11 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
             TensorSpec("attn_hc_x_mixed_pad", [B, seq_pad, HIDDEN], torch.bfloat16),
             TensorSpec("attn_hc_post_pad", [B, seq_pad, HC_PAD], torch.float32),
             TensorSpec("attn_hc_comb_pad", [B, seq_pad, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("attn_hc_x_mixed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("attn_hc_post", [B, seq_len, HC_PAD], torch.float32),
-            TensorSpec("attn_hc_comb", [B, seq_len, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("attn_normed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16),
-            TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("comp_kv_proj", [B, seq_len, HEAD_DIM], torch.float32),
-            TensorSpec("comp_score_proj", [B, seq_len, HEAD_DIM], torch.float32),
-            TensorSpec("comp_pooled", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("comp_normed", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("compressed", [B, compressed_len, HEAD_DIM], torch.bfloat16),
             TensorSpec("kv_pool", [B, kv_pool_len, HEAD_DIM], torch.bfloat16),
             TensorSpec("kv_cache_out", [B, WINDOW_SIZE, HEAD_DIM], torch.bfloat16, is_output=True, init_value=0.0),
             TensorSpec("comp_kv_state_out", [B, COMPRESS_RATIO128, HEAD_DIM], torch.float32, is_output=True),
             TensorSpec("comp_score_state_out", [B, COMPRESS_RATIO128, HEAD_DIM], torch.float32, is_output=True),
             TensorSpec("comp_cache_out", [B, TOPK_HCA, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("attn_o", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
-            TensorSpec("attn_out", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("attn_hc_out", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_x_pad", [B, seq_pad, HC_MULT, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_mixes", [B, seq_pad, MIX_PAD], torch.float32),
             TensorSpec("ffn_hc_pre", [B, seq_pad, HC_PAD], torch.float32),
@@ -2801,20 +2297,6 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
             TensorSpec("ffn_hc_x_mixed_pad", [B, seq_pad, HIDDEN], torch.bfloat16),
             TensorSpec("ffn_hc_post_pad", [B, seq_pad, HC_PAD], torch.float32),
             TensorSpec("ffn_hc_comb_pad", [B, seq_pad, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("ffn_hc_x_mixed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("ffn_hc_post", [B, seq_len, HC_PAD], torch.float32),
-            TensorSpec("ffn_hc_comb", [B, seq_len, HC_MULT * HC_MULT], torch.float32),
-            TensorSpec("ffn_normed", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("logits", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("scores", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("indices", [B, seq_len, TOPK], torch.int32),
-            TensorSpec("weights", [B, seq_len, TOPK], torch.float32),
-            TensorSpec("route_y", [B, seq_len, TOPK, HIDDEN], torch.bfloat16),
-            TensorSpec("shared_gate", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_up", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_hidden", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_y", [B, seq_len, HIDDEN], torch.bfloat16),
-            TensorSpec("moe_out", [B, seq_len, HIDDEN], torch.bfloat16),
             TensorSpec("out", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16, is_output=True),
         ]
     )

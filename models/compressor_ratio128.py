@@ -52,10 +52,6 @@ def compressor_ratio128_prefill_fwd(
     cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     block_count: pl.Tensor[[1], pl.INT32],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_state_out: pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32],
     score_state_out: pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32],
@@ -65,10 +61,6 @@ def compressor_ratio128_prefill_fwd(
     x.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, C_DYN)
     sin.bind_dynamic(0, C_DYN)
-    kv_proj.bind_dynamic(1, S_DYN)
-    score_proj.bind_dynamic(1, S_DYN)
-    pooled.bind_dynamic(1, C_DYN)
-    normed.bind_dynamic(1, C_DYN)
     compressed.bind_dynamic(1, C_DYN)
 
     tokens = pl.tensor.dim(x, 1)
@@ -77,6 +69,11 @@ def compressor_ratio128_prefill_fwd(
     should_compress = blocks > 0
     cutoff = blocks * COMPRESS_RATIO
     remainder = tokens - cutoff
+
+    kv_proj = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.FP32)
+    score_proj = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.FP32)
+    pooled = pl.create_tensor([B, padded_blocks, HEAD_DIM], dtype=pl.BF16)
+    normed = pl.create_tensor([B, padded_blocks, HEAD_DIM], dtype=pl.BF16)
 
     kv_proj = linear_4096_to_512_fp32(x, wkv_t, kv_proj)
     score_proj = linear_4096_to_512_fp32(x, wgate_t, score_proj)
@@ -268,10 +265,6 @@ def compressor_ratio128_prefill_test(
     cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     block_count: pl.Tensor[[1], pl.INT32],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     compressed: pl.Out[pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16]],
     kv_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32]],
     score_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32]],
@@ -286,10 +279,6 @@ def compressor_ratio128_prefill_test(
         cos,
         sin,
         block_count,
-        kv_proj,
-        score_proj,
-        pooled,
-        normed,
         compressed,
         kv_state_out,
         score_state_out,
@@ -313,10 +302,6 @@ def compressor_ratio128_decode_fwd(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
     compressed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
     kv_state_out: pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32],
     score_state_out: pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32],
@@ -324,10 +309,13 @@ def compressor_ratio128_decode_fwd(
 ):
     """Run official ``Compressor.forward`` for ``compress_ratio == 128`` decode."""
     x.bind_dynamic(1, S_DYN)
-    kv_proj.bind_dynamic(1, S_DYN)
-    score_proj.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
+    kv_proj = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.FP32)
+    score_proj = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.FP32)
+    pooled = pl.create_tensor([B, 1, HEAD_DIM], dtype=pl.BF16)
+    normed = pl.create_tensor([B, 1, HEAD_DIM], dtype=pl.BF16)
+
     kv_proj = linear_4096_to_512_fp32(x, wkv_t, kv_proj)
     score_proj = linear_4096_to_512_fp32(x, wgate_t, score_proj)
 
@@ -485,10 +473,6 @@ def compressor_ratio128_decode_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    score_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.FP32],
-    pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
     compressed: pl.Out[pl.Tensor[[B, 1, HEAD_DIM], pl.BF16]],
     kv_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32]],
     score_state_out: pl.Out[pl.Tensor[[B, COMPRESS_RATIO, HEAD_DIM], pl.FP32]],
@@ -508,10 +492,6 @@ def compressor_ratio128_decode_test(
         norm_w,
         cos,
         sin,
-        kv_proj,
-        score_proj,
-        pooled,
-        normed,
         compressed,
         kv_state_out,
         score_state_out,
@@ -659,10 +639,6 @@ def build_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
             torch.int32,
             init_value=torch.tensor([actual_compressed_len], dtype=torch.int32),
         ),
-        TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.float32, init_value=0.0),
-        TensorSpec("score_proj", [B, seq_len, HEAD_DIM], torch.float32, init_value=0.0),
-        TensorSpec("pooled", [B, compressed_len, HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("normed", [B, compressed_len, HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("compressed", [B, compressed_len, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("kv_state_out", [B, COMPRESS_RATIO, HEAD_DIM], torch.float32, is_output=True),
         TensorSpec("score_state_out", [B, COMPRESS_RATIO, HEAD_DIM], torch.float32, is_output=True),
@@ -735,10 +711,6 @@ def build_decode_specs(start_pos: int = COMPRESS_RATIO - 1):
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("cos", [1, ROPE_HALF], torch.float32, init_value=local_cos),
         TensorSpec("sin", [1, ROPE_HALF], torch.float32, init_value=local_sin),
-        TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.float32, init_value=0.0),
-        TensorSpec("score_proj", [B, seq_len, HEAD_DIM], torch.float32, init_value=0.0),
-        TensorSpec("pooled", [B, 1, HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("normed", [B, 1, HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("compressed", [B, 1, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("kv_state_out", [B, COMPRESS_RATIO, HEAD_DIM], torch.float32, is_output=True),
         TensorSpec("score_state_out", [B, COMPRESS_RATIO, HEAD_DIM], torch.float32, is_output=True),

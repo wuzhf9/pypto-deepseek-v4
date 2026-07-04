@@ -116,39 +116,14 @@ def attention_csa_prefill_fwd(
     idx_comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     idx_comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     idx_comp_block_count: pl.Tensor[[1], pl.INT32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    attn_compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
     attn_comp_kv_state_out: pl.Tensor[[B, C4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32],
     attn_comp_score_state_out: pl.Tensor[[B, C4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32],
     attn_comp_cache_out: pl.Tensor[[B, TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16],
-    idx_q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    idx_q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    idx_weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    idx_comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_pooled: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    idx_comp_normed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    idx_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
-    idx_topk_idxs: pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32],
     idx_kv_cache_out: pl.Tensor[[B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], pl.BF16],
     idx_comp_kv_state_out: pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
     idx_comp_score_state_out: pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
-    csa_topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Attention.forward`` for ``compress_ratio == 4, start_pos == 0``."""
@@ -161,9 +136,18 @@ def attention_csa_prefill_fwd(
     idx_comp_cos.bind_dynamic(0, C_DYN)
     idx_comp_sin.bind_dynamic(0, C_DYN)
     kv_pool.bind_dynamic(1, K_DYN)
-    csa_topk_idxs.bind_dynamic(1, S_DYN)
 
-    qr, q, kv = attention_qkv_fwd(
+    tokens = pl.tensor.dim(x, 1)
+    compressed_len = pl.tensor.dim(attn_comp_cos, 0)
+    qr = pl.create_tensor([B, tokens, Q_LORA_RANK], dtype=pl.BF16)
+    q = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.BF16)
+    attn_compressed = pl.create_tensor([B, compressed_len, HEAD_DIM], dtype=pl.BF16)
+    idx_topk_idxs = pl.create_tensor([B, tokens, INDEX_TOPK], dtype=pl.INT32)
+    csa_topk_idxs = pl.create_tensor([B, tokens, TOPK_CSA_TOTAL], dtype=pl.INT32)
+    attn_o = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+
+    attention_qkv_fwd(
         x,
         wq_a_t,
         q_norm_w,
@@ -172,17 +156,13 @@ def attention_csa_prefill_fwd(
         kv_norm_w,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
         qr,
         q,
         kv,
     )
     kv_cache_out = update_prefill_window_cache(kv, kv_cache_out)
 
-    idx_topk_idxs, idx_kv_cache_out, idx_comp_kv_state_out, idx_comp_score_state_out = indexer_prefill_fwd(
+    indexer_prefill_fwd(
         x,
         qr,
         idx_wq_b_t,
@@ -197,44 +177,30 @@ def attention_csa_prefill_fwd(
         idx_comp_cos,
         idx_comp_sin,
         idx_comp_block_count,
-        idx_q_proj,
-        idx_q_rope,
-        idx_weights,
-        idx_comp_kv_proj,
-        idx_comp_score_proj,
-        idx_comp_pooled,
-        idx_comp_normed,
-        idx_score,
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
         idx_topk_idxs,
     )
-    csa_topk_idxs = build_csa_prefill_topk(window_topk_idxs, idx_topk_idxs, csa_topk_idxs)
+    build_csa_prefill_topk(window_topk_idxs, idx_topk_idxs, csa_topk_idxs)
 
-    attn_compressed, attn_comp_kv_state_out, attn_comp_score_state_out, attn_comp_cache_out = (
-        compressor_ratio4_attention_prefill_fwd(
-            x,
-            attn_comp_wkv_t,
-            attn_comp_wgate_t,
-            attn_comp_ape,
-            attn_comp_norm_w,
-            attn_comp_cos,
-            attn_comp_sin,
-            attn_comp_block_count,
-            attn_comp_kv_proj,
-            attn_comp_score_proj,
-            attn_comp_pooled,
-            attn_comp_normed,
-            attn_compressed,
-            attn_comp_kv_state_out,
-            attn_comp_score_state_out,
-            attn_comp_cache_out,
-        )
+    compressor_ratio4_attention_prefill_fwd(
+        x,
+        attn_comp_wkv_t,
+        attn_comp_wgate_t,
+        attn_comp_ape,
+        attn_comp_norm_w,
+        attn_comp_cos,
+        attn_comp_sin,
+        attn_comp_block_count,
+        attn_compressed,
+        attn_comp_kv_state_out,
+        attn_comp_score_state_out,
+        attn_comp_cache_out,
     )
-    kv_pool = build_prefill_kv_pool(kv, attn_compressed, kv_pool)
-    attn_o = sparse_attn_csa_fwd(q, kv_pool, attn_sink, csa_topk_idxs, attn_o)
-    out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
+    build_prefill_kv_pool(kv, attn_compressed, kv_pool)
+    sparse_attn_csa_fwd(q, kv_pool, attn_sink, csa_topk_idxs, attn_o)
+    attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, out)
 
     return (
         kv_cache_out,
@@ -244,7 +210,7 @@ def attention_csa_prefill_fwd(
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
-        out_final,
+        out,
     )
 
 
@@ -288,39 +254,13 @@ def attention_csa_decode_fwd(
     idx_comp_norm_w: pl.Tensor[[INDEX_HEAD_DIM], pl.BF16],
     idx_comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     idx_comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    attn_comp_normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    attn_compressed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    kv_pool: pl.Tensor[[B, WINDOW_SIZE + TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16],
     attn_comp_kv_state_out: pl.Tensor[[B, C4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32],
     attn_comp_score_state_out: pl.Tensor[[B, C4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32],
     attn_comp_cache_out: pl.Tensor[[B, TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16],
-    idx_q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    idx_q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    idx_weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    idx_comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_pooled: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    idx_comp_normed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    idx_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
-    idx_topk_idxs: pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32],
     idx_kv_cache_out: pl.Tensor[[B, TOPK_CSA_COMPRESSED, INDEX_HEAD_DIM], pl.BF16],
     idx_comp_kv_state_out: pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
     idx_comp_score_state_out: pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
-    csa_topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Run ``Attention.forward`` for ``compress_ratio == 4, start_pos > 0``."""
@@ -328,9 +268,18 @@ def attention_csa_decode_fwd(
     window_topk_idxs.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
-    csa_topk_idxs.bind_dynamic(1, S_DYN)
 
-    qr, q, kv = attention_qkv_fwd(
+    tokens = pl.tensor.dim(x, 1)
+    qr = pl.create_tensor([B, tokens, Q_LORA_RANK], dtype=pl.BF16)
+    q = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.BF16)
+    attn_compressed = pl.create_tensor([B, 1, HEAD_DIM], dtype=pl.BF16)
+    kv_pool = pl.create_tensor([B, WINDOW_SIZE + TOPK_CSA_COMPRESSED, HEAD_DIM], dtype=pl.BF16)
+    idx_topk_idxs = pl.create_tensor([B, tokens, INDEX_TOPK], dtype=pl.INT32)
+    csa_topk_idxs = pl.create_tensor([B, tokens, TOPK_CSA_TOTAL], dtype=pl.INT32)
+    attn_o = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+
+    attention_qkv_fwd(
         x,
         wq_a_t,
         q_norm_w,
@@ -339,17 +288,13 @@ def attention_csa_decode_fwd(
         kv_norm_w,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
         qr,
         q,
         kv,
     )
     kv_cache_out = update_decode_window_cache(kv_cache, kv, cache_pos, kv_cache_out)
 
-    idx_topk_idxs, idx_kv_cache_out, idx_comp_kv_state_out, idx_comp_score_state_out = indexer_decode_fwd(
+    indexer_decode_fwd(
         x,
         qr,
         idx_wq_b_t,
@@ -369,49 +314,35 @@ def attention_csa_decode_fwd(
         idx_comp_norm_w,
         idx_comp_cos,
         idx_comp_sin,
-        idx_q_proj,
-        idx_q_rope,
-        idx_weights,
-        idx_comp_kv_proj,
-        idx_comp_score_proj,
-        idx_comp_pooled,
-        idx_comp_normed,
-        idx_score,
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
         idx_topk_idxs,
     )
-    csa_topk_idxs = build_csa_prefill_topk(window_topk_idxs, idx_topk_idxs, csa_topk_idxs)
+    build_csa_prefill_topk(window_topk_idxs, idx_topk_idxs, csa_topk_idxs)
 
-    attn_compressed, attn_comp_kv_state_out, attn_comp_score_state_out, attn_comp_cache_out = (
-        compressor_ratio4_attention_decode_fwd(
-            x,
-            attn_comp_kv_state,
-            attn_comp_score_state,
-            attn_comp_cache,
-            comp_slot,
-            comp_cache_slot,
-            comp_should_compress,
-            attn_comp_wkv_t,
-            attn_comp_wgate_t,
-            attn_comp_ape,
-            attn_comp_norm_w,
-            attn_comp_cos,
-            attn_comp_sin,
-            attn_comp_kv_proj,
-            attn_comp_score_proj,
-            attn_comp_pooled,
-            attn_comp_normed,
-            attn_compressed,
-            attn_comp_kv_state_out,
-            attn_comp_score_state_out,
-            attn_comp_cache_out,
-        )
+    compressor_ratio4_attention_decode_fwd(
+        x,
+        attn_comp_kv_state,
+        attn_comp_score_state,
+        attn_comp_cache,
+        comp_slot,
+        comp_cache_slot,
+        comp_should_compress,
+        attn_comp_wkv_t,
+        attn_comp_wgate_t,
+        attn_comp_ape,
+        attn_comp_norm_w,
+        attn_comp_cos,
+        attn_comp_sin,
+        attn_compressed,
+        attn_comp_kv_state_out,
+        attn_comp_score_state_out,
+        attn_comp_cache_out,
     )
-    kv_pool = build_decode_kv_pool(kv_cache_out, attn_comp_cache_out, kv_pool)
-    attn_o = sparse_attn_csa_fwd(q, kv_pool, attn_sink, csa_topk_idxs, attn_o)
-    out_final = attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
+    build_decode_kv_pool(kv_cache_out, attn_comp_cache_out, kv_pool)
+    sparse_attn_csa_fwd(q, kv_pool, attn_sink, csa_topk_idxs, attn_o)
+    attention_out_fwd(attn_o, wo_a_t, wo_b_t, cos, sin, out)
 
     return (
         kv_cache_out,
@@ -421,7 +352,7 @@ def attention_csa_decode_fwd(
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
-        out_final,
+        out,
     )
 
 
@@ -456,39 +387,14 @@ def attention_csa_prefill_test(
     idx_comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     idx_comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     idx_comp_block_count: pl.Tensor[[1], pl.INT32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_pooled: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_normed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
-    attn_compressed: pl.Tensor[[B, C_DYN, HEAD_DIM], pl.BF16],
     kv_pool: pl.Tensor[[B, K_DYN, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     attn_comp_kv_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_score_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16]],
-    idx_q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    idx_q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    idx_weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    idx_comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_pooled: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    idx_comp_normed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    idx_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
-    idx_topk_idxs: pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32],
     idx_kv_cache_out: pl.Out[pl.Tensor[[B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], pl.BF16]],
     idx_comp_kv_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     idx_comp_score_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
-    csa_topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return attention_csa_prefill_fwd(
@@ -521,39 +427,14 @@ def attention_csa_prefill_test(
         idx_comp_cos,
         idx_comp_sin,
         idx_comp_block_count,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        attn_comp_kv_proj,
-        attn_comp_score_proj,
-        attn_comp_pooled,
-        attn_comp_normed,
-        attn_compressed,
         kv_pool,
         kv_cache_out,
         attn_comp_kv_state_out,
         attn_comp_score_state_out,
         attn_comp_cache_out,
-        idx_q_proj,
-        idx_q_rope,
-        idx_weights,
-        idx_comp_kv_proj,
-        idx_comp_score_proj,
-        idx_comp_pooled,
-        idx_comp_normed,
-        idx_score,
-        idx_topk_idxs,
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
-        csa_topk_idxs,
-        attn_o,
-        o_inv,
-        proj,
         out,
     )
 
@@ -598,39 +479,13 @@ def attention_csa_decode_test(
     idx_comp_norm_w: pl.Tensor[[INDEX_HEAD_DIM], pl.BF16],
     idx_comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     idx_comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    attn_comp_kv_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_score_proj: pl.Tensor[[B, S_DYN, ATTN_PROJ_DIM], pl.FP32],
-    attn_comp_pooled: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    attn_comp_normed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    attn_compressed: pl.Tensor[[B, 1, HEAD_DIM], pl.BF16],
-    kv_pool: pl.Tensor[[B, WINDOW_SIZE + TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16],
     kv_cache_out: pl.Out[pl.Tensor[[B, WINDOW_SIZE, HEAD_DIM], pl.BF16]],
     attn_comp_kv_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_score_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, ATTN_PROJ_DIM], pl.FP32]],
     attn_comp_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, HEAD_DIM], pl.BF16]],
-    idx_q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    idx_q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    idx_weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    idx_comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    idx_comp_pooled: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    idx_comp_normed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    idx_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
-    idx_topk_idxs: pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32],
     idx_kv_cache_out: pl.Out[pl.Tensor[[B, TOPK_CSA_COMPRESSED, INDEX_HEAD_DIM], pl.BF16]],
     idx_comp_kv_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     idx_comp_score_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
-    csa_topk_idxs: pl.Tensor[[B, S_DYN, TOPK_CSA_TOTAL], pl.INT32],
-    attn_o: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return attention_csa_decode_fwd(
@@ -672,39 +527,13 @@ def attention_csa_decode_test(
         idx_comp_norm_w,
         idx_comp_cos,
         idx_comp_sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
-        qr,
-        q,
-        kv,
-        attn_comp_kv_proj,
-        attn_comp_score_proj,
-        attn_comp_pooled,
-        attn_comp_normed,
-        attn_compressed,
-        kv_pool,
         kv_cache_out,
         attn_comp_kv_state_out,
         attn_comp_score_state_out,
         attn_comp_cache_out,
-        idx_q_proj,
-        idx_q_rope,
-        idx_weights,
-        idx_comp_kv_proj,
-        idx_comp_score_proj,
-        idx_comp_pooled,
-        idx_comp_normed,
-        idx_score,
-        idx_topk_idxs,
         idx_kv_cache_out,
         idx_comp_kv_state_out,
         idx_comp_score_state_out,
-        csa_topk_idxs,
-        attn_o,
-        o_inv,
-        proj,
         out,
     )
 
@@ -742,23 +571,21 @@ def golden_attention_csa_forward(tensors, start_pos: int):
 
     # q
     qr = q = torch.matmul(x.float(), tensors["wq_a_t"].float()).to(torch.bfloat16)
-    q_a = q
     q = q.float()
     q = (q * torch.rsqrt(q.square().mean(-1, keepdim=True) + EPS) * tensors["q_norm_w"].float()).to(torch.bfloat16)
     qr = q
     q = torch.matmul(q.float(), tensors["wq_b_t"].float()).to(torch.bfloat16)
-    q_proj = q
     q = q.unflatten(-1, (N_HEADS, HEAD_DIM))
     q = (q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + EPS)).to(torch.bfloat16)
     q = _apply_rope_golden(q, tensors["cos"], tensors["sin"], inverse=False)
 
     # win kv
     kv = torch.matmul(x.float(), tensors["wkv_t"].float()).to(torch.bfloat16)
-    kv_proj = kv
     kv = kv.float()
     kv = (kv * torch.rsqrt(kv.square().mean(-1, keepdim=True) + EPS) * tensors["kv_norm_w"].float()).to(torch.bfloat16)
-    kv_normed = kv
     kv = _apply_rope_golden(kv, tensors["cos"], tensors["sin"], inverse=False)
+
+    compressed_len = tensors["attn_comp_cos"].shape[0]
 
     if start_pos == 0:
         kv_cache_out = tensors["kv_cache_out"].clone()
@@ -788,18 +615,10 @@ def golden_attention_csa_forward(tensors, start_pos: int):
         "comp_norm_w": tensors["idx_comp_norm_w"],
         "comp_cos": tensors["idx_comp_cos"],
         "comp_sin": tensors["idx_comp_sin"],
-        "q_proj": tensors["idx_q_proj"],
-        "q_rope": tensors["idx_q_rope"],
-        "weights": tensors["idx_weights"],
-        "comp_kv_proj": tensors["idx_comp_kv_proj"],
-        "comp_score_proj": tensors["idx_comp_score_proj"],
-        "comp_pooled": tensors["idx_comp_pooled"],
-        "comp_normed": tensors["idx_comp_normed"],
-        "index_score": tensors["idx_score"],
         "index_kv_cache": tensors["idx_kv_cache_out"],
         "comp_kv_state_out": tensors["idx_comp_kv_state_out"],
         "comp_score_state_out": tensors["idx_comp_score_state_out"],
-        "topk_idxs": tensors["idx_topk_idxs"],
+        "topk_idxs": torch.full((B, seq_len, INDEX_TOPK), -1, dtype=torch.int32),
     }
     if start_pos == 0:
         idx_tensors["comp_block_count"] = tensors["idx_comp_block_count"]
@@ -817,7 +636,7 @@ def golden_attention_csa_forward(tensors, start_pos: int):
         )
         golden_indexer_decode(idx_tensors)
 
-    csa_topk_idxs = torch.cat([tensors["window_topk_idxs"], tensors["idx_topk_idxs"]], dim=-1)
+    csa_topk_idxs = torch.cat([tensors["window_topk_idxs"], idx_tensors["topk_idxs"]], dim=-1)
 
     comp_tensors = {
         "x": x,
@@ -827,11 +646,7 @@ def golden_attention_csa_forward(tensors, start_pos: int):
         "norm_w": tensors["attn_comp_norm_w"],
         "cos": tensors["attn_comp_cos"],
         "sin": tensors["attn_comp_sin"],
-        "kv_proj": tensors["attn_comp_kv_proj"],
-        "score_proj": tensors["attn_comp_score_proj"],
-        "pooled": tensors["attn_comp_pooled"],
-        "normed": tensors["attn_comp_normed"],
-        "compressed": tensors["attn_compressed"],
+        "compressed": torch.empty(B, compressed_len, HEAD_DIM, dtype=torch.bfloat16),
         "kv_state_out": tensors["attn_comp_kv_state_out"],
         "score_state_out": tensors["attn_comp_score_state_out"],
         "compressed_cache_out": tensors["attn_comp_cache_out"],
@@ -865,31 +680,15 @@ def golden_attention_csa_forward(tensors, start_pos: int):
     proj = torch.einsum("bsgd,grd->bsgr", o.float(), wo_a.float()).to(torch.bfloat16)
     out = torch.matmul(proj.flatten(2).float(), tensors["wo_b_t"].float()).to(torch.bfloat16)
 
-    tensors["q_a"][:] = q_a
-    tensors["q_proj"][:] = q_proj
-    tensors["kv_proj"][:] = kv_proj
-    tensors["kv_normed"][:] = kv_normed
-    tensors["qr"][:] = qr
-    tensors["q"][:] = q
-    tensors["kv"][:] = kv
     tensors["kv_cache_out"][:] = kv_cache_out
-    tensors["idx_topk_idxs"][:] = idx_tensors["topk_idxs"]
     tensors["idx_kv_cache_out"][:] = idx_tensors["index_kv_cache"]
     tensors["idx_comp_kv_state_out"][:] = idx_tensors["comp_kv_state_out"]
     tensors["idx_comp_score_state_out"][:] = idx_tensors["comp_score_state_out"]
-    tensors["csa_topk_idxs"][:] = csa_topk_idxs
-    tensors["attn_comp_kv_proj"][:] = comp_tensors["kv_proj"]
-    tensors["attn_comp_score_proj"][:] = comp_tensors["score_proj"]
-    tensors["attn_comp_pooled"][:] = comp_tensors["pooled"]
-    tensors["attn_comp_normed"][:] = comp_tensors["normed"]
-    tensors["attn_compressed"][:] = comp_tensors["compressed"]
-    tensors["kv_pool"][:, : kv_pool.shape[1]] = kv_pool
+    if "kv_pool" in tensors:
+        tensors["kv_pool"][:, : kv_pool.shape[1]] = kv_pool
     tensors["attn_comp_kv_state_out"][:] = comp_tensors["kv_state_out"]
     tensors["attn_comp_score_state_out"][:] = comp_tensors["score_state_out"]
     tensors["attn_comp_cache_out"][:] = comp_tensors["compressed_cache_out"]
-    tensors["attn_o"][:] = attn_o
-    tensors["o_inv"][:] = o_inv
-    tensors["proj"][:] = proj.flatten(2)
     tensors["out"][:] = out
 
 
@@ -1035,6 +834,18 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
     else:
         prefix_specs = x_spec
 
+    if not decode:
+        attn_prefill_specs = [
+            TensorSpec("attn_comp_block_count", [1], torch.int32, init_value=torch.tensor([blocks], dtype=torch.int32))
+        ]
+        index_prefill_specs = [
+            TensorSpec("idx_comp_block_count", [1], torch.int32, init_value=torch.tensor([blocks], dtype=torch.int32)),
+            TensorSpec("kv_pool", [B, kv_pool_len, HEAD_DIM], torch.bfloat16),
+        ]
+    else:
+        attn_prefill_specs = []
+        index_prefill_specs = []
+
     specs = [
         *prefix_specs,
         TensorSpec("wq_a_t", [HIDDEN, Q_LORA_RANK], torch.bfloat16, init_value=init_wq_a_t),
@@ -1059,62 +870,26 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
         TensorSpec("attn_comp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_attn_comp_norm_w),
         TensorSpec("attn_comp_cos", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_cos),
         TensorSpec("attn_comp_sin", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_sin),
+        *attn_prefill_specs,
+        TensorSpec("idx_wq_b_t", [Q_LORA_RANK, INDEX_Q_OUT], torch.bfloat16, init_value=init_idx_wq_b_t),
+        TensorSpec("idx_weights_proj_t", [HIDDEN, INDEX_N_HEADS], torch.bfloat16, init_value=init_idx_weights_proj_t),
+        TensorSpec("idx_offset", [1], torch.int32, init_value=torch.tensor([WINDOW_SIZE if decode else seq_len], dtype=torch.int32)),
+        TensorSpec("idx_comp_wkv_t", [HIDDEN, INDEX_PROJ_DIM], torch.bfloat16, init_value=init_idx_comp_w),
+        TensorSpec("idx_comp_wgate_t", [HIDDEN, INDEX_PROJ_DIM], torch.bfloat16, init_value=init_idx_comp_w),
+        TensorSpec("idx_comp_ape", [COMPRESS_RATIO, INDEX_PROJ_DIM], torch.float32, init_value=init_idx_comp_ape),
+        TensorSpec("idx_comp_norm_w", [INDEX_HEAD_DIM], torch.bfloat16, init_value=init_idx_comp_norm_w),
+        TensorSpec("idx_comp_cos", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_cos.clone()),
+        TensorSpec("idx_comp_sin", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_sin.clone()),
+        *index_prefill_specs,
+        TensorSpec("kv_cache_out", [B, WINDOW_SIZE, HEAD_DIM], torch.bfloat16, is_output=True, init_value=0.0),
+        TensorSpec("attn_comp_kv_state_out", [B, C4_STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
+        TensorSpec("attn_comp_score_state_out", [B, C4_STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
+        TensorSpec("attn_comp_cache_out", [B, TOPK_CSA_COMPRESSED, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("idx_kv_cache_out", [B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("idx_comp_kv_state_out", [B, C4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
+        TensorSpec("idx_comp_score_state_out", [B, C4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
+        TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
     ]
-    if not decode:
-        specs.append(TensorSpec("attn_comp_block_count", [1], torch.int32, init_value=torch.tensor([blocks], dtype=torch.int32)))
-    specs.extend(
-        [
-            TensorSpec("idx_wq_b_t", [Q_LORA_RANK, INDEX_Q_OUT], torch.bfloat16, init_value=init_idx_wq_b_t),
-            TensorSpec("idx_weights_proj_t", [HIDDEN, INDEX_N_HEADS], torch.bfloat16, init_value=init_idx_weights_proj_t),
-            TensorSpec("idx_offset", [1], torch.int32, init_value=torch.tensor([WINDOW_SIZE if decode else seq_len], dtype=torch.int32)),
-            TensorSpec("idx_comp_wkv_t", [HIDDEN, INDEX_PROJ_DIM], torch.bfloat16, init_value=init_idx_comp_w),
-            TensorSpec("idx_comp_wgate_t", [HIDDEN, INDEX_PROJ_DIM], torch.bfloat16, init_value=init_idx_comp_w),
-            TensorSpec("idx_comp_ape", [COMPRESS_RATIO, INDEX_PROJ_DIM], torch.float32, init_value=init_idx_comp_ape),
-            TensorSpec("idx_comp_norm_w", [INDEX_HEAD_DIM], torch.bfloat16, init_value=init_idx_comp_norm_w),
-            TensorSpec("idx_comp_cos", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_cos.clone()),
-            TensorSpec("idx_comp_sin", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_sin.clone()),
-        ]
-    )
-    if not decode:
-        specs.append(TensorSpec("idx_comp_block_count", [1], torch.int32, init_value=torch.tensor([blocks], dtype=torch.int32)))
-    specs.extend(
-        [
-            TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16),
-            TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-            TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("attn_comp_kv_proj", [B, seq_len, ATTN_PROJ_DIM], torch.float32),
-            TensorSpec("attn_comp_score_proj", [B, seq_len, ATTN_PROJ_DIM], torch.float32),
-            TensorSpec("attn_comp_pooled", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("attn_comp_normed", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("attn_compressed", [B, compressed_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_pool", [B, kv_pool_len, HEAD_DIM], torch.bfloat16),
-            TensorSpec("kv_cache_out", [B, WINDOW_SIZE, HEAD_DIM], torch.bfloat16, is_output=True, init_value=0.0),
-            TensorSpec("attn_comp_kv_state_out", [B, C4_STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
-            TensorSpec("attn_comp_score_state_out", [B, C4_STATE_ROWS, ATTN_PROJ_DIM], torch.float32, is_output=True),
-            TensorSpec("attn_comp_cache_out", [B, TOPK_CSA_COMPRESSED, HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("idx_q_proj", [B, seq_len, INDEX_Q_OUT], torch.bfloat16),
-            TensorSpec("idx_q_rope", [B, seq_len, INDEX_N_HEADS, INDEX_HEAD_DIM], torch.bfloat16),
-            TensorSpec("idx_weights", [B, seq_len, INDEX_N_HEADS], torch.bfloat16),
-            TensorSpec("idx_comp_kv_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32),
-            TensorSpec("idx_comp_score_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32),
-            TensorSpec("idx_comp_pooled", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16),
-            TensorSpec("idx_comp_normed", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16),
-            TensorSpec("idx_score", [B, seq_len, INDEX_SCORE_LEN], torch.float32),
-            TensorSpec("idx_topk_idxs", [B, seq_len, INDEX_TOPK], torch.int32, init_value=-1),
-            TensorSpec("idx_kv_cache_out", [B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], torch.bfloat16, is_output=True),
-            TensorSpec("idx_comp_kv_state_out", [B, C4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
-            TensorSpec("idx_comp_score_state_out", [B, C4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
-            TensorSpec("csa_topk_idxs", [B, seq_len, TOPK_CSA_TOTAL], torch.int32, init_value=-1),
-            TensorSpec("attn_o", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-            TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
-            TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
-        ]
-    )
     return specs
 
 

@@ -65,14 +65,6 @@ def indexer_prefill_fwd(
     comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_block_count: pl.Tensor[[1], pl.INT32],
-    q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    index_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
     index_kv_cache: pl.Tensor[[B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], pl.BF16],
     comp_kv_state_out: pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
     comp_score_state_out: pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
@@ -85,19 +77,18 @@ def indexer_prefill_fwd(
     sin.bind_dynamic(0, S_DYN)
     comp_cos.bind_dynamic(0, C_DYN)
     comp_sin.bind_dynamic(0, C_DYN)
-    q_proj.bind_dynamic(1, S_DYN)
-    q_rope.bind_dynamic(1, S_DYN)
-    weights.bind_dynamic(1, S_DYN)
-    comp_kv_proj.bind_dynamic(1, S_DYN)
-    comp_score_proj.bind_dynamic(1, S_DYN)
-    comp_pooled.bind_dynamic(1, C_DYN)
-    comp_normed.bind_dynamic(1, C_DYN)
-    index_score.bind_dynamic(1, S_DYN)
     topk_idxs.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
+    compressed_blocks = pl.tensor.dim(comp_cos, 0)
     blocks = pl.read(comp_block_count, [0])
     offset_i32 = pl.read(offset, [0])
+
+    q_proj = pl.create_tensor([B, tokens, INDEX_Q_OUT], dtype=pl.BF16)
+    q_rope = pl.create_tensor([B, tokens, INDEX_N_HEADS, INDEX_HEAD_DIM], dtype=pl.BF16)
+    weights = pl.create_tensor([B, tokens, INDEX_N_HEADS], dtype=pl.BF16)
+    comp_compressed = pl.create_tensor([B, compressed_blocks, INDEX_HEAD_DIM], dtype=pl.BF16)
+    index_score = pl.create_tensor([B, tokens, INDEX_SCORE_LEN], dtype=pl.FP32)
 
     q_proj = linear_1024_to_8192(qr, wq_b_t, q_proj)
     q_unflat = pl.reshape(q_proj, [B, tokens, INDEX_N_HEADS, INDEX_HEAD_DIM])
@@ -113,7 +104,7 @@ def indexer_prefill_fwd(
             )
             weights_flat[t : t + 1, 0:INDEX_N_HEADS] = pl.cast(scaled, target_type=pl.BF16, mode="rint")
 
-    comp_pooled, comp_kv_state_out, comp_score_state_out, index_kv_cache = compressor_ratio4_indexer_prefill_fwd(
+    unused_compressed, comp_kv_state_out, comp_score_state_out, index_kv_cache = compressor_ratio4_indexer_prefill_fwd(
         x,
         comp_wkv_t,
         comp_wgate_t,
@@ -122,11 +113,7 @@ def indexer_prefill_fwd(
         comp_cos,
         comp_sin,
         comp_block_count,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
-        comp_pooled,
+        comp_compressed,
         comp_kv_state_out,
         comp_score_state_out,
         index_kv_cache,
@@ -212,15 +199,7 @@ def indexer_prefill_test(
     comp_cos: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[C_DYN, ROPE_HALF], pl.FP32],
     comp_block_count: pl.Tensor[[1], pl.INT32],
-    q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, C_DYN, INDEX_HEAD_DIM], pl.BF16],
     topk_idxs: pl.Out[pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32]],
-    index_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
     index_kv_cache: pl.Out[pl.Tensor[[B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], pl.BF16]],
     comp_kv_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     comp_score_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
@@ -240,14 +219,6 @@ def indexer_prefill_test(
         comp_cos,
         comp_sin,
         comp_block_count,
-        q_proj,
-        q_rope,
-        weights,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
-        index_score,
         index_kv_cache,
         comp_kv_state_out,
         comp_score_state_out,
@@ -277,14 +248,6 @@ def indexer_decode_fwd(
     comp_norm_w: pl.Tensor[[INDEX_HEAD_DIM], pl.BF16],
     comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    index_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
     index_kv_cache: pl.Tensor[[B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], pl.BF16],
     comp_kv_state_out: pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
     comp_score_state_out: pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32],
@@ -295,12 +258,6 @@ def indexer_decode_fwd(
     qr.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
-    q_proj.bind_dynamic(1, S_DYN)
-    q_rope.bind_dynamic(1, S_DYN)
-    weights.bind_dynamic(1, S_DYN)
-    comp_kv_proj.bind_dynamic(1, S_DYN)
-    comp_score_proj.bind_dynamic(1, S_DYN)
-    index_score.bind_dynamic(1, S_DYN)
     topk_idxs.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
@@ -308,6 +265,12 @@ def indexer_decode_fwd(
     cache_slot_i32 = pl.read(comp_cache_slot, [0])
     should_flag = pl.read(comp_should_compress, [0])
     cache_len = cache_slot_i32 + should_flag
+
+    q_proj = pl.create_tensor([B, tokens, INDEX_Q_OUT], dtype=pl.BF16)
+    q_rope = pl.create_tensor([B, tokens, INDEX_N_HEADS, INDEX_HEAD_DIM], dtype=pl.BF16)
+    weights = pl.create_tensor([B, tokens, INDEX_N_HEADS], dtype=pl.BF16)
+    comp_compressed = pl.create_tensor([B, 1, INDEX_HEAD_DIM], dtype=pl.BF16)
+    index_score = pl.create_tensor([B, tokens, INDEX_SCORE_LEN], dtype=pl.FP32)
 
     q_proj = linear_1024_to_8192(qr, wq_b_t, q_proj)
     q_unflat = pl.reshape(q_proj, [B, tokens, INDEX_N_HEADS, INDEX_HEAD_DIM])
@@ -322,7 +285,7 @@ def indexer_decode_fwd(
         )
         weights_flat[0:1, 0:INDEX_N_HEADS] = pl.cast(scaled, target_type=pl.BF16, mode="rint")
 
-    comp_pooled, comp_kv_state_out, comp_score_state_out, index_kv_cache = compressor_ratio4_indexer_decode_fwd(
+    unused_compressed, comp_kv_state_out, comp_score_state_out, index_kv_cache = compressor_ratio4_indexer_decode_fwd(
         x,
         comp_kv_state,
         comp_score_state,
@@ -336,11 +299,7 @@ def indexer_decode_fwd(
         comp_norm_w,
         comp_cos,
         comp_sin,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
-        comp_pooled,
+        comp_compressed,
         comp_kv_state_out,
         comp_score_state_out,
         index_kv_cache,
@@ -421,15 +380,7 @@ def indexer_decode_test(
     comp_norm_w: pl.Tensor[[INDEX_HEAD_DIM], pl.BF16],
     comp_cos: pl.Tensor[[1, ROPE_HALF], pl.FP32],
     comp_sin: pl.Tensor[[1, ROPE_HALF], pl.FP32],
-    q_proj: pl.Tensor[[B, S_DYN, INDEX_Q_OUT], pl.BF16],
-    q_rope: pl.Tensor[[B, S_DYN, INDEX_N_HEADS, INDEX_HEAD_DIM], pl.BF16],
-    weights: pl.Tensor[[B, S_DYN, INDEX_N_HEADS], pl.BF16],
-    comp_kv_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    comp_score_proj: pl.Tensor[[B, S_DYN, INDEX_PROJ_DIM], pl.FP32],
-    comp_pooled: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
-    comp_normed: pl.Tensor[[B, 1, INDEX_HEAD_DIM], pl.BF16],
     topk_idxs: pl.Out[pl.Tensor[[B, S_DYN, INDEX_TOPK], pl.INT32]],
-    index_score: pl.Tensor[[B, S_DYN, INDEX_SCORE_LEN], pl.FP32],
     index_kv_cache: pl.Out[pl.Tensor[[B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], pl.BF16]],
     comp_kv_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
     comp_score_state_out: pl.Out[pl.Tensor[[B, C4_STATE_ROWS, INDEX_PROJ_DIM], pl.FP32]],
@@ -454,14 +405,6 @@ def indexer_decode_test(
         comp_norm_w,
         comp_cos,
         comp_sin,
-        q_proj,
-        q_rope,
-        weights,
-        comp_kv_proj,
-        comp_score_proj,
-        comp_pooled,
-        comp_normed,
-        index_score,
         index_kv_cache,
         comp_kv_state_out,
         comp_score_state_out,
@@ -497,10 +440,6 @@ def golden_indexer_forward(tensors, start_pos: int):
             "cos": tensors["comp_cos"],
             "sin": tensors["comp_sin"],
             "block_count": tensors["comp_block_count"],
-            "kv_proj": tensors["comp_kv_proj"],
-            "score_proj": tensors["comp_score_proj"],
-            "pooled": tensors["comp_pooled"],
-            "normed": tensors["comp_normed"],
             "compressed": torch.zeros(B, max(1, blocks), INDEX_HEAD_DIM, dtype=torch.bfloat16),
             "kv_state_out": tensors["comp_kv_state_out"],
             "score_state_out": tensors["comp_score_state_out"],
@@ -521,10 +460,6 @@ def golden_indexer_forward(tensors, start_pos: int):
             "norm_w": tensors["comp_norm_w"],
             "cos": tensors["comp_cos"],
             "sin": tensors["comp_sin"],
-            "kv_proj": tensors["comp_kv_proj"],
-            "score_proj": tensors["comp_score_proj"],
-            "pooled": tensors["comp_pooled"],
-            "normed": tensors["comp_normed"],
             "compressed": torch.zeros(B, 1, INDEX_HEAD_DIM, dtype=torch.bfloat16),
             "kv_state_out": tensors["comp_kv_state_out"],
             "score_state_out": tensors["comp_score_state_out"],
@@ -559,7 +494,6 @@ def golden_indexer_forward(tensors, start_pos: int):
         topk[:, :, :k] = idx.to(torch.int32)
 
     tensors["topk_idxs"][:] = topk
-    tensors["index_score"][:] = score_full
     tensors["index_kv_cache"][:] = comp_tensors["compressed_cache_out"]
     tensors["comp_kv_state_out"][:] = comp_tensors["kv_state_out"]
     tensors["comp_score_state_out"][:] = comp_tensors["score_state_out"]
@@ -632,15 +566,7 @@ def build_indexer_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
         TensorSpec("comp_cos", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_cos),
         TensorSpec("comp_sin", [compressed_len, ROPE_HALF], torch.float32, init_value=comp_sin),
         TensorSpec("comp_block_count", [1], torch.int32, init_value=torch.tensor([blocks], dtype=torch.int32)),
-        TensorSpec("q_proj", [B, seq_len, INDEX_Q_OUT], torch.bfloat16, init_value=0.0),
-        TensorSpec("q_rope", [B, seq_len, INDEX_N_HEADS, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("weights", [B, seq_len, INDEX_N_HEADS], torch.bfloat16, init_value=0.0),
-        TensorSpec("comp_kv_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("comp_score_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("comp_pooled", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("comp_normed", [B, compressed_len, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("topk_idxs", [B, seq_len, INDEX_TOPK], torch.int32, is_output=True),
-        TensorSpec("index_score", [B, seq_len, INDEX_SCORE_LEN], torch.float32, init_value=0.0, is_output=True),
         TensorSpec("index_kv_cache", [B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("comp_kv_state_out", [B, C4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
         TensorSpec("comp_score_state_out", [B, C4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
@@ -733,15 +659,7 @@ def build_indexer_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
         TensorSpec("comp_norm_w", [INDEX_HEAD_DIM], torch.bfloat16, init_value=init_comp_norm_w),
         TensorSpec("comp_cos", [1, ROPE_HALF], torch.float32, init_value=comp_cos),
         TensorSpec("comp_sin", [1, ROPE_HALF], torch.float32, init_value=comp_sin),
-        TensorSpec("q_proj", [B, seq_len, INDEX_Q_OUT], torch.bfloat16, init_value=0.0),
-        TensorSpec("q_rope", [B, seq_len, INDEX_N_HEADS, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("weights", [B, seq_len, INDEX_N_HEADS], torch.bfloat16, init_value=0.0),
-        TensorSpec("comp_kv_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("comp_score_proj", [B, seq_len, INDEX_PROJ_DIM], torch.float32, init_value=0.0),
-        TensorSpec("comp_pooled", [B, 1, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
-        TensorSpec("comp_normed", [B, 1, INDEX_HEAD_DIM], torch.bfloat16, init_value=0.0),
         TensorSpec("topk_idxs", [B, seq_len, INDEX_TOPK], torch.int32, is_output=True),
-        TensorSpec("index_score", [B, seq_len, INDEX_SCORE_LEN], torch.float32, init_value=0.0, is_output=True),
         TensorSpec("index_kv_cache", [B, INDEX_SCORE_LEN, INDEX_HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("comp_kv_state_out", [B, C4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
         TensorSpec("comp_score_state_out", [B, C4_STATE_ROWS, INDEX_PROJ_DIM], torch.float32, is_output=True),
@@ -751,7 +669,7 @@ def build_indexer_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
 def main() -> int:
     import argparse
 
-    from models.golden import ratio_allclose, run_jit, topk_indices_by_score
+    from models.golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 Flash Indexer validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -769,14 +687,6 @@ def main() -> int:
         "enable_l2_swimlane": args.enable_l2_swimlane,
     }
     compare_fn = {
-        "topk_idxs": topk_indices_by_score(
-            "index_score",
-            index_offset_name="offset",
-            invalid_index=-1,
-            atol=1e-4,
-            rtol=1.0 / 128,
-        ),
-        "index_score": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
         "index_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
         "comp_kv_state_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
         "comp_score_state_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),

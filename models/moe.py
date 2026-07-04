@@ -162,21 +162,18 @@ def moe_hash_fwd(
     shared_w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
     shared_w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
     shared_w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Interface for ``MoE.forward`` when ``Gate.hash`` is true."""
     x.bind_dynamic(1, S_DYN)
-    indices, weights = gate_hash_fwd(x, gate_w_t, tid2eid, input_ids, logits, scores, indices, weights)
-    route_y = _run_route_major_routed_experts(
+    tokens = pl.tensor.dim(x, 1)
+    indices = pl.create_tensor([B, tokens, TOPK], dtype=pl.INT32)
+    weights = pl.create_tensor([B, tokens, TOPK], dtype=pl.FP32)
+    route_y = pl.create_tensor([B, tokens, TOPK, HIDDEN], dtype=pl.BF16)
+    shared_y = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
+    gate_hash_fwd(x, gate_w_t, tid2eid, input_ids, indices, weights)
+    _run_route_major_routed_experts(
         x,
         indices,
         weights,
@@ -185,9 +182,9 @@ def moe_hash_fwd(
         routed_w3_t,
         route_y,
     )
-    shared_y = expert_shared_fwd(x, shared_w1_t, shared_w2_t, shared_w3_t, shared_gate, shared_up, shared_hidden, shared_y)
-    out = _combine_route_major(route_y, shared_y, out)
-    return indices, weights, route_y, shared_y, out
+    expert_shared_fwd(x, shared_w1_t, shared_w2_t, shared_w3_t, shared_y)
+    _combine_route_major(route_y, shared_y, out)
+    return out
 
 
 @pl.jit.inline
@@ -201,21 +198,18 @@ def moe_topk_fwd(
     shared_w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
     shared_w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
     shared_w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Tensor[[B, S_DYN, TOPK], pl.INT32],
-    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
-    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Interface for ``MoE.forward`` when ``Gate.hash`` is false."""
     x.bind_dynamic(1, S_DYN)
-    indices, weights = gate_topk_fwd(x, gate_w_t, gate_bias, logits, scores, indices, weights)
-    route_y = _run_route_major_routed_experts(
+    tokens = pl.tensor.dim(x, 1)
+    indices = pl.create_tensor([B, tokens, TOPK], dtype=pl.INT32)
+    weights = pl.create_tensor([B, tokens, TOPK], dtype=pl.FP32)
+    route_y = pl.create_tensor([B, tokens, TOPK, HIDDEN], dtype=pl.BF16)
+    shared_y = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
+    gate_topk_fwd(x, gate_w_t, gate_bias, indices, weights)
+    _run_route_major_routed_experts(
         x,
         indices,
         weights,
@@ -224,9 +218,9 @@ def moe_topk_fwd(
         routed_w3_t,
         route_y,
     )
-    shared_y = expert_shared_fwd(x, shared_w1_t, shared_w2_t, shared_w3_t, shared_gate, shared_up, shared_hidden, shared_y)
-    out = _combine_route_major(route_y, shared_y, out)
-    return indices, weights, route_y, shared_y, out
+    expert_shared_fwd(x, shared_w1_t, shared_w2_t, shared_w3_t, shared_y)
+    _combine_route_major(route_y, shared_y, out)
+    return out
 
 
 @pl.jit
@@ -241,15 +235,6 @@ def moe_hash_test(
     shared_w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
     shared_w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
     shared_w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Out[pl.Tensor[[B, S_DYN, TOPK], pl.INT32]],
-    weights: pl.Out[pl.Tensor[[B, S_DYN, TOPK], pl.FP32]],
-    route_y: pl.Out[pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16]],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return moe_hash_fwd(
@@ -263,15 +248,6 @@ def moe_hash_test(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         out,
     )
 
@@ -287,15 +263,6 @@ def moe_topk_test(
     shared_w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
     shared_w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
     shared_w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
-    logits: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    scores: pl.Tensor[[B, S_DYN, N_EXPERTS], pl.FP32],
-    indices: pl.Out[pl.Tensor[[B, S_DYN, TOPK], pl.INT32]],
-    weights: pl.Out[pl.Tensor[[B, S_DYN, TOPK], pl.FP32]],
-    route_y: pl.Out[pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16]],
-    shared_gate: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_up: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_hidden: pl.Tensor[[B, S_DYN, MOE_INTER_DIM], pl.BF16],
-    shared_y: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
     return moe_topk_fwd(
@@ -308,15 +275,6 @@ def moe_topk_test(
         shared_w1_t,
         shared_w2_t,
         shared_w3_t,
-        logits,
-        scores,
-        indices,
-        weights,
-        route_y,
-        shared_gate,
-        shared_up,
-        shared_hidden,
-        shared_y,
         out,
     )
 
@@ -397,15 +355,6 @@ def golden_moe_forward(tensors, *, hash_route: bool):
     )
     out = (routed_acc + shared_y.reshape(tokens, HIDDEN).float()).to(torch.bfloat16).reshape(bsz, seq_len, HIDDEN)
 
-    tensors["logits"][:] = logits
-    tensors["scores"][:] = scores
-    tensors["indices"][:] = indices.to(torch.int32)
-    tensors["weights"][:] = weights
-    tensors["route_y"][:] = route_y
-    tensors["shared_gate"][:] = shared_gate
-    tensors["shared_up"][:] = shared_up
-    tensors["shared_hidden"][:] = shared_hidden
-    tensors["shared_y"][:] = shared_y
     tensors["out"][:] = out
 
 
@@ -477,15 +426,6 @@ def _build_tensor_specs(seq_len: int, *, hash_route: bool):
             TensorSpec("shared_w1_t", [HIDDEN, MOE_INTER_DIM], torch.bfloat16, init_value=init_shared_w1_t),
             TensorSpec("shared_w2_t", [MOE_INTER_DIM, HIDDEN], torch.bfloat16, init_value=init_shared_w2_t),
             TensorSpec("shared_w3_t", [HIDDEN, MOE_INTER_DIM], torch.bfloat16, init_value=init_shared_w3_t),
-            TensorSpec("logits", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("scores", [B, seq_len, N_EXPERTS], torch.float32),
-            TensorSpec("indices", [B, seq_len, TOPK], torch.int32, is_output=True),
-            TensorSpec("weights", [B, seq_len, TOPK], torch.float32, is_output=True),
-            TensorSpec("route_y", [B, seq_len, TOPK, HIDDEN], torch.bfloat16, is_output=True),
-            TensorSpec("shared_gate", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_up", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_hidden", [B, seq_len, MOE_INTER_DIM], torch.bfloat16),
-            TensorSpec("shared_y", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
             TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
         ]
     )
@@ -519,9 +459,6 @@ def main() -> int:
         "enable_l2_swimlane": args.enable_l2_swimlane,
     }
     compare_fn = {
-        "weights": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.001),
-        "route_y": ratio_allclose(atol=1e-3, rtol=2.0 / 128, max_error_ratio=0.005),
-        "shared_y": ratio_allclose(atol=1e-3, rtol=2.0 / 128, max_error_ratio=0.005),
         "out": ratio_allclose(atol=1e-3, rtol=2.0 / 128, max_error_ratio=0.005),
     }
     all_cases = {

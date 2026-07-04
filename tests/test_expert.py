@@ -39,9 +39,6 @@ def _base_tensors(module: torch.nn.Module, x: torch.Tensor) -> dict[str, torch.T
         "w1_t": module.w1.weight.detach().t().contiguous().to(torch.bfloat16),
         "w2_t": module.w2.weight.detach().t().contiguous().to(torch.bfloat16),
         "w3_t": module.w3.weight.detach().t().contiguous().to(torch.bfloat16),
-        "gate": torch.zeros(1, seq_len, INTER_DIM, dtype=torch.bfloat16),
-        "up": torch.zeros(1, seq_len, INTER_DIM, dtype=torch.bfloat16),
-        "hidden": torch.zeros(1, seq_len, INTER_DIM, dtype=torch.bfloat16),
         "out": torch.zeros(1, seq_len, DIM, dtype=torch.bfloat16),
     }
 

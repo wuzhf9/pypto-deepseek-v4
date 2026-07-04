@@ -118,15 +118,6 @@ def _moe_tensors(module: torch.nn.Module, x: torch.Tensor, input_ids: torch.Tens
         "shared_w1_t": module.shared_experts.w1.weight.detach().t().contiguous().to(torch.bfloat16),
         "shared_w2_t": module.shared_experts.w2.weight.detach().t().contiguous().to(torch.bfloat16),
         "shared_w3_t": module.shared_experts.w3.weight.detach().t().contiguous().to(torch.bfloat16),
-        "logits": torch.zeros(bsz, seq_len, N_EXPERTS, dtype=torch.float32),
-        "scores": torch.zeros(bsz, seq_len, N_EXPERTS, dtype=torch.float32),
-        "indices": torch.zeros(bsz, seq_len, TOPK, dtype=torch.int32),
-        "weights": torch.zeros(bsz, seq_len, TOPK, dtype=torch.float32),
-        "route_y": torch.zeros(bsz, seq_len, TOPK, DIM, dtype=torch.bfloat16),
-        "shared_gate": torch.zeros(bsz, seq_len, INTER_DIM, dtype=torch.bfloat16),
-        "shared_up": torch.zeros(bsz, seq_len, INTER_DIM, dtype=torch.bfloat16),
-        "shared_hidden": torch.zeros(bsz, seq_len, INTER_DIM, dtype=torch.bfloat16),
-        "shared_y": torch.zeros(bsz, seq_len, DIM, dtype=torch.bfloat16),
         "out": torch.zeros(bsz, seq_len, DIM, dtype=torch.bfloat16),
     }
     if hash_route:
@@ -148,7 +139,6 @@ def test_golden_moe_hash_matches_official_model(tiny_moe_args, seq_len: int) -> 
     tensors = _moe_tensors(module, x, input_ids, hash_route=True)
     moe.golden_moe_hash(tensors)
 
-    assert torch.unique(tensors["indices"], dim=-1).shape[-1] == TOPK
     torch.testing.assert_close(tensors["out"], expected, rtol=0, atol=0)
 
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
@@ -163,5 +153,4 @@ def test_golden_moe_topk_matches_official_model(tiny_moe_args, seq_len: int) -> 
     tensors = _moe_tensors(module, x, input_ids, hash_route=False)
     moe.golden_moe_topk(tensors)
 
-    assert torch.unique(tensors["indices"], dim=-1).shape[-1] == TOPK
     torch.testing.assert_close(tensors["out"], expected, rtol=0, atol=0)

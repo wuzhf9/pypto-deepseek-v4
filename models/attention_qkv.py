@@ -46,10 +46,6 @@ def attention_qkv_fwd(
     kv_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     qr: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
     q: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
     kv: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
@@ -58,15 +54,16 @@ def attention_qkv_fwd(
     x.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
-    q_a.bind_dynamic(1, S_DYN)
-    q_proj.bind_dynamic(1, S_DYN)
-    kv_proj.bind_dynamic(1, S_DYN)
-    kv_normed.bind_dynamic(1, S_DYN)
     qr.bind_dynamic(1, S_DYN)
     q.bind_dynamic(1, S_DYN)
     kv.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(x, 1)
+    q_a = pl.create_tensor([B, tokens, Q_LORA_RANK], dtype=pl.BF16)
+    q_proj = pl.create_tensor([B, tokens, ATTN_Q_OUT], dtype=pl.BF16)
+    kv_proj = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.BF16)
+    kv_normed = pl.create_tensor([B, tokens, HEAD_DIM], dtype=pl.BF16)
+
     q_a = linear_4096_to_1024(x, wq_a_t, q_a)
     qr = rmsnorm_1024(q_a, q_norm_w, qr)
     q_proj = linear_1024_to_32768(qr, wq_b_t, q_proj)
@@ -141,10 +138,6 @@ def attention_qkv_fwd_test(
     kv_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    q_a: pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16],
-    q_proj: pl.Tensor[[B, S_DYN, ATTN_Q_OUT], pl.BF16],
-    kv_proj: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
-    kv_normed: pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16],
     qr: pl.Out[pl.Tensor[[B, S_DYN, Q_LORA_RANK], pl.BF16]],
     q: pl.Out[pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16]],
     kv: pl.Out[pl.Tensor[[B, S_DYN, HEAD_DIM], pl.BF16]],
@@ -158,10 +151,6 @@ def attention_qkv_fwd_test(
         kv_norm_w,
         cos,
         sin,
-        q_a,
-        q_proj,
-        kv_proj,
-        kv_normed,
         qr,
         q,
         kv,
@@ -176,28 +165,20 @@ def golden_attention_qkv(tensors):
 
     # q
     qr = q = torch.matmul(x.float(), tensors["wq_a_t"].float()).to(torch.bfloat16)
-    q_a = q
     q = q.float()
     q = (q * torch.rsqrt(q.square().mean(-1, keepdim=True) + EPS) * tensors["q_norm_w"].float()).to(torch.bfloat16)
     qr = q
     q = torch.matmul(q.float(), tensors["wq_b_t"].float()).to(torch.bfloat16)
-    q_proj = q
     q = q.unflatten(-1, (N_HEADS, HEAD_DIM))
     q = (q.float() * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + EPS)).to(torch.bfloat16)
     q = _apply_rope_golden(q, tensors["cos"], tensors["sin"], inverse=False)
 
     # win kv
     kv = torch.matmul(x.float(), tensors["wkv_t"].float()).to(torch.bfloat16)
-    kv_proj = kv
     kv = kv.float()
     kv = (kv * torch.rsqrt(kv.square().mean(-1, keepdim=True) + EPS) * tensors["kv_norm_w"].float()).to(torch.bfloat16)
-    kv_normed = kv
     kv = _apply_rope_golden(kv, tensors["cos"], tensors["sin"], inverse=False)
 
-    tensors["q_a"][:] = q_a
-    tensors["q_proj"][:] = q_proj
-    tensors["kv_proj"][:] = kv_proj
-    tensors["kv_normed"][:] = kv_normed
     tensors["qr"][:] = qr
     tensors["q"][:] = q
     tensors["kv"][:] = kv
@@ -238,10 +219,6 @@ def build_attention_qkv_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0
         TensorSpec("kv_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_kv_norm_w),
         TensorSpec("cos", [seq_len, ROPE_HALF], torch.float32, init_value=local_cos),
         TensorSpec("sin", [seq_len, ROPE_HALF], torch.float32, init_value=local_sin),
-        TensorSpec("q_a", [B, seq_len, Q_LORA_RANK], torch.bfloat16),
-        TensorSpec("q_proj", [B, seq_len, ATTN_Q_OUT], torch.bfloat16),
-        TensorSpec("kv_proj", [B, seq_len, HEAD_DIM], torch.bfloat16),
-        TensorSpec("kv_normed", [B, seq_len, HEAD_DIM], torch.bfloat16),
         TensorSpec("qr", [B, seq_len, Q_LORA_RANK], torch.bfloat16, is_output=True),
         TensorSpec("q", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16, is_output=True),
         TensorSpec("kv", [B, seq_len, HEAD_DIM], torch.bfloat16, is_output=True),

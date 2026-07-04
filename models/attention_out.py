@@ -41,19 +41,18 @@ def attention_out_fwd(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
 ):
     """Compute official inverse RoPE and attention output projection."""
     o.bind_dynamic(1, S_DYN)
     cos.bind_dynamic(0, S_DYN)
     sin.bind_dynamic(0, S_DYN)
-    o_inv.bind_dynamic(1, S_DYN)
-    proj.bind_dynamic(1, S_DYN)
     out.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(o, 1)
+    o_inv = pl.create_tensor([B, tokens, N_HEADS, HEAD_DIM], dtype=pl.BF16)
+    proj = pl.create_tensor([B, tokens, ATTN_OUT_IN], dtype=pl.BF16)
+
     o_inv = rope_4d_512_inv(o, cos, sin, o_inv)
     o_flat = pl.reshape(o_inv, [tokens, N_HEADS * HEAD_DIM])
     proj_flat = pl.reshape(proj, [tokens, ATTN_OUT_IN])
@@ -103,25 +102,21 @@ def attention_out_fwd_test(
     wo_b_t: pl.Tensor[[ATTN_OUT_IN, HIDDEN], pl.BF16],
     cos: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
     sin: pl.Tensor[[S_DYN, ROPE_HALF], pl.FP32],
-    o_inv: pl.Tensor[[B, S_DYN, N_HEADS, HEAD_DIM], pl.BF16],
-    proj: pl.Tensor[[B, S_DYN, ATTN_OUT_IN], pl.BF16],
     out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
 ):
-    out = attention_out_fwd(o, wo_a_t, wo_b_t, cos, sin, o_inv, proj, out)
+    out = attention_out_fwd(o, wo_a_t, wo_b_t, cos, sin, out)
     return out
 
 
 def golden_attention_out(tensors):
     import torch
 
-    o_inv = _apply_rope_golden(tensors["o"], tensors["cos"], tensors["sin"], inverse=True)
-    o = o_inv.view(B, tensors["o"].shape[1], O_GROUPS, O_GROUP_IN)
+    o = _apply_rope_golden(tensors["o"], tensors["cos"], tensors["sin"], inverse=True)
+    o = o.view(B, tensors["o"].shape[1], O_GROUPS, O_GROUP_IN)
     wo_a = tensors["wo_a_t"].transpose(0, 1).contiguous().view(O_GROUPS, O_LORA_RANK, O_GROUP_IN)
     proj = torch.einsum("bsgd,grd->bsgr", o.float(), wo_a.float()).to(torch.bfloat16)
     out = torch.matmul(proj.flatten(2).float(), tensors["wo_b_t"].float()).to(torch.bfloat16)
 
-    tensors["o_inv"][:] = o_inv
-    tensors["proj"][:] = proj.flatten(2)
     tensors["out"][:] = out
 
 
@@ -148,8 +143,6 @@ def build_tensor_specs(seq_len: int = DEFAULT_SEQ_LEN, start_pos: int = 0):
         TensorSpec("wo_b_t", [ATTN_OUT_IN, HIDDEN], torch.bfloat16, init_value=init_wo_b_t),
         TensorSpec("cos", [seq_len, ROPE_HALF], torch.float32, init_value=local_cos),
         TensorSpec("sin", [seq_len, ROPE_HALF], torch.float32, init_value=local_sin),
-        TensorSpec("o_inv", [B, seq_len, N_HEADS, HEAD_DIM], torch.bfloat16),
-        TensorSpec("proj", [B, seq_len, ATTN_OUT_IN], torch.bfloat16),
         TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
     ]
 

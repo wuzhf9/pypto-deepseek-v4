@@ -159,30 +159,12 @@ def _base_tensors(attn: torch.nn.Module, x: torch.Tensor, start_pos: int) -> dic
     }
 
 def _add_output_tensors(tensors: dict[str, torch.Tensor], args, seq_len: int, *, decode: bool) -> None:
-    compressed_len = 1 if decode else max(1, seq_len // 128)
-    kv_pool_len = args.window_size + args.max_seq_len // 128 if decode else seq_len + compressed_len
     tensors.update(
         {
-            "q_a": torch.zeros(1, seq_len, args.q_lora_rank, dtype=torch.bfloat16),
-            "q_proj": torch.zeros(1, seq_len, args.n_heads * args.head_dim, dtype=torch.bfloat16),
-            "kv_proj": torch.zeros(1, seq_len, args.head_dim, dtype=torch.bfloat16),
-            "kv_normed": torch.zeros(1, seq_len, args.head_dim, dtype=torch.bfloat16),
-            "qr": torch.zeros(1, seq_len, args.q_lora_rank, dtype=torch.bfloat16),
-            "q": torch.zeros(1, seq_len, args.n_heads, args.head_dim, dtype=torch.bfloat16),
-            "kv": torch.zeros(1, seq_len, args.head_dim, dtype=torch.bfloat16),
-            "comp_kv_proj": torch.zeros(1, seq_len, args.head_dim, dtype=torch.float32),
-            "comp_score_proj": torch.zeros(1, seq_len, args.head_dim, dtype=torch.float32),
-            "comp_pooled": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
-            "comp_normed": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
-            "compressed": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
-            "kv_pool": torch.zeros(1, kv_pool_len, args.head_dim, dtype=torch.bfloat16),
             "kv_cache_out": torch.zeros(1, args.window_size, args.head_dim, dtype=torch.bfloat16),
             "comp_kv_state_out": torch.zeros(1, 128, args.head_dim, dtype=torch.float32),
             "comp_score_state_out": torch.zeros(1, 128, args.head_dim, dtype=torch.float32),
             "comp_cache_out": torch.zeros(1, args.max_seq_len // 128, args.head_dim, dtype=torch.bfloat16),
-            "attn_o": torch.zeros(1, seq_len, args.n_heads, args.head_dim, dtype=torch.bfloat16),
-            "o_inv": torch.zeros(1, seq_len, args.n_heads, args.head_dim, dtype=torch.bfloat16),
-            "proj": torch.zeros(1, seq_len, args.o_groups * args.o_lora_rank, dtype=torch.bfloat16),
             "out": torch.zeros(1, seq_len, args.dim, dtype=torch.bfloat16),
         }
     )

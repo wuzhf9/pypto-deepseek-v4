@@ -104,10 +104,6 @@ def _compressor_tensors(compressor: torch.nn.Module, x: torch.Tensor, args) -> d
         "kv_state_out": torch.zeros(1, 128, args.head_dim, dtype=torch.float32),
         "score_state_out": torch.zeros(1, 128, args.head_dim, dtype=torch.float32),
         "compressed_cache_out": torch.zeros(1, args.max_seq_len // 128, args.head_dim, dtype=torch.bfloat16),
-        "kv_proj": torch.zeros(1, seq_len, args.head_dim, dtype=torch.float32),
-        "score_proj": torch.zeros(1, seq_len, args.head_dim, dtype=torch.float32),
-        "pooled": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
-        "normed": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
         "compressed": torch.zeros(1, compressed_len, args.head_dim, dtype=torch.bfloat16),
     }
 
@@ -145,10 +141,6 @@ def _compressor_decode_tensors(
         "norm_w": compressor.norm.weight.detach().clone(),
         "cos": cos,
         "sin": sin,
-        "kv_proj": torch.zeros(1, 1, args.head_dim, dtype=torch.float32),
-        "score_proj": torch.zeros(1, 1, args.head_dim, dtype=torch.float32),
-        "pooled": torch.zeros(1, 1, args.head_dim, dtype=torch.bfloat16),
-        "normed": torch.zeros(1, 1, args.head_dim, dtype=torch.bfloat16),
         "compressed": torch.zeros(1, 1, args.head_dim, dtype=torch.bfloat16),
         "kv_state_out": torch.zeros_like(compressor.kv_state),
         "score_state_out": torch.zeros_like(compressor.score_state),

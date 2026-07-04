@@ -65,8 +65,6 @@ def _head_tensors(
         "hc_base": hc_base.clone(),
         "norm_w": norm.weight.detach().clone(),
         "head_w": head.weight.detach().clone(),
-        "hc_out": torch.zeros(1, seq_len, HIDDEN, dtype=torch.bfloat16),
-        "normed": torch.zeros(1, seq_len, HIDDEN, dtype=torch.bfloat16),
         "logits": torch.zeros(1, VOCAB, dtype=torch.float32),
     }
 
@@ -77,15 +75,11 @@ def test_golden_head_matches_official_model(tiny_head, seq_len: int) -> None:
     x, hc_fn, hc_scale, hc_base = _make_inputs(gen, seq_len)
 
     with torch.no_grad():
-        expected_hc = head.hc_head(x.clone(), hc_fn.clone(), hc_scale.clone(), hc_base.clone())
-        expected_normed = norm(expected_hc.clone())
         expected_logits = head(x.clone(), hc_fn.clone(), hc_scale.clone(), hc_base.clone(), norm)
 
     tensors = _head_tensors(head, norm, x, hc_fn, hc_scale, hc_base)
     head_model.golden_head(tensors)
 
-    torch.testing.assert_close(tensors["hc_out"], expected_hc, rtol=0, atol=0)
-    torch.testing.assert_close(tensors["normed"], expected_normed, rtol=0, atol=0)
     torch.testing.assert_close(tensors["logits"], expected_logits, rtol=0, atol=0)
 
 
@@ -114,8 +108,4 @@ def test_build_head_specs_shapes_and_dtypes(monkeypatch) -> None:
     assert tensors["head_w"].dtype == torch.float32
     assert tensors["pre"].shape == (1, padded_seq_len, head_model.HC_PAD)
     assert tensors["hc_out_pad"].shape == (1, padded_seq_len, HIDDEN)
-    assert tensors["logits_pad"].shape == (head_model.T_TILE, VOCAB)
-    assert tensors["logits_pad"].dtype == torch.float32
-    assert tensors["hc_out"].shape == (1, seq_len, HIDDEN)
-    assert tensors["normed"].shape == (1, seq_len, HIDDEN)
     assert tensors["logits"].shape == (1, VOCAB)

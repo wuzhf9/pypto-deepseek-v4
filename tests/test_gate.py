@@ -79,8 +79,6 @@ def _base_tensors(module: torch.nn.Module, x: torch.Tensor) -> dict[str, torch.T
     return {
         "x": x.clone(),
         "gate_w_t": module.weight.detach().t().contiguous().to(torch.bfloat16),
-        "logits": torch.zeros(bsz, seq_len, N_EXPERTS, dtype=torch.float32),
-        "scores": torch.zeros(bsz, seq_len, N_EXPERTS, dtype=torch.float32),
         "indices": torch.zeros(bsz, seq_len, TOPK, dtype=torch.int32),
         "weights": torch.zeros(bsz, seq_len, TOPK, dtype=torch.float32),
     }
