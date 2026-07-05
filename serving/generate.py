@@ -229,6 +229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-special-tokens", action="store_true")
     parser.add_argument("--print-prompt", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--verbose-layer-log", action="store_true")
     parser.add_argument("--stats", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args(argv)
 
@@ -303,6 +304,7 @@ def _create_runner(args: argparse.Namespace) -> Any:
         max_layers=args.max_layers,
         run_head=True,
         profile=args.profile,
+        verbose_layer_log=args.verbose_layer_log,
         routed_pack_cache_dir=args.routed_pack_cache_dir,
     )
 

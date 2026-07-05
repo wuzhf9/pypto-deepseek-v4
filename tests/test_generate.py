@@ -217,6 +217,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         skip_special_tokens=True,
         print_prompt=False,
         profile=False,
+        verbose_layer_log=False,
     )
 
     result = generate.run_generation(args)
@@ -224,6 +225,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
     assert captured["tokenizer_path"] == checkpoint
     assert captured["runner_args"] == (str(checkpoint),)
     assert captured["runner_kwargs"]["routed_pack_cache_dir"] == "cache"
+    assert captured["runner_kwargs"]["verbose_layer_log"] is False
     assert result.text == "4"
     assert result.prompt_tokens == 3
     assert result.generated_tokens == 1

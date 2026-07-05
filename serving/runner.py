@@ -86,18 +86,12 @@ class _DirectBackend:
 
 
 class _WorkerBackend:
-    """Placeholder for the long-lived DistributedWorker backend.
-
-    ``DistributedWorker`` requires host tensors passed to kernels to be shared
-    memory allocated before the worker forks.  Layer-by-layer weight loading
-    therefore needs a preallocated shared host weight-buffer pool before this
-    backend can safely run the full model.
-    """
+    """Placeholder for the experimental worker-resident backend."""
 
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         raise NotImplementedError(
-            "worker backend requires a shared host weight-buffer pool; use backend='direct' "
-            "for the first runner smoke validation"
+            "worker backend was removed after profiling showed kernel runtime dominates; "
+            "use backend='direct'"
         )
 
 
@@ -117,6 +111,7 @@ class DeepSeekV4Runner:
         max_layers: int | None = 1,
         run_head: bool = True,
         profile: bool = False,
+        verbose_layer_log: bool = False,
         routed_pack_cache_dir: str | None = None,
         runtime_cfg: dict[str, Any] | None = None,
     ) -> None:
@@ -127,6 +122,7 @@ class DeepSeekV4Runner:
         self.max_layers = config.n_layers if max_layers is None else int(max_layers)
         self.run_head = bool(run_head)
         self.profile = bool(profile)
+        self.verbose_layer_log = bool(verbose_layer_log)
         self.weight_loader = DeepSeekV4WeightLoader(
             checkpoint_path,
             weight_index=weight_index,
@@ -260,11 +256,12 @@ class DeepSeekV4Runner:
         case = self._block_case(spec, decode=decode, start_pos=start_pos, seq_len=seq_len)
         specs = case.spec_builder(start_pos) if decode else case.spec_builder(seq_len)
         mode = "decode" if decode else "prefill"
-        print(
-            f"[RUNNER] layer {layer_id} start: mode={mode} ratio={spec.ratio} "
-            f"hash_route={spec.hash_route} kernel={case.name} input={tuple(hidden.shape)}",
-            flush=True,
-        )
+        if self.verbose_layer_log:
+            print(
+                f"[RUNNER] layer {layer_id} start: mode={mode} ratio={spec.ratio} "
+                f"hash_route={spec.hash_route} kernel={case.name} input={tuple(hidden.shape)}",
+                flush=True,
+            )
 
         start = time.perf_counter()
         if self.profile:
@@ -282,12 +279,13 @@ class DeepSeekV4Runner:
         self.state.update_layer_state(layer_id, outputs)
         self._profile("layer.state_update", start, layer=layer_id, mode=mode, ratio=spec.ratio)
         out = outputs["out"].contiguous()
-        finite = bool(torch.isfinite(out.float()).all().item())
-        print(
-            f"[RUNNER] layer {layer_id} done: output={tuple(out.shape)} "
-            f"dtype={out.dtype} finite={finite}",
-            flush=True,
-        )
+        if self.verbose_layer_log:
+            finite = bool(torch.isfinite(out.float()).all().item())
+            print(
+                f"[RUNNER] layer {layer_id} done: output={tuple(out.shape)} "
+                f"dtype={out.dtype} finite={finite}",
+                flush=True,
+            )
         self._profile("layer.total", total_start, layer=layer_id, mode=mode, ratio=spec.ratio, kernel=case.name)
         return out
 
@@ -527,6 +525,7 @@ def main() -> int:
     parser.add_argument("--no-head", action="store_true", default=False)
     parser.add_argument("--decode-steps", type=int, default=0)
     parser.add_argument("--profile", action="store_true", default=False)
+    parser.add_argument("--verbose-layer-log", action="store_true", default=False)
     parser.add_argument("--routed-pack-cache-dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -549,6 +548,7 @@ def main() -> int:
         max_layers=args.max_layers,
         run_head=not args.no_head,
         profile=args.profile,
+        verbose_layer_log=args.verbose_layer_log,
         routed_pack_cache_dir=args.routed_pack_cache_dir,
     )
     try:

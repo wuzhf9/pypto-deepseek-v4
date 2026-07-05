@@ -39,25 +39,20 @@ PyPTO 入口；`serving/weight_loader.py` 负责权重读取和布局转换；`s
 直接实现 `DeepSeekV4Runner`。runner 内部可以保留 debug/backend 选项，但不先实现独立的
 `SmokeRunner`，避免 block kernel 选择、参数组装、输出映射和 state 更新逻辑出现两套实现。
 
-`DistributedWorker` 由 PyPTO 框架提供，不是 `pypto-serving` 自己实现的功能。虽然当前没有
-多卡并行需求，但 `DistributedWorker` 仍然适合作为单卡长生命周期 runtime 管理器使用：
+当前主路径使用 direct backend。worker-resident backend 曾用于验证 state/cache 和 hidden
+常驻 NPU 的可行性，但 profile 显示主要瓶颈仍在 block kernel runtime，worker 路径的收益
+不足以作为后续主线：
 
 ```text
 DeepSeekV4Runner
   - 负责整网 prefill/decode 流程
   - 负责权重加载、state 管理、kernel dispatch
-  - 第一版使用 direct backend 做 smoke/debug
-  - 后续使用单设备 DistributedWorker 做正式整网运行
+  - 使用 direct backend 做 smoke/debug 和完整推理
 ```
 
-单设备 `DistributedWorker` 的作用是复用已编译 kernel、管理 worker-resident tensor，并让
-state cache 常驻 NPU。direct backend 可以对齐 `models/golden.py::run_jit` 的直接
-`compiled(*args, config=...)` 调用方式，用于单 kernel 或短链路 debug；它不是另一套 runner。
-
-`DistributedWorker` 对 host tensor 有一个重要约束：传给 worker 的 host tensor 必须是 worker
-fork 前已经分配的 shared-memory tensor。按层新加载的普通权重 tensor 不能直接作为 worker
-参数传入。因此第一版先使用 direct backend 验证 runner 参数组装和计算链路；worker backend
-需要先实现 shared host weight buffer pool，再启用 state 常驻 NPU。
+direct backend 对齐 `models/golden.py::run_jit` 的直接 `compiled(*args, config=...)`
+调用方式，已经验证能够跑通完整推理。后续优化优先转向 PyPTO kernel 内部计算路径，而不是
+继续扩展 `--backend worker`。
 
 ## 对外接口
 
@@ -277,37 +272,13 @@ CPU:
 
 NPU:
   - direct backend 下 state 作为普通 host tensor 参数参与每次 kernel 调用
-  - worker backend 启用后，attention/compressor/indexer state 常驻 worker-resident DeviceTensor
   - 当前层权重和 scratch 只在当前 kernel 调用期间有效
   - 当前层运行结束后释放当前层权重和 scratch
 ```
 
-worker backend 中的 state 常驻 NPU 对齐 `pypto-serving` 的 KV cache 常驻 NPU 模式。我们的
-state 包括：
-
-```text
-kv_cache
-comp_cache
-comp_kv_state
-comp_score_state
-attn_comp_cache
-attn_comp_kv_state
-attn_comp_score_state
-idx_kv_cache
-idx_comp_kv_state
-idx_comp_score_state
-```
-
-hidden 不在第一版中跨层常驻 NPU。这样可以避免先验证“上一层 block 输出的 DeviceTensor 能否
-直接作为下一层 block 输入复用”这一额外问题。代价是每层 hidden 都有 host/NPU 往返，但当前
-目标是逻辑正确，不追求性能。
-
-后续整网能够正确跑通后，如果需要优化性能，再把 hidden 改为常驻 NPU：
-
-- hidden 常驻 NPU，在层间直接传递。
-- 按最大单层形状预分配 weight buffer pool，每层覆盖内容而不是频繁 alloc/free。
-
-这些优化不改变 kernel 计算语义。
+state/cache 和 hidden 常驻 NPU 已通过实验验证可行，但小规模 profile 没有体现出足够收益。
+当前优化重点改为拆分 block kernel runtime 的内部耗时，定位 attention、MoE、HC、linear、
+sparse attention 等子路径的真实占比。
 
 ## Scratch Tensor 处理
 
@@ -381,17 +352,16 @@ runner 实现后按以下顺序验证：
 - 按 Qwen3 模式用最大容量编译一次后，当前 block kernel 是否能稳定复用不同实际 `S` 的
   输入切片需要实测；如果某个 block 形态触发重复编译或 runtime 错误，需要单独调整该
   kernel 的 dynamic shape 写法。
-- host/NPU 每层往返会很慢，但当前目标是逻辑正确，不追求性能。
-- hidden 常驻 NPU 是后续性能优化项，不作为第一版 runner 的正确性依赖。
+- host/NPU 每层往返仍然存在，但当前 profile 显示它不是首要瓶颈。
+- worker-resident state/cache 和 hidden 路径已实验并回退，不作为后续主线。
 - 如果 packed-expert 不可行，切换 selected-expert 时需要新增或调整 MoE 调度，但不影响
   attention、compressor、indexer、block 的已验证逻辑。
 
 ## 后续细化项
 
-- 确认 PyPTO 单设备 `DistributedWorker` 的最小创建、编译、运行、DeviceTensor state 管理和 close API。
 - 给 block runner 抽一个稳定的参数组装 helper，避免每个 block 形态重复拼长参数列表。
 - 实测 packed-expert 单层峰值显存。
-- 实测每层权重 host 传入、worker-resident 权重上传释放和固定 weight buffer pool 三种策略。
+- 拆分 block kernel runtime，定位最耗时的子模块和切分方式。
 
 ## 当前实现进展
 
@@ -422,17 +392,18 @@ runner 实现后按以下顺序验证：
   - `--decode-steps N` 会先执行 prefill，再从 `start_pos=seq_len` 开始连续 decode `N` 步。
   - 带 head 时使用上一步 logits 的 argmax 作为下一步 decode token；`--no-head` 时使用随机 token 做 kernel 串联验证。
   - `--profile` 打印 host 侧 timing，用于定位权重加载、tensor materialize、kernel compile/run 和 state 更新开销。
+  - `--verbose-layer-log` 打印逐层 start/done 和 finite 检查；默认关闭，避免长生成输出过多。
   - `--routed-pack-cache-dir PATH` 从离线 bf16 routed pack cache 读取 MoE routed expert packed 权重，缺失层回退在线转换。
 - 生成入口
   - `python serving/generate.py ...`
   - 按 `../deepseek_v4_flash` 的流程调用官方 `encode_messages(...)`，再调用 tokenizer `encode(...)`。
   - 支持 prefill、greedy decode、temperature sampling、EOS 停止和 `--max-new-tokens`。
+  - `--verbose-layer-log` 可透传到 runner，用于定位某一层的 shape、dtype 和 finite 状态。
   - 复用 `DeepSeekV4Runner` 和 `DeepSeekV4State`，不维护第二套模型执行逻辑。
 
-当前未启用 `worker` backend。原因是 PyPTO `DistributedWorker` 要求传入 worker 的 host
-tensor 必须是 worker fork 前已经分配的 shared-memory tensor；而当前 layer-by-layer 权重
-是在运行过程中按层加载的普通 CPU tensor。worker backend 需要先实现 shared host weight
-buffer pool，再启用 state 常驻 NPU。
+当前未启用 `worker` backend。state/cache 与 hidden 常驻 NPU 的实验路径已经回退，原因是
+profile 显示 block kernel runtime 占每层耗时约 90%，worker 路径确定性优化空间不足以作为
+后续主线。下一步优化应聚焦 kernel runtime。
 
 Ascend 端已经完成的关键验证：
 
@@ -587,8 +558,8 @@ fp4/fp8 dequant、transpose 和 copy 等权重加载细分耗时。
 ## 优化计划
 
 1. 降低验证噪声。
-   - runner 逐层日志默认关闭，只在 `--verbose-layer-log` 或 `--debug` 时打开。
-   - 保留关键的 prompt token 数、生成 token 数、总耗时和最终文本输出。
+   - 已实现 `--verbose-layer-log`，runner 逐层日志默认关闭。
+   - 默认只保留关键的 prompt token 数、生成 token 数、总耗时和最终文本输出。
    - 该优化不改变计算路径，只减少长生成时的日志量。
 2. 重新做短场景 profile。
    - 使用 `prompt='你好' --max-new-tokens 2 --profile`。
@@ -599,19 +570,11 @@ fp4/fp8 dequant、transpose 和 copy 等权重加载细分耗时。
    - 已完成 routed expert 离线 bf16 pack cache。
    - 根据 profile 决定是否增加非 routed 权重的离线 bf16/runtime-layout cache。
    - 候选对象包括频繁发生 fp8/fp4 反量化、转置或 dtype 转换的 attention、compressor、indexer、gate、shared expert 权重。
-4. 实现 shared host weight buffer pool。
-   - 按最大单层 shape 预分配 host buffer。
-   - 每层加载权重后覆盖已有 buffer 内容，而不是频繁创建新的 host tensor。
-   - 这是启用 worker backend 前的准备工作。
-5. 启用 worker backend，让 state 常驻 NPU。
-   - 对齐 pypto-serving 的 KV cache 常驻 NPU 模式。
-   - 目标是让 `kv_cache`、compressor/indexer state/cache 不再每层每 token 回到 host。
-   - 先做单层最小 worker smoke，再扩大到完整 prefill/decode。
-6. hidden 常驻 NPU。
-   - 在 state 常驻 NPU 稳定后，再把 block 间 hidden 也改为 NPU resident。
-   - 可使用两块 hidden ping-pong buffer，在层间直接传递。
-   - 这会减少每层 hidden host/NPU 往返，是 decode 性能的主要后续优化项。
-7. selected-expert decode 路径作为备选。
+4. 聚焦 block kernel runtime。
+   - 以 `block_*_prefill/decode` 为入口增加或临时插入子模块 timing/诊断输出。
+   - 优先拆分 MoE、attention、HC pre/post、sparse attention、linear 路径的耗时。
+   - 根据占比决定是否调整 kernel 切分、拆分大 kernel、减少无效专家计算或重写局部算子。
+5. selected-expert decode 路径作为备选。
    - 当前 packed-expert 已证明能够跑通并满足内存需求。
    - 如果 profile 显示 decode 的 packed routed expert 权重加载仍是绝对瓶颈，再评估 selected-expert。
    - selected-expert 会引入新的 MoE kernel 和权重接口，不作为当前主路径。
