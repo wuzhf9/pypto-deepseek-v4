@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 import torch
@@ -223,14 +224,20 @@ class DeepSeekV4WeightLoader:
         config: DeepSeekV4FlashConfig = FLASH_CONFIG,
         default_device: str | torch.device = "cpu",
         max_cache_bytes: int = 0,
+        profile: bool = False,
+        routed_pack_cache_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.index = self._load_index(weight_index)
         self.config = config
         self.default_device = torch.device(default_device)
         self.max_cache_bytes = max_cache_bytes
+        self.profile = bool(profile)
+        self.routed_pack_cache_dir = Path(routed_pack_cache_dir) if routed_pack_cache_dir is not None else None
         self._cache: OrderedDict[tuple[str, str, bool, str | None], torch.Tensor] = OrderedDict()
         self._cache_bytes = 0
+        self._file_handles: dict[Path, Any] = {}
+        self._profile_stats: OrderedDict[str, dict[str, float | int]] = OrderedDict()
 
     @property
     def cache_bytes(self) -> int:
@@ -263,7 +270,9 @@ class DeepSeekV4WeightLoader:
 
         tensor = self._load_indexed_tensor(name, device=target, dequantize=dequantize)
         if dtype is not None:
+            start = time.perf_counter()
             tensor = tensor.to(dtype=dtype)
+            self._record_profile(f"dtype_cast.{dtype}", start)
         tensor = tensor.contiguous()
         if cache:
             self._insert_cache(key, tensor)
@@ -290,7 +299,11 @@ class DeepSeekV4WeightLoader:
         device: str | torch.device | None = None,
         cache: bool = True,
     ) -> torch.Tensor:
-        return self.get_linear_weight(name, dtype=dtype, device=device, cache=cache).t().contiguous()
+        tensor = self.get_linear_weight(name, dtype=dtype, device=device, cache=cache)
+        start = time.perf_counter()
+        out = tensor.t().contiguous()
+        self._record_profile("transpose.linear_t", start)
+        return out
 
     def get_embedding_weight(self, *, device: str | torch.device | None = None) -> torch.Tensor:
         return self.get_tensor("embed.weight", dtype=torch.bfloat16, device=device)
@@ -428,32 +441,59 @@ class DeepSeekV4WeightLoader:
         device: str | torch.device | None = None,
         release_each_expert: bool = False,
     ) -> MoERoutedPackWeights:
-        w1_tensors = []
-        w2_tensors = []
-        w3_tensors = []
+        del release_each_expert
+        target = torch.device(device) if device is not None else self.default_device
+        cached = self._load_cached_routed_pack(layer_id, device=target)
+        if cached is not None:
+            return cached
+
+        routed_w1_t = torch.empty(
+            self.config.n_routed_experts,
+            self.config.dim,
+            self.config.moe_inter_dim,
+            dtype=torch.bfloat16,
+            device=target,
+        )
+        routed_w2_t = torch.empty(
+            self.config.n_routed_experts,
+            self.config.moe_inter_dim,
+            self.config.dim,
+            dtype=torch.bfloat16,
+            device=target,
+        )
+        routed_w3_t = torch.empty(
+            self.config.n_routed_experts,
+            self.config.dim,
+            self.config.moe_inter_dim,
+            dtype=torch.bfloat16,
+            device=target,
+        )
+
         for expert_id in range(self.config.n_routed_experts):
-            expert = self.get_moe_routed_expert(layer_id, expert_id, device=device)
-            w1_tensors.append(expert.w1_t)
-            w2_tensors.append(expert.w2_t)
-            w3_tensors.append(expert.w3_t)
-            if release_each_expert:
-                self.release_prefix(f"{self._layer_prefix(layer_id)}.ffn.experts.{expert_id}.")
+            prefix = f"{self._layer_prefix(layer_id)}.ffn.experts.{expert_id}"
+            self._copy_linear_t_into(routed_w1_t[expert_id], f"{prefix}.w1.weight", device=target)
+            self._copy_linear_t_into(routed_w2_t[expert_id], f"{prefix}.w2.weight", device=target)
+            self._copy_linear_t_into(routed_w3_t[expert_id], f"{prefix}.w3.weight", device=target)
         return MoERoutedPackWeights(
-            routed_w1_t=torch.stack(w1_tensors, dim=0).contiguous(),
-            routed_w2_t=torch.stack(w2_tensors, dim=0).contiguous(),
-            routed_w3_t=torch.stack(w3_tensors, dim=0).contiguous(),
+            routed_w1_t=routed_w1_t.contiguous(),
+            routed_w2_t=routed_w2_t.contiguous(),
+            routed_w3_t=routed_w3_t.contiguous(),
         )
 
     def release(self, name: str | None = None) -> None:
         if name is None:
             self._cache.clear()
             self._cache_bytes = 0
+            self._close_file_handles()
             return
 
         removed = [key for key in self._cache if key[0] == name]
         for key in removed:
             tensor = self._cache.pop(key)
             self._cache_bytes -= tensor_nbytes(tensor)
+
+    def close(self) -> None:
+        self.release()
 
     def release_prefix(self, prefix: str) -> None:
         removed = [key for key in self._cache if key[0].startswith(prefix)]
@@ -470,9 +510,72 @@ class DeepSeekV4WeightLoader:
         )
 
     def _layer_prefix(self, layer_id: int) -> str:
+        self._validate_layer_id(layer_id)
+        return f"layers.{layer_id}"
+
+    def _copy_linear_t_into(self, out: torch.Tensor, name: str, *, device: torch.device) -> None:
+        tensor = self.get_linear_t(name, device=device, cache=False)
+        if tuple(tensor.shape) != tuple(out.shape):
+            raise ValueError(f"{name} transposed shape mismatch: expected {tuple(out.shape)}, got {tuple(tensor.shape)}")
+        start = time.perf_counter()
+        out.copy_(tensor)
+        self._record_profile("copy_linear_t", start)
+
+    def routed_pack_cache_path(self, layer_id: int) -> Path | None:
+        self._validate_layer_id(layer_id)
+        if self.routed_pack_cache_dir is None:
+            return None
+        return self.routed_pack_cache_dir / f"layer_{layer_id:03d}_routed_pack.safetensors"
+
+    def _load_cached_routed_pack(self, layer_id: int, *, device: torch.device) -> MoERoutedPackWeights | None:
+        path = self.routed_pack_cache_path(layer_id)
+        if path is None or not path.exists():
+            return None
+
+        start = time.perf_counter()
+        handle = self._get_file_handle(path)
+        routed_w1_t = self._materialize_cached_tensor(handle.get_tensor("routed_w1_t"), device)
+        routed_w2_t = self._materialize_cached_tensor(handle.get_tensor("routed_w2_t"), device)
+        routed_w3_t = self._materialize_cached_tensor(handle.get_tensor("routed_w3_t"), device)
+        self._record_profile("routed_pack_cache.load", start)
+
+        self._validate_routed_pack_tensor(
+            "routed_w1_t",
+            routed_w1_t,
+            (self.config.n_routed_experts, self.config.dim, self.config.moe_inter_dim),
+        )
+        self._validate_routed_pack_tensor(
+            "routed_w2_t",
+            routed_w2_t,
+            (self.config.n_routed_experts, self.config.moe_inter_dim, self.config.dim),
+        )
+        self._validate_routed_pack_tensor(
+            "routed_w3_t",
+            routed_w3_t,
+            (self.config.n_routed_experts, self.config.dim, self.config.moe_inter_dim),
+        )
+        return MoERoutedPackWeights(
+            routed_w1_t=routed_w1_t.contiguous(),
+            routed_w2_t=routed_w2_t.contiguous(),
+            routed_w3_t=routed_w3_t.contiguous(),
+        )
+
+    def _validate_layer_id(self, layer_id: int) -> None:
         if not 0 <= layer_id < self.config.n_layers:
             raise ValueError(f"layer_id must be in [0, {self.config.n_layers}), got {layer_id}")
-        return f"layers.{layer_id}"
+
+    @staticmethod
+    def _validate_routed_pack_tensor(name: str, tensor: torch.Tensor, shape: tuple[int, ...]) -> None:
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{name} cache shape mismatch: expected {shape}, got {tuple(tensor.shape)}")
+        if tensor.dtype is not torch.bfloat16:
+            raise TypeError(f"{name} cache dtype mismatch: expected torch.bfloat16, got {tensor.dtype}")
+
+    @staticmethod
+    def _materialize_cached_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if device.type == "cpu":
+            return tensor.clone().contiguous()
+        return tensor.to(device).contiguous()
 
     def _load_index(self, weight_index: str | os.PathLike[str] | dict[str, Any] | None) -> dict[str, dict[str, Any]]:
         if weight_index is None:
@@ -534,10 +637,15 @@ class DeepSeekV4WeightLoader:
         dequantize: bool,
     ) -> torch.Tensor:
         entry = self.entry(name)
+        start = time.perf_counter()
         tensor = self._load_raw_tensor(entry)
         kind = self._resolve_kind(name, entry, tensor)
+        self._record_profile(f"raw_load.{kind}", start)
         if not dequantize or kind not in {"fp8_weight", "fp4_packed_weight"}:
-            return tensor.to(device)
+            start = time.perf_counter()
+            out = tensor.to(device)
+            self._record_profile(f"to_device.{kind}", start)
+            return out
 
         scale_name = entry.get("scale") or name.replace(".weight", ".scale")
         if scale_name in self.index:
@@ -546,15 +654,37 @@ class DeepSeekV4WeightLoader:
             scale_entry = {"file": entry["scale_file"], "raw_name": entry["scale_raw_name"]}
         else:
             raise KeyError(f"Missing scale tensor for quantized weight: {name}")
+        start = time.perf_counter()
         scale = self._load_raw_tensor(scale_entry)
+        self._record_profile(f"scale_load.{kind}", start)
+        start = time.perf_counter()
         if kind == "fp8_weight":
-            return dequant_fp8_weight_to_bf16(tensor, scale).to(device)
-        return dequant_fp4_weight_to_bf16(tensor, scale).to(device)
+            converted = dequant_fp8_weight_to_bf16(tensor, scale)
+        else:
+            converted = dequant_fp4_weight_to_bf16(tensor, scale)
+        self._record_profile(f"dequant.{kind}", start)
+        start = time.perf_counter()
+        out = converted.to(device)
+        self._record_profile(f"to_device.{kind}", start)
+        return out
 
     def _load_raw_tensor(self, entry: dict[str, Any]) -> torch.Tensor:
         path = self.checkpoint_path / entry["file"]
-        with safe_open(path, framework="pt", device="cpu") as handle:
-            return handle.get_tensor(entry["raw_name"])
+        handle = self._get_file_handle(path)
+        return handle.get_tensor(entry["raw_name"])
+
+    def _get_file_handle(self, path: Path) -> Any:
+        path = path.resolve()
+        handle = self._file_handles.get(path)
+        if handle is None:
+            handle = safe_open(path, framework="pt", device="cpu")
+            self._file_handles[path] = handle
+        return handle
+
+    def _close_file_handles(self) -> None:
+        for handle in self._file_handles.values():
+            handle.__exit__(None, None, None)
+        self._file_handles.clear()
 
     @staticmethod
     def _resolve_kind(name: str, entry: dict[str, Any], tensor: torch.Tensor) -> str:
@@ -588,17 +718,35 @@ class DeepSeekV4WeightLoader:
             _, tensor = self._cache.popitem(last=False)
             self._cache_bytes -= tensor_nbytes(tensor)
 
+    def reset_profile_stats(self) -> None:
+        self._profile_stats.clear()
+
+    def profile_summary(self) -> list[tuple[str, int, float]]:
+        return [
+            (name, int(stats["count"]), float(stats["seconds"]) * 1000.0)
+            for name, stats in self._profile_stats.items()
+        ]
+
+    def _record_profile(self, name: str, start: float) -> None:
+        if not self.profile:
+            return
+        stats = self._profile_stats.setdefault(name, {"count": 0, "seconds": 0.0})
+        stats["count"] = int(stats["count"]) + 1
+        stats["seconds"] = float(stats["seconds"]) + (time.perf_counter() - start)
+
 
 def load_weight_loader_from_checkpoint(
     checkpoint_path: str | os.PathLike[str],
     *,
     default_device: str | torch.device = "cpu",
     max_cache_bytes: int = 0,
+    routed_pack_cache_dir: str | os.PathLike[str] | None = None,
 ) -> DeepSeekV4WeightLoader:
     return DeepSeekV4WeightLoader(
         checkpoint_path,
         default_device=default_device,
         max_cache_bytes=max_cache_bytes,
+        routed_pack_cache_dir=routed_pack_cache_dir,
     )
 
 

@@ -211,6 +211,57 @@ def test_cache_release_and_release_prefix(tmp_path):
     assert loader.cache_bytes == 0
 
 
+def test_loader_reuses_safetensors_file_handle(tmp_path):
+    tensors = {
+        "model.embed_tokens.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+        "model.norm.weight": torch.ones(2, dtype=torch.bfloat16),
+    }
+    index = _save_checkpoint(tmp_path, tensors)
+    loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config())
+
+    loader.get_tensor("embed.weight", cache=False)
+    loader.get_tensor("norm.weight", cache=False)
+    assert len(loader._file_handles) == 1
+
+    loader.release("embed.weight")
+    assert len(loader._file_handles) == 1
+
+    loader.close()
+    assert len(loader._file_handles) == 0
+
+
+def test_loader_uses_routed_pack_cache_when_available(tmp_path):
+    cfg = _small_config()
+    checkpoint = tmp_path / "ckpt"
+    checkpoint.mkdir()
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    tensors = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.0.down_proj.weight": torch.full((4, 3), -1.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.0.up_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.gate_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.down_proj.weight": torch.full((4, 3), -1.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.up_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
+    }
+    index = _save_checkpoint(checkpoint, tensors)
+    save_file(
+        {
+            "routed_w1_t": torch.full((2, 4, 3), 1.0, dtype=torch.bfloat16),
+            "routed_w2_t": torch.full((2, 3, 4), 2.0, dtype=torch.bfloat16),
+            "routed_w3_t": torch.full((2, 4, 3), 3.0, dtype=torch.bfloat16),
+        },
+        cache_dir / "layer_000_routed_pack.safetensors",
+    )
+
+    loader = DeepSeekV4WeightLoader(checkpoint, index, config=cfg, routed_pack_cache_dir=cache_dir)
+    packed = loader.get_layer_moe_routed_pack(0)
+    assert torch.equal(packed.routed_w1_t, torch.full((2, 4, 3), 1.0, dtype=torch.bfloat16))
+    assert torch.equal(packed.routed_w2_t, torch.full((2, 3, 4), 2.0, dtype=torch.bfloat16))
+    assert torch.equal(packed.routed_w3_t, torch.full((2, 4, 3), 3.0, dtype=torch.bfloat16))
+
+
 def test_official_lowvram_weight_index_smoke_loads_representative_weights():
     checkpoint = _official_checkpoint_path()
     weight_index = checkpoint / "bf16_lowvram_cache" / "weight_index.json"

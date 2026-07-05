@@ -311,15 +311,8 @@ def topk_indices_by_score(
     return compare
 
 
-def _save_tensors(dest_dir: Path, tensors: dict[str, torch.Tensor]) -> None:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    for name, tensor in tensors.items():
-        torch.save(tensor, dest_dir / f"{name}.pt")
-
-
 def _prepare_tensors(
     specs: list[TensorSpec],
-    work_dir: Path,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     tensors = {spec.name: spec.create_tensor() for spec in specs}
     input_snapshot = {
@@ -327,14 +320,12 @@ def _prepare_tensors(
         for spec in specs
         if not spec.is_output or spec.init_value is not None
     }
-    _save_tensors(work_dir / "data" / "in", input_snapshot)
     return tensors, input_snapshot
 
 
 def _compute_golden(
     specs: list[TensorSpec],
     input_snapshot: dict[str, torch.Tensor],
-    work_dir: Path,
     golden_fn: Callable,
 ) -> dict[str, torch.Tensor]:
     with _Stage("compute golden"):
@@ -346,7 +337,6 @@ def _compute_golden(
                 scratch[spec.name] = input_snapshot[spec.name].clone()
         golden_fn(scratch)
         outputs = {spec.name: scratch[spec.name] for spec in specs if spec.is_output}
-        _save_tensors(work_dir / "data" / "out", outputs)
         return outputs
 
 
@@ -439,11 +429,11 @@ def run_jit(
             return RunResult(True, execution_time=total, work_dir=work_dir)
 
         with _Stage("generate inputs"):
-            tensors, input_snapshot = _prepare_tensors(specs, work_dir)
+            tensors, input_snapshot = _prepare_tensors(specs)
 
         golden_outputs = None
         if golden_fn is not None:
-            golden_outputs = _compute_golden(specs, input_snapshot, work_dir, golden_fn)
+            golden_outputs = _compute_golden(specs, input_snapshot, golden_fn)
 
         with _Stage("runtime"):
             ordered_args = [tensors[spec.name] for spec in specs]
