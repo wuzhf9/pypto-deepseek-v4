@@ -395,13 +395,13 @@ runner 实现后按以下顺序验证：
 
 ## 当前实现进展
 
-当前已经新增 `serving/runner.py`，实现了第一版 `DeepSeekV4Runner`。
+当前已经新增 `serving/runner.py` 和 `serving/generate.py`，实现了第一版端到端生成链路。
 
 已实现内容：
 
 - `DeepSeekV4Runner.prefill(input_ids)`
-  - `embedding_fwd -> block loop -> optional head_fwd`
-  - 默认 `max_layers=1`，用于先验证 layer 0 prefill smoke。
+  - `embedding_fwd -> block loop -> optional head_fwd`。
+  - 支持 `max_layers=43` 完整层数。
 - `DeepSeekV4Runner.decode(input_ids, start_pos=...)`
   - 复用同一个 runner 实例中的 prefill state/cache。
   - `start_pos` 由 CLI 或调用方显式传入。
@@ -423,11 +423,45 @@ runner 实现后按以下顺序验证：
   - 带 head 时使用上一步 logits 的 argmax 作为下一步 decode token；`--no-head` 时使用随机 token 做 kernel 串联验证。
   - `--profile` 打印 host 侧 timing，用于定位权重加载、tensor materialize、kernel compile/run 和 state 更新开销。
   - `--routed-pack-cache-dir PATH` 从离线 bf16 routed pack cache 读取 MoE routed expert packed 权重，缺失层回退在线转换。
+- 生成入口
+  - `python serving/generate.py ...`
+  - 按 `../deepseek_v4_flash` 的流程调用官方 `encode_messages(...)`，再调用 tokenizer `encode(...)`。
+  - 支持 prefill、greedy decode、temperature sampling、EOS 停止和 `--max-new-tokens`。
+  - 复用 `DeepSeekV4Runner` 和 `DeepSeekV4State`，不维护第二套模型执行逻辑。
 
 当前未启用 `worker` backend。原因是 PyPTO `DistributedWorker` 要求传入 worker 的 host
 tensor 必须是 worker fork 前已经分配的 shared-memory tensor；而当前 layer-by-layer 权重
 是在运行过程中按层加载的普通 CPU tensor。worker backend 需要先实现 shared host weight
 buffer pool，再启用 state 常驻 NPU。
+
+Ascend 端已经完成的关键验证：
+
+- `max_layers=43` prefill 能跑通。
+- `max_layers=43` prefill + head 能跑通。
+- `max_layers=43` prefill + decode 能跑通。
+- `serving/generate.py` 使用真实 tokenizer、真实权重和完整 43 层，能够生成逻辑正确的中文回复。
+
+已验证的完整生成命令：
+
+```bash
+python serving/generate.py \
+  --checkpoint ~/dsv4_ckpt \
+  --encoding-path ~/dsv4_ckpt/encoding \
+  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --prompt '你好' \
+  --max-new-tokens 20 \
+  -p a2a3 -d {}
+```
+
+该命令输出：
+
+```text
+AI: 你好！很高兴见到你。有什么我可以帮你的吗？无论是聊天、解答问题，还是提供
+prompt_tokens: 5
+generated_tokens: 20
+elapsed_s: 1576.100
+output_tps: 0.013
+```
 
 ## 当前验证方式
 
@@ -435,13 +469,17 @@ buffer pool，再启用 state 常驻 NPU。
 
 ```bash
 python -m py_compile serving/runner.py
+python -m py_compile serving/generate.py
 python -m py_compile models/golden.py
+pytest -q tests
 ```
 
 本地没有完整 PyPTO native extension 环境，直接 import/run PyPTO 会触发
 `pypto.pypto_core.DataType` 缺失，因此功能验证需要在 Ascend 环境进行。
 
-推荐第一条远程 smoke 命令：
+远程 smoke 可以继续保留从小到大的验证顺序，用于修改 runner 或 block 参数组装后快速回归。
+
+最小 prefill：
 
 ```bash
 python serving/runner.py --checkpoint ../deepseek_v4_flash -p a2a3 -d 0 -s 1 --max-layers 1 --no-head
@@ -490,10 +528,29 @@ python serving/runner.py --checkpoint ../deepseek_v4_flash -p a2a3 -d 0 -s 13 --
 python serving/runner.py --checkpoint ../deepseek_v4_flash -p a2a3 -d 0 -s 13 --max-layers 43 --decode-steps 1
 ```
 
-性能采样时增加 `--profile`：
+完整生成验证使用：
 
 ```bash
-python serving/runner.py --checkpoint ../deepseek_v4_flash -p a2a3 -d 0 -s 13 --max-layers 5 --decode-steps 1 --profile
+python serving/generate.py \
+  --checkpoint ~/dsv4_ckpt \
+  --encoding-path ~/dsv4_ckpt/encoding \
+  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --prompt '你好' \
+  --max-new-tokens 20 \
+  -p a2a3 -d {}
+```
+
+性能采样时增加 `--profile`，优先使用短生成场景：
+
+```bash
+python serving/generate.py \
+  --checkpoint ~/dsv4_ckpt \
+  --encoding-path ~/dsv4_ckpt/encoding \
+  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --prompt '你好' \
+  --max-new-tokens 2 \
+  -p a2a3 -d {} \
+  --profile
 ```
 
 如果已经生成离线 routed pack cache，可以增加：
@@ -523,22 +580,38 @@ fp4/fp8 dequant、transpose 和 copy 等权重加载细分耗时。
 只清理 tensor cache，不关闭 file handle；`release()` 无参数或 `close()` 会释放 tensor cache
 并关闭所有 file handle。
 
-## 下一步计划
+当前已实现 routed expert 离线 bf16 pack cache。`DeepSeekV4WeightLoader.get_layer_moe_routed_pack(...)`
+会优先读取 `--routed-pack-cache-dir` 中的 `layer_NNN_routed_pack.safetensors`，缺失时回退到
+官方 checkpoint 在线 fp4 反量化、转置和 packed tensor 写入。
 
-1. 在 Ascend 上验证第一版 direct runner。
-   - 先跑 layer 0 prefill smoke。
-   - 再跑带 head 的 logits smoke。
-   - 然后扩大到前 3、5 层，覆盖所有 block 形态。
-2. 根据远程报错修正 runner 参数组装。
-   - 重点检查 spec shape、权重布局、state output key 和 `ffn_norm_w` 命名。
-3. 验证 decode。
-   - 先用 `max_layers=1` 验证 `swa_hash_decode`。
-   - 再用 `max_layers=5` 覆盖 `csa_hash_decode`、`hca_topk_decode`、`csa_topk_decode`。
-   - 最后验证 `max_layers=43 --decode-steps 1`，确认完整 prefill state 能被 decode 消费。
-4. 设计并实现 shared host weight buffer pool。
-   - 让 worker fork 前创建固定 shared-memory host buffers。
-   - 每层加载权重后 copy 到已有 buffer。
-   - 再启用 `DistributedWorker` backend 和 state 常驻 NPU。
-5. direct runner 跑通足够层数后，再实现 `serving/generate.py`。
-   - tokenizer、prefill、decode loop、greedy argmax。
-   - 与 `../deepseek_v4_flash` bf16 low-vram 路径做短 prompt 行为对比。
+## 优化计划
+
+1. 降低验证噪声。
+   - runner 逐层日志默认关闭，只在 `--verbose-layer-log` 或 `--debug` 时打开。
+   - 保留关键的 prompt token 数、生成 token 数、总耗时和最终文本输出。
+   - 该优化不改变计算路径，只减少长生成时的日志量。
+2. 重新做短场景 profile。
+   - 使用 `prompt='你好' --max-new-tokens 2 --profile`。
+   - 重点区分权重读取、权重 materialize、kernel compile、kernel run、state update 和 head 开销。
+   - 不先假设瓶颈，后续优化按 profile 数据排序。
+3. 继续优化权重加载路径。
+   - 已完成 safetensors file handle cache。
+   - 已完成 routed expert 离线 bf16 pack cache。
+   - 根据 profile 决定是否增加非 routed 权重的离线 bf16/runtime-layout cache。
+   - 候选对象包括频繁发生 fp8/fp4 反量化、转置或 dtype 转换的 attention、compressor、indexer、gate、shared expert 权重。
+4. 实现 shared host weight buffer pool。
+   - 按最大单层 shape 预分配 host buffer。
+   - 每层加载权重后覆盖已有 buffer 内容，而不是频繁创建新的 host tensor。
+   - 这是启用 worker backend 前的准备工作。
+5. 启用 worker backend，让 state 常驻 NPU。
+   - 对齐 pypto-serving 的 KV cache 常驻 NPU 模式。
+   - 目标是让 `kv_cache`、compressor/indexer state/cache 不再每层每 token 回到 host。
+   - 先做单层最小 worker smoke，再扩大到完整 prefill/decode。
+6. hidden 常驻 NPU。
+   - 在 state 常驻 NPU 稳定后，再把 block 间 hidden 也改为 NPU resident。
+   - 可使用两块 hidden ping-pong buffer，在层间直接传递。
+   - 这会减少每层 hidden host/NPU 往返，是 decode 性能的主要后续优化项。
+7. selected-expert decode 路径作为备选。
+   - 当前 packed-expert 已证明能够跑通并满足内存需求。
+   - 如果 profile 显示 decode 的 packed routed expert 权重加载仍是绝对瓶颈，再评估 selected-expert。
+   - selected-expert 会引入新的 MoE kernel 和权重接口，不作为当前主路径。
