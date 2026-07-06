@@ -202,6 +202,39 @@ def test_golden_compressor_ratio128_decode_matches_official_model(tiny_ratio128_
     else:
         torch.testing.assert_close(tensors["compressed"], expected_return, rtol=0, atol=0)
 
+def test_golden_compressor_ratio128_continuous_decode_crosses_boundary(tiny_ratio128_args) -> None:
+    compressor = _make_official_compressor(tiny_ratio128_args)
+    prefill_len = 126
+    torch.manual_seed(20260706)
+    prefill_x = (torch.randn(1, prefill_len, tiny_ratio128_args.dim, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+
+    expected_return = compressor(prefill_x.clone(), start_pos=0)
+    tensors = _compressor_tensors(compressor, prefill_x, tiny_ratio128_args)
+    compressor_ratio128.golden_compressor_ratio128_forward(tensors, start_pos=0)
+
+    assert expected_return is None
+    torch.testing.assert_close(tensors["kv_state_out"], compressor.kv_state, rtol=0, atol=0)
+    _assert_score_state_matches(tensors["score_state_out"], compressor.score_state)
+    torch.testing.assert_close(tensors["compressed_cache_out"], compressor.kv_cache, rtol=0, atol=0)
+
+    for start_pos in (126, 127, 128, 129):
+        token = (torch.randn(1, 1, tiny_ratio128_args.dim, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        tensors = _compressor_decode_tensors(compressor, token, tiny_ratio128_args, start_pos)
+        expected_return = compressor(token.clone(), start_pos=start_pos)
+
+        compressor_ratio128.golden_compressor_ratio128_forward(tensors, start_pos=start_pos)
+
+        torch.testing.assert_close(tensors["kv_state_out"], compressor.kv_state, rtol=0, atol=1e-8)
+        torch.testing.assert_close(tensors["score_state_out"], compressor.score_state, rtol=0, atol=1e-8)
+        torch.testing.assert_close(tensors["compressed_cache_out"], compressor.kv_cache, rtol=0, atol=0)
+        if expected_return is None:
+            assert int(tensors["should_compress"][0].item()) == 0
+            torch.testing.assert_close(tensors["compressed"], torch.zeros_like(tensors["compressed"]), rtol=0, atol=0)
+        else:
+            assert start_pos == 127
+            assert int(tensors["should_compress"][0].item()) == 1
+            torch.testing.assert_close(tensors["compressed"], expected_return, rtol=0, atol=0)
+
 def test_build_decode_specs_rejects_prefill_start_pos() -> None:
     with pytest.raises(ValueError, match="greater than 0"):
         compressor_ratio128.build_decode_specs(start_pos=0)

@@ -226,3 +226,53 @@ def test_attention_hca_decode_golden_matches_official_model(tiny_args, start_pos
     torch.testing.assert_close(tensors["comp_cache_out"], attn.kv_cache[:, tiny_args.window_size :], rtol=0, atol=0)
     torch.testing.assert_close(tensors["comp_kv_state_out"], attn.compressor.kv_state, rtol=0, atol=0)
     torch.testing.assert_close(tensors["comp_score_state_out"], attn.compressor.score_state, rtol=0, atol=0)
+
+def test_attention_hca_continuous_decode_crosses_ratio128_boundary(tiny_args) -> None:
+    attn = _make_official_attention(tiny_args)
+    prefill_len = 126
+    torch.manual_seed(20260706)
+    prefill_x = torch.randn(1, prefill_len, tiny_args.dim, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        expected = attn(prefill_x.clone(), start_pos=0)
+    tensors = _base_tensors(attn, prefill_x, start_pos=0)
+    tensors["comp_block_count"] = torch.tensor([prefill_len // 128], dtype=torch.int32)
+    _add_output_tensors(tensors, tiny_args, seq_len=prefill_len, decode=False)
+
+    attention_hca.golden_attention_hca_forward(tensors, start_pos=0)
+
+    torch.testing.assert_close(tensors["out"], expected, rtol=0, atol=0)
+    torch.testing.assert_close(tensors["kv_cache_out"], attn.kv_cache[:, : tiny_args.window_size], rtol=0, atol=0)
+    torch.testing.assert_close(tensors["comp_cache_out"], attn.kv_cache[:, tiny_args.window_size :], rtol=0, atol=0)
+    torch.testing.assert_close(tensors["comp_kv_state_out"], attn.compressor.kv_state, rtol=0, atol=0)
+    valid = torch.isfinite(attn.compressor.score_state)
+    torch.testing.assert_close(tensors["comp_score_state_out"][valid], attn.compressor.score_state[valid], rtol=0, atol=0)
+
+    for start_pos in (126, 127, 128, 129):
+        token = torch.randn(1, 1, tiny_args.dim, dtype=torch.bfloat16)
+        kv_cache_before = attn.kv_cache[:, : tiny_args.window_size].clone()
+        comp_cache_before = attn.kv_cache[:, tiny_args.window_size :].clone()
+        comp_kv_state_before = attn.compressor.kv_state.clone()
+        comp_score_state_before = attn.compressor.score_state.clone()
+
+        with torch.no_grad():
+            expected = attn(token.clone(), start_pos=start_pos)
+
+        tensors = _base_tensors(attn, token, start_pos=start_pos)
+        tensors["kv_cache"] = kv_cache_before
+        tensors["comp_kv_state"] = comp_kv_state_before
+        tensors["comp_score_state"] = comp_score_state_before
+        tensors["comp_cache"] = comp_cache_before
+        tensors["cache_pos"] = torch.tensor([start_pos % tiny_args.window_size], dtype=torch.int32)
+        tensors["comp_slot"] = torch.tensor([start_pos % 128], dtype=torch.int32)
+        tensors["comp_cache_slot"] = torch.tensor([start_pos // 128], dtype=torch.int32)
+        tensors["comp_should_compress"] = torch.tensor([int((start_pos + 1) % 128 == 0)], dtype=torch.int32)
+        _add_output_tensors(tensors, tiny_args, seq_len=1, decode=True)
+
+        attention_hca.golden_attention_hca_forward(tensors, start_pos=start_pos)
+
+        torch.testing.assert_close(tensors["out"], expected, rtol=0, atol=0)
+        torch.testing.assert_close(tensors["kv_cache_out"], attn.kv_cache[:, : tiny_args.window_size], rtol=0, atol=0)
+        torch.testing.assert_close(tensors["comp_cache_out"], attn.kv_cache[:, tiny_args.window_size :], rtol=0, atol=0)
+        torch.testing.assert_close(tensors["comp_kv_state_out"], attn.compressor.kv_state, rtol=0, atol=0)
+        torch.testing.assert_close(tensors["comp_score_state_out"], attn.compressor.score_state, rtol=0, atol=0)

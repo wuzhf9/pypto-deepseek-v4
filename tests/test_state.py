@@ -54,6 +54,13 @@ def _official_cos_sin(compress_ratio: int, max_seq_len: int) -> tuple[torch.Tens
     return freqs.real.contiguous(), freqs.imag.contiguous()
 
 
+def _tensor_from_spec(specs, name: str) -> torch.Tensor:
+    for spec in specs:
+        if spec.name == name:
+            return spec.create_tensor()
+    raise AssertionError(f"missing TensorSpec: {name}")
+
+
 def test_layer_specs_follow_official_config():
     state = DeepSeekV4State()
     assert len(state.layers) == FLASH_CONFIG.n_layers
@@ -139,7 +146,7 @@ def test_state_topk_inputs_match_official_model_helpers():
         csa = state.build_prefill_inputs(2, seq_len)
         _assert_matches_official_with_padding(csa["window_topk_idxs"], expected_window)
 
-    for start_pos in (1, 13, 127, 128, 255):
+    for start_pos in (1, 13, 126, 127, 128, 129, 255):
         expected_window = official_model.get_window_topk_idxs(
             FLASH_CONFIG.window_size,
             1,
@@ -199,8 +206,8 @@ def test_state_rope_inputs_match_official_model_profiles():
     torch.testing.assert_close(csa["attn_comp_sin"], compress4_sin[:12:COMPRESS_RATIO4], rtol=0, atol=0)
 
     hca = state.build_prefill_inputs(3, 129)
-    torch.testing.assert_close(hca["cos"], normal_cos[:129], rtol=0, atol=0)
-    torch.testing.assert_close(hca["sin"], normal_sin[:129], rtol=0, atol=0)
+    torch.testing.assert_close(hca["cos"], compress128_cos[:129], rtol=0, atol=0)
+    torch.testing.assert_close(hca["sin"], compress128_sin[:129], rtol=0, atol=0)
     torch.testing.assert_close(hca["comp_cos"], compress128_cos[:128:COMPRESS_RATIO128], rtol=0, atol=0)
     torch.testing.assert_close(hca["comp_sin"], compress128_sin[:128:COMPRESS_RATIO128], rtol=0, atol=0)
 
@@ -289,6 +296,39 @@ def test_ratio4_main_rope_uses_compress_profile():
     compress_cos, _ = build_deepseek_v4_rope_tables(compress_ratio=COMPRESS_RATIO4, max_seq_len=8)
     assert torch.equal(csa["cos"], compress_cos)
     assert not torch.equal(csa["cos"][1:], normal_cos[1:])
+
+
+def test_ratio128_main_rope_uses_compress_profile():
+    state = DeepSeekV4State()
+    hca_prefill = state.build_prefill_inputs(3, 8)
+    hca_decode = state.build_decode_inputs(3, 7)
+    normal_cos, _ = build_deepseek_v4_rope_tables(compress_ratio=0, max_seq_len=8)
+    compress_cos, _ = build_deepseek_v4_rope_tables(compress_ratio=COMPRESS_RATIO128, max_seq_len=8)
+    assert torch.equal(hca_prefill["cos"], compress_cos)
+    assert torch.equal(hca_decode["cos"], compress_cos[7:8])
+    assert not torch.equal(hca_prefill["cos"][1:], normal_cos[1:])
+
+
+def test_ratio128_standalone_specs_use_compress_profile():
+    import models.attention_hca as attention_hca
+    import models.block as block
+
+    seq_len = 8
+    start_pos = 7
+    normal_cos, _ = build_deepseek_v4_rope_tables(compress_ratio=0, max_seq_len=seq_len)
+    compress_cos, _ = build_deepseek_v4_rope_tables(compress_ratio=COMPRESS_RATIO128, max_seq_len=seq_len)
+
+    attn_prefill_cos = _tensor_from_spec(attention_hca.build_hca_prefill_specs(seq_len), "cos")
+    attn_decode_cos = _tensor_from_spec(attention_hca.build_hca_decode_specs(start_pos), "cos")
+    block_prefill_cos = _tensor_from_spec(block.build_hca_topk_prefill_specs(seq_len), "cos")
+    block_decode_cos = _tensor_from_spec(block.build_hca_topk_decode_specs(start_pos), "cos")
+
+    torch.testing.assert_close(attn_prefill_cos, compress_cos, rtol=0, atol=0)
+    torch.testing.assert_close(block_prefill_cos, compress_cos, rtol=0, atol=0)
+    torch.testing.assert_close(attn_decode_cos, compress_cos[start_pos : start_pos + 1], rtol=0, atol=0)
+    torch.testing.assert_close(block_decode_cos, compress_cos[start_pos : start_pos + 1], rtol=0, atol=0)
+    assert not torch.equal(attn_prefill_cos[1:], normal_cos[1:])
+    assert not torch.equal(block_prefill_cos[1:], normal_cos[1:])
 
 
 def test_update_layer_state_replaces_expected_tensors():

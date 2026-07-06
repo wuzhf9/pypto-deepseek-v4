@@ -543,7 +543,12 @@ class DeepSeekV4State:
         return state
 
     def _main_rope_for_layer(self, spec: LayerSpec, start_pos: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        rope = self._compress4_rope if spec.ratio == COMPRESS_RATIO4 else self._normal_rope
+        if spec.ratio == 0:
+            rope = self._normal_rope
+        elif spec.ratio == COMPRESS_RATIO128:
+            rope = self._compress128_rope
+        else:
+            rope = self._compress4_rope
         return materialize_rope_range(rope[0], rope[1], start_pos, seq_len)
 
     def _validate_layer_id(self, layer_id: int) -> None:
@@ -598,4 +603,3 @@ __all__ = [
     "precompute_freqs_cos_sin",
     "rope_profile_for_compress_ratio",
 ]
-

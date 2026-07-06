@@ -2081,7 +2081,10 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
     from models.golden import TensorSpec
 
     seq_pad = ceil_div(seq_len, HC_T_TILE) * HC_T_TILE
-    attn_cos_all, attn_sin_all = build_deepseek_v4_rope_tables(max_seq_len=start_pos + seq_len)
+    attn_cos_all, attn_sin_all = build_deepseek_v4_rope_tables(
+        compress_ratio=COMPRESS_RATIO128,
+        max_seq_len=start_pos + seq_len,
+    )
     local_cos, local_sin = materialize_rope_range(attn_cos_all, attn_sin_all, start_pos, seq_len)
     if decode:
         comp_should_compress = int((start_pos + 1) % COMPRESS_RATIO128 == 0)

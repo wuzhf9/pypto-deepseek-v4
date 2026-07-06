@@ -66,7 +66,7 @@ def rmsnorm_4096(
                 )
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_4096), EPS), [T_TILE, 1])
-            inv_rms = pl.recip(pl.sqrt(variance))
+            inv_rms = pl.rsqrt(variance, high_precision=True)
 
             for kb in pl.range(BLOCKS_4096):
                 k0 = kb * D_TILE
@@ -114,7 +114,7 @@ def rmsnorm_1024(
                 )
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_1024), EPS), [T_TILE, 1])
-            inv_rms = pl.recip(pl.sqrt(variance))
+            inv_rms = pl.rsqrt(variance, high_precision=True)
 
             for kb in pl.range(BLOCKS_1024):
                 k0 = kb * D_TILE
@@ -162,7 +162,7 @@ def rmsnorm_512(
                 )
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_512), EPS), [T_TILE, 1])
-            inv_rms = pl.recip(pl.sqrt(variance))
+            inv_rms = pl.rsqrt(variance, high_precision=True)
 
             for kb in pl.range(BLOCKS_512):
                 k0 = kb * D_TILE
@@ -210,7 +210,7 @@ def rmsnorm_128(
                 )
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_128), EPS), [T_TILE, 1])
-            inv_rms = pl.recip(pl.sqrt(variance))
+            inv_rms = pl.rsqrt(variance, high_precision=True)
 
             for kb in pl.range(BLOCKS_128):
                 k0 = kb * D_TILE

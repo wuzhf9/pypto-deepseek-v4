@@ -526,7 +526,10 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
 
     from models.golden import TensorSpec
 
-    attn_cos_all, attn_sin_all = build_deepseek_v4_rope_tables(max_seq_len=start_pos + seq_len)
+    attn_cos_all, attn_sin_all = build_deepseek_v4_rope_tables(
+        compress_ratio=COMPRESS_RATIO,
+        max_seq_len=start_pos + seq_len,
+    )
     local_cos, local_sin = materialize_rope_range(attn_cos_all, attn_sin_all, start_pos, seq_len)
     if decode:
         comp_should = int((start_pos + 1) % COMPRESS_RATIO == 0)
