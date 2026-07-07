@@ -17,6 +17,7 @@ from models import embedding as embedding_kernel
 from models import head as head_kernel
 from models.config import FLASH_CONFIG, DeepSeekV4FlashConfig
 from models.golden import TensorSpec
+from serving.profile import ProfileRecorder
 from serving.state import COMPRESS_RATIO4, COMPRESS_RATIO128, DEFAULT_MAX_SEQ_LEN, DeepSeekV4State, LayerSpec
 from serving.weight_loader import DeepSeekV4WeightLoader
 
@@ -121,14 +122,14 @@ class DeepSeekV4Runner:
         self.config = config
         self.max_layers = config.n_layers if max_layers is None else int(max_layers)
         self.run_head = bool(run_head)
-        self.profile = bool(profile)
+        self.profiler = ProfileRecorder(enabled=profile)
         self.verbose_layer_log = bool(verbose_layer_log)
         self.weight_loader = DeepSeekV4WeightLoader(
             checkpoint_path,
             weight_index=weight_index,
             config=config,
             default_device="cpu",
-            profile=self.profile,
+            profile=self.profiler.enabled,
             routed_pack_cache_dir=routed_pack_cache_dir,
         )
         self.state = DeepSeekV4State(config=config, max_seq_len=max_seq_len, device="cpu")
@@ -141,105 +142,87 @@ class DeepSeekV4Runner:
             raise ValueError(f"unsupported backend: {backend!r}")
 
     def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
-        total_start = time.perf_counter()
         input_ids = self._validate_prefill_input_ids(input_ids)
         seq_len = int(input_ids.shape[1])
+        with self.profiler.timer("prefill.total", seq_len=seq_len, max_layers=self.max_layers, run_head=self.run_head):
+            hidden_3d = self._run_embedding(input_ids)
+            hidden = hidden_3d.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
 
-        hidden_3d = self._run_embedding(input_ids)
-        hidden = hidden_3d.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+            for layer_id in range(self.max_layers):
+                hidden = self._run_block(layer_id, hidden, input_ids=input_ids, start_pos=0, decode=False)
+                with self.profiler.timer("layer.release", layer=layer_id, mode="prefill"):
+                    self._release_layer_weights(layer_id)
 
-        for layer_id in range(self.max_layers):
-            hidden = self._run_block(layer_id, hidden, input_ids=input_ids, start_pos=0, decode=False)
-            release_start = time.perf_counter()
-            self._release_layer_weights(layer_id)
-            self._profile("layer.release", release_start, layer=layer_id, mode="prefill")
-
-        if not self.run_head:
-            self._profile("prefill.total", total_start, seq_len=seq_len, max_layers=self.max_layers, run_head=False)
-            return hidden
-        out = self._run_head(hidden)
-        self._profile("prefill.total", total_start, seq_len=seq_len, max_layers=self.max_layers, run_head=True)
-        return out
+            if not self.run_head:
+                return hidden
+            return self._run_head(hidden)
 
     def decode(self, input_ids: torch.Tensor, *, start_pos: int) -> torch.Tensor:
-        total_start = time.perf_counter()
         input_ids = self._validate_decode_input_ids(input_ids, start_pos=start_pos)
+        with self.profiler.timer("decode.total", start_pos=start_pos, max_layers=self.max_layers, run_head=self.run_head):
+            hidden_3d = self._run_embedding(input_ids)
+            hidden = hidden_3d.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
 
-        hidden_3d = self._run_embedding(input_ids)
-        hidden = hidden_3d.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+            for layer_id in range(self.max_layers):
+                hidden = self._run_block(layer_id, hidden, input_ids=input_ids, start_pos=start_pos, decode=True)
+                with self.profiler.timer("layer.release", layer=layer_id, mode="decode"):
+                    self._release_layer_weights(layer_id)
 
-        for layer_id in range(self.max_layers):
-            hidden = self._run_block(layer_id, hidden, input_ids=input_ids, start_pos=start_pos, decode=True)
-            release_start = time.perf_counter()
-            self._release_layer_weights(layer_id)
-            self._profile("layer.release", release_start, layer=layer_id, mode="decode")
-
-        if not self.run_head:
-            self._profile("decode.total", total_start, start_pos=start_pos, max_layers=self.max_layers, run_head=False)
-            return hidden
-        out = self._run_head(hidden)
-        self._profile("decode.total", total_start, start_pos=start_pos, max_layers=self.max_layers, run_head=True)
-        return out
+            if not self.run_head:
+                return hidden
+            return self._run_head(hidden)
 
     def close(self) -> None:
         self.backend.close()
         self.weight_loader.close()
 
     def _run_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        total_start = time.perf_counter()
-        specs = embedding_kernel.build_embedding_specs(seq_len=int(input_ids.shape[1]))
-        start = time.perf_counter()
-        weight = self.weight_loader.get_embedding_weight()
-        self._profile("embedding.weight", start)
-        start = time.perf_counter()
-        tensors = self._materialize_specs(
-            specs,
-            {
-                "input_ids": input_ids,
-                "weight": weight,
-            },
-        )
-        self._profile("embedding.materialize", start)
-        start = time.perf_counter()
-        outputs = self.backend.run(
-            _KernelCase("embedding_test", embedding_kernel.embedding_test, embedding_kernel.build_embedding_specs),
-            specs,
-            tensors,
-        )
-        self._profile_backend("embedding.kernel", start)
-        out = outputs["out"].contiguous()
-        self._profile("embedding.total", total_start, seq_len=int(input_ids.shape[1]))
-        return out
+        seq_len = int(input_ids.shape[1])
+        with self.profiler.timer("embedding.total", seq_len=seq_len):
+            specs = embedding_kernel.build_embedding_specs(seq_len=seq_len)
+            with self.profiler.timer("embedding.weight"):
+                weight = self.weight_loader.get_embedding_weight()
+            with self.profiler.timer("embedding.materialize"):
+                tensors = self._materialize_specs(
+                    specs,
+                    {
+                        "input_ids": input_ids,
+                        "weight": weight,
+                    },
+                )
+            with self.profiler.backend_timer("embedding.kernel", self.backend):
+                outputs = self.backend.run(
+                    _KernelCase("embedding_test", embedding_kernel.embedding_test, embedding_kernel.build_embedding_specs),
+                    specs,
+                    tensors,
+                )
+            return outputs["out"].contiguous()
 
     def _run_head(self, hidden: torch.Tensor) -> torch.Tensor:
-        total_start = time.perf_counter()
-        specs = head_kernel.build_head_specs(seq_len=int(hidden.shape[1]))
-        start = time.perf_counter()
-        weights = self.weight_loader.get_head_weights()
-        self._profile("head.weight", start)
-        start = time.perf_counter()
-        tensors = self._materialize_specs(
-            specs,
-            {
-                "x": hidden,
-                "hc_fn_t": weights.hc_fn_t,
-                "hc_scale": weights.hc_scale,
-                "hc_base": weights.hc_base,
-                "norm_w": weights.norm_w,
-                "head_w": weights.head_w,
-            },
-        )
-        self._profile("head.materialize", start)
-        start = time.perf_counter()
-        outputs = self.backend.run(
-            _KernelCase("head_test", head_kernel.head_test, head_kernel.build_head_specs),
-            specs,
-            tensors,
-        )
-        self._profile_backend("head.kernel", start)
-        out = outputs["logits"].contiguous()
-        self._profile("head.total", total_start, seq_len=int(hidden.shape[1]))
-        return out
+        seq_len = int(hidden.shape[1])
+        with self.profiler.timer("head.total", seq_len=seq_len):
+            specs = head_kernel.build_head_specs(seq_len=seq_len)
+            with self.profiler.timer("head.weight"):
+                weights = self.weight_loader.get_head_weights()
+            with self.profiler.timer("head.materialize"):
+                tensors = self._materialize_specs(
+                    specs,
+                    {
+                        "x": hidden,
+                        "hc_fn_t": weights.hc_fn_t,
+                        "hc_scale": weights.hc_scale,
+                        "hc_base": weights.hc_base,
+                        "norm_w": weights.norm_w,
+                        "head_w": weights.head_w,
+                    },
+                )
+            with self.profiler.backend_timer("head.kernel", self.backend):
+                outputs = self.backend.run(
+                    _KernelCase("head_test", head_kernel.head_test, head_kernel.build_head_specs),
+                    specs,
+                    tensors,
+                )
+            return outputs["logits"].contiguous()
 
     def _run_block(
         self,
@@ -250,7 +233,6 @@ class DeepSeekV4Runner:
         start_pos: int,
         decode: bool,
     ) -> torch.Tensor:
-        total_start = time.perf_counter()
         spec = self.state.layer_spec(layer_id)
         seq_len = int(hidden.shape[1])
         case = self._block_case(spec, decode=decode, start_pos=start_pos, seq_len=seq_len)
@@ -263,31 +245,27 @@ class DeepSeekV4Runner:
                 flush=True,
             )
 
-        start = time.perf_counter()
-        if self.profile:
-            self.weight_loader.reset_profile_stats()
-        values = self._layer_values(layer_id, hidden, input_ids=input_ids, start_pos=start_pos, decode=decode)
-        self._profile("layer.values", start, layer=layer_id, mode=mode, ratio=spec.ratio)
-        self._profile_weight_loader("layer.weight_loader", layer=layer_id, mode=mode, ratio=spec.ratio)
-        start = time.perf_counter()
-        tensors = self._materialize_specs(specs, values)
-        self._profile("layer.materialize", start, layer=layer_id, mode=mode, ratio=spec.ratio)
-        start = time.perf_counter()
-        outputs = self.backend.run(case, specs, tensors)
-        self._profile_backend("layer.kernel", start, layer=layer_id, mode=mode, ratio=spec.ratio, kernel=case.name)
-        start = time.perf_counter()
-        self.state.update_layer_state(layer_id, outputs)
-        self._profile("layer.state_update", start, layer=layer_id, mode=mode, ratio=spec.ratio)
-        out = outputs["out"].contiguous()
-        if self.verbose_layer_log:
-            finite = bool(torch.isfinite(out.float()).all().item())
-            print(
-                f"[RUNNER] layer {layer_id} done: output={tuple(out.shape)} "
-                f"dtype={out.dtype} finite={finite}",
-                flush=True,
-            )
-        self._profile("layer.total", total_start, layer=layer_id, mode=mode, ratio=spec.ratio, kernel=case.name)
-        return out
+        with self.profiler.timer("layer.total", layer=layer_id, mode=mode, ratio=spec.ratio, kernel=case.name):
+            with self.profiler.timer("layer.values", layer=layer_id, mode=mode, ratio=spec.ratio):
+                if self.profiler.enabled:
+                    self.weight_loader.reset_profile_stats()
+                values = self._layer_values(layer_id, hidden, input_ids=input_ids, start_pos=start_pos, decode=decode)
+            self.profiler.record_weight_loader("layer.weight_loader", self.weight_loader, layer=layer_id, mode=mode, ratio=spec.ratio)
+            with self.profiler.timer("layer.materialize", layer=layer_id, mode=mode, ratio=spec.ratio):
+                tensors = self._materialize_specs(specs, values)
+            with self.profiler.backend_timer("layer.kernel", self.backend, layer=layer_id, mode=mode, ratio=spec.ratio, kernel=case.name):
+                outputs = self.backend.run(case, specs, tensors)
+            with self.profiler.timer("layer.state_update", layer=layer_id, mode=mode, ratio=spec.ratio):
+                self.state.update_layer_state(layer_id, outputs)
+            out = outputs["out"].contiguous()
+            if self.verbose_layer_log:
+                finite = bool(torch.isfinite(out.float()).all().item())
+                print(
+                    f"[RUNNER] layer {layer_id} done: output={tuple(out.shape)} "
+                    f"dtype={out.dtype} finite={finite}",
+                    flush=True,
+                )
+            return out
 
     def _layer_values(
         self,
@@ -299,30 +277,24 @@ class DeepSeekV4Runner:
         decode: bool,
     ) -> dict[str, torch.Tensor]:
         spec = self.state.layer_spec(layer_id)
-        phase_start = time.perf_counter()
-        aux = self.state.build_decode_inputs(layer_id, start_pos) if decode else self.state.build_prefill_inputs(layer_id, int(hidden.shape[1]))
-        self._profile("layer.values.aux", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
-        phase_start = time.perf_counter()
-        hc = self.weight_loader.get_layer_hc(layer_id)
-        self._profile("layer.values.hc", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
-        phase_start = time.perf_counter()
-        attn = self.weight_loader.get_layer_attention_common(layer_id)
-        self._profile("layer.values.attn", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
-        phase_start = time.perf_counter()
-        gate = self.weight_loader.get_layer_moe_gate(layer_id, hash_route=spec.hash_route)
-        self._profile("layer.values.gate", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
-        phase_start = time.perf_counter()
-        shared = self.weight_loader.get_layer_moe_shared(layer_id)
-        self._profile("layer.values.shared", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
-        phase_start = time.perf_counter()
-        routed = self.weight_loader.get_layer_moe_routed_pack(layer_id, release_each_expert=True)
-        self._profile("layer.values.routed_pack", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
-        phase_start = time.perf_counter()
-        ffn_norm_w = self.weight_loader.get_tensor(
-            f"layers.{layer_id}.ffn_norm.weight",
-            dtype=torch.bfloat16,
-        )
-        self._profile("layer.values.ffn_norm", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
+        mode = "decode" if decode else "prefill"
+        with self.profiler.timer("layer.values.aux", layer=layer_id, mode=mode, ratio=spec.ratio):
+            aux = self.state.build_decode_inputs(layer_id, start_pos) if decode else self.state.build_prefill_inputs(layer_id, int(hidden.shape[1]))
+        with self.profiler.timer("layer.values.hc", layer=layer_id, mode=mode, ratio=spec.ratio):
+            hc = self.weight_loader.get_layer_hc(layer_id)
+        with self.profiler.timer("layer.values.attn", layer=layer_id, mode=mode, ratio=spec.ratio):
+            attn = self.weight_loader.get_layer_attention_common(layer_id)
+        with self.profiler.timer("layer.values.gate", layer=layer_id, mode=mode, ratio=spec.ratio):
+            gate = self.weight_loader.get_layer_moe_gate(layer_id, hash_route=spec.hash_route)
+        with self.profiler.timer("layer.values.shared", layer=layer_id, mode=mode, ratio=spec.ratio):
+            shared = self.weight_loader.get_layer_moe_shared(layer_id)
+        with self.profiler.timer("layer.values.routed_pack", layer=layer_id, mode=mode, ratio=spec.ratio):
+            routed = self.weight_loader.get_layer_moe_routed_pack(layer_id, release_each_expert=True)
+        with self.profiler.timer("layer.values.ffn_norm", layer=layer_id, mode=mode, ratio=spec.ratio):
+            ffn_norm_w = self.weight_loader.get_tensor(
+                f"layers.{layer_id}.ffn_norm.weight",
+                dtype=torch.bfloat16,
+            )
 
         values: dict[str, torch.Tensor] = {
             "x": hidden,
@@ -363,9 +335,8 @@ class DeepSeekV4Runner:
             values["gate_bias"] = gate.gate_bias
 
         if spec.ratio == COMPRESS_RATIO128:
-            phase_start = time.perf_counter()
-            comp = self.weight_loader.get_layer_compressor_ratio128(layer_id)
-            self._profile("layer.values.compressor128", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
+            with self.profiler.timer("layer.values.compressor128", layer=layer_id, mode=mode, ratio=spec.ratio):
+                comp = self.weight_loader.get_layer_compressor_ratio128(layer_id)
             values.update(
                 {
                     "comp_wkv_t": comp.wkv_t,
@@ -375,12 +346,10 @@ class DeepSeekV4Runner:
                 }
             )
         elif spec.ratio == COMPRESS_RATIO4:
-            phase_start = time.perf_counter()
-            attn_comp = self.weight_loader.get_layer_compressor_ratio4_attention(layer_id)
-            self._profile("layer.values.attn_compressor4", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
-            phase_start = time.perf_counter()
-            indexer = self.weight_loader.get_layer_indexer(layer_id)
-            self._profile("layer.values.indexer", phase_start, layer=layer_id, mode="decode" if decode else "prefill", ratio=spec.ratio)
+            with self.profiler.timer("layer.values.attn_compressor4", layer=layer_id, mode=mode, ratio=spec.ratio):
+                attn_comp = self.weight_loader.get_layer_compressor_ratio4_attention(layer_id)
+            with self.profiler.timer("layer.values.indexer", layer=layer_id, mode=mode, ratio=spec.ratio):
+                indexer = self.weight_loader.get_layer_indexer(layer_id)
             values.update(
                 {
                     "attn_comp_wkv_t": attn_comp.wkv_t,
@@ -453,38 +422,6 @@ class DeepSeekV4Runner:
 
     def _release_layer_weights(self, layer_id: int) -> None:
         self.weight_loader.release_prefix(f"layers.{layer_id}.")
-
-    def _profile(self, name: str, start: float, **fields: Any) -> None:
-        if not self.profile:
-            return
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        details = " ".join(f"{key}={value}" for key, value in fields.items())
-        suffix = f" {details}" if details else ""
-        print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms{suffix}", flush=True)
-
-    def _profile_backend(self, name: str, start: float, **fields: Any) -> None:
-        if not self.profile:
-            return
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        compile_ms = getattr(self.backend, "last_compile_seconds", 0.0) * 1000.0
-        run_ms = getattr(self.backend, "last_run_seconds", 0.0) * 1000.0
-        cache_hit = getattr(self.backend, "last_compile_cache_hit", False)
-        fields = {
-            **fields,
-            "compile_ms": f"{compile_ms:.3f}",
-            "run_ms": f"{run_ms:.3f}",
-            "cache_hit": cache_hit,
-        }
-        details = " ".join(f"{key}={value}" for key, value in fields.items())
-        print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms {details}", flush=True)
-
-    def _profile_weight_loader(self, name: str, **fields: Any) -> None:
-        if not self.profile:
-            return
-        parts = [f"{key}={value}" for key, value in fields.items()]
-        for stat_name, count, elapsed_ms in self.weight_loader.profile_summary():
-            parts.append(f"{stat_name}={elapsed_ms:.3f}ms/{count}")
-        print(f"[PROFILE] {name}: {' '.join(parts)}", flush=True)
 
     def _validate_prefill_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
