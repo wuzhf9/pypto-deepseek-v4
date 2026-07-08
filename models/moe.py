@@ -31,6 +31,7 @@ VOCAB = M.vocab_size
 ROUTE_SCALE = M.route_scale
 SWIGLU_LIMIT = M.swiglu_limit
 DEFAULT_SEQ_LEN = 8
+S_DECODE = 1
 
 
 @pl.jit.inline
@@ -114,6 +115,91 @@ def _run_route_major_routed_experts(
                         k0 = kb * K_TILE
                         hk = pl.slice(hidden_tile_full, [T_TILE, K_TILE], [0, k0], valid_shape=[1, K_TILE])
                         w2k = pl.slice(routed_w2_flat, [K_TILE, O_TILE], [w2_start + k0, o0])
+                        acc = pl.matmul_acc(acc, hk, w2k)
+                    acc_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                    dst = t * TOPK + k
+                    route_y_flat = pl.assemble(route_y_flat, pl.slice(acc_bf16, [1, O_TILE], [0, 0]), [dst, o0])
+
+    return pl.reshape(route_y_flat, [B, tokens, TOPK, HIDDEN])
+
+
+@pl.jit.inline
+def _run_selected_experts_decode(
+    x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
+    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
+    selected_w1_t: pl.Tensor[[TOPK, HIDDEN, MOE_INTER_DIM], pl.BF16],
+    selected_w2_t: pl.Tensor[[TOPK, MOE_INTER_DIM, HIDDEN], pl.BF16],
+    selected_w3_t: pl.Tensor[[TOPK, HIDDEN, MOE_INTER_DIM], pl.BF16],
+    route_y: pl.Tensor[[B, S_DYN, TOPK, HIDDEN], pl.BF16],
+):
+    """Compute decode routed experts from top-k ordered selected weights."""
+    x.bind_dynamic(1, S_DYN)
+    weights.bind_dynamic(1, S_DYN)
+    route_y.bind_dynamic(1, S_DYN)
+
+    tokens = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [tokens, HIDDEN])
+    weights_flat = pl.reshape(weights, [tokens, TOPK])
+    route_y_flat = pl.reshape(route_y, [tokens * TOPK, HIDDEN])
+    selected_w1_flat = pl.reshape(selected_w1_t, [TOPK * HIDDEN, MOE_INTER_DIM])
+    selected_w2_flat = pl.reshape(selected_w2_t, [TOPK * MOE_INTER_DIM, HIDDEN])
+    selected_w3_flat = pl.reshape(selected_w3_t, [TOPK * HIDDEN, MOE_INTER_DIM])
+
+    for k in pl.range(TOPK):
+        w1_start = k * HIDDEN
+        w2_start = k * MOE_INTER_DIM
+        w3_start = k * HIDDEN
+        for t in pl.range(tokens):
+            route_weight_scalar = pl.read(weights_flat, [t, k])
+            gate_tile_fp32 = pl.create_tensor([T_TILE, MOE_INTER_DIM], dtype=pl.FP32)
+            up_tile_fp32 = pl.create_tensor([T_TILE, MOE_INTER_DIM], dtype=pl.FP32)
+
+            for og_idx in pl.spmd(MOE_INTER_O_BLOCKS // OUT_GROUP, name_hint="moe_selected_gate_up"):
+                og = og_idx * OUT_GROUP
+                for o_inner in pl.pipeline(OUT_GROUP, stage=2):
+                    o0 = (og + o_inner) * O_TILE
+                    x0 = pl.slice(x_flat, [T_TILE, K_TILE], [t, 0], valid_shape=[1, K_TILE])
+                    w10 = pl.slice(selected_w1_flat, [K_TILE, O_TILE], [w1_start, o0])
+                    w30 = pl.slice(selected_w3_flat, [K_TILE, O_TILE], [w3_start, o0])
+                    gate_acc = pl.matmul(x0, w10, out_dtype=pl.FP32)
+                    up_acc = pl.matmul(x0, w30, out_dtype=pl.FP32)
+                    for kb in pl.pipeline(1, HIDDEN_K_BLOCKS, stage=2):
+                        k0 = kb * K_TILE
+                        xk = pl.slice(x_flat, [T_TILE, K_TILE], [t, k0], valid_shape=[1, K_TILE])
+                        w1k = pl.slice(selected_w1_flat, [K_TILE, O_TILE], [w1_start + k0, o0])
+                        w3k = pl.slice(selected_w3_flat, [K_TILE, O_TILE], [w3_start + k0, o0])
+                        gate_acc = pl.matmul_acc(gate_acc, xk, w1k)
+                        up_acc = pl.matmul_acc(up_acc, xk, w3k)
+                    gate_tile_fp32[:, o0 : o0 + O_TILE] = gate_acc
+                    up_tile_fp32[:, o0 : o0 + O_TILE] = up_acc
+
+            hidden_tile_full = pl.create_tensor([T_TILE, MOE_INTER_DIM], dtype=pl.BF16)
+            for ob in pl.spmd(MOE_INTER_O_BLOCKS, name_hint="moe_selected_swiglu"):
+                o0 = ob * O_TILE
+                gate_bf16 = pl.cast(gate_tile_fp32[:, o0 : o0 + O_TILE], target_type=pl.BF16, mode="rint")
+                up_bf16 = pl.cast(up_tile_fp32[:, o0 : o0 + O_TILE], target_type=pl.BF16, mode="rint")
+                gate_tile = pl.cast(gate_bf16, target_type=pl.FP32)
+                up_tile = pl.cast(up_bf16, target_type=pl.FP32)
+                limit = pl.full([T_TILE, O_TILE], dtype=pl.FP32, value=SWIGLU_LIMIT)
+                neg_limit = pl.full([T_TILE, O_TILE], dtype=pl.FP32, value=-SWIGLU_LIMIT)
+                gate_clamped = pl.minimum(gate_tile, limit)
+                up_clamped = pl.minimum(pl.maximum(up_tile, neg_limit), limit)
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_clamped)), 1.0))
+                hidden_fp32 = pl.mul(pl.mul(pl.mul(gate_clamped, sigmoid), up_clamped), route_weight_scalar)
+                hidden_tile = pl.cast(hidden_fp32, target_type=pl.BF16, mode="rint")
+                hidden_tile_full[:, o0 : o0 + O_TILE] = pl.fillpad(hidden_tile, pad_value=pl.PadValue.zero)
+
+            for og_idx in pl.spmd(HIDDEN_O_BLOCKS // OUT_GROUP, name_hint="moe_selected_w2"):
+                og = og_idx * OUT_GROUP
+                for o_inner in pl.pipeline(OUT_GROUP, stage=2):
+                    o0 = (og + o_inner) * O_TILE
+                    h0 = pl.slice(hidden_tile_full, [T_TILE, K_TILE], [0, 0], valid_shape=[1, K_TILE])
+                    w20 = pl.slice(selected_w2_flat, [K_TILE, O_TILE], [w2_start, o0])
+                    acc = pl.matmul(h0, w20, out_dtype=pl.FP32)
+                    for kb in pl.pipeline(1, MOE_INTER_K_BLOCKS, stage=2):
+                        k0 = kb * K_TILE
+                        hk = pl.slice(hidden_tile_full, [T_TILE, K_TILE], [0, k0], valid_shape=[1, K_TILE])
+                        w2k = pl.slice(selected_w2_flat, [K_TILE, O_TILE], [w2_start + k0, o0])
                         acc = pl.matmul_acc(acc, hk, w2k)
                     acc_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
                     dst = t * TOPK + k
@@ -223,6 +309,37 @@ def moe_topk_fwd(
     return out
 
 
+@pl.jit.inline
+def moe_selected_decode_experts_fwd(
+    x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
+    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
+    selected_w1_t: pl.Tensor[[TOPK, HIDDEN, MOE_INTER_DIM], pl.BF16],
+    selected_w2_t: pl.Tensor[[TOPK, MOE_INTER_DIM, HIDDEN], pl.BF16],
+    selected_w3_t: pl.Tensor[[TOPK, HIDDEN, MOE_INTER_DIM], pl.BF16],
+    shared_w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
+    shared_w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
+    shared_w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
+):
+    """Run selected decode experts after gate indices/weights are known."""
+    x.bind_dynamic(1, S_DYN)
+    tokens = pl.tensor.dim(x, 1)
+    route_y = pl.create_tensor([B, tokens, TOPK, HIDDEN], dtype=pl.BF16)
+    shared_y = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
+
+    _run_selected_experts_decode(
+        x,
+        weights,
+        selected_w1_t,
+        selected_w2_t,
+        selected_w3_t,
+        route_y,
+    )
+    expert_shared_fwd(x, shared_w1_t, shared_w2_t, shared_w3_t, shared_y)
+    _combine_route_major(route_y, shared_y, out)
+    return out
+
+
 @pl.jit
 def moe_hash_test(
     x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
@@ -277,6 +394,32 @@ def moe_topk_test(
         shared_w3_t,
         out,
     )
+
+
+@pl.jit
+def moe_selected_decode_experts_test(
+    x: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
+    weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
+    selected_w1_t: pl.Tensor[[TOPK, HIDDEN, MOE_INTER_DIM], pl.BF16],
+    selected_w2_t: pl.Tensor[[TOPK, MOE_INTER_DIM, HIDDEN], pl.BF16],
+    selected_w3_t: pl.Tensor[[TOPK, HIDDEN, MOE_INTER_DIM], pl.BF16],
+    shared_w1_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
+    shared_w2_t: pl.Tensor[[MOE_INTER_DIM, HIDDEN], pl.BF16],
+    shared_w3_t: pl.Tensor[[HIDDEN, MOE_INTER_DIM], pl.BF16],
+    out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
+):
+    return moe_selected_decode_experts_fwd(
+        x,
+        weights,
+        selected_w1_t,
+        selected_w2_t,
+        selected_w3_t,
+        shared_w1_t,
+        shared_w2_t,
+        shared_w3_t,
+        out,
+    )
+
 
 def _expert_forward_golden(
     x: torch.Tensor,
@@ -355,6 +498,39 @@ def golden_moe_forward(tensors, *, hash_route: bool):
     )
     out = (routed_acc + shared_y.reshape(tokens, HIDDEN).float()).to(torch.bfloat16).reshape(bsz, seq_len, HIDDEN)
 
+    tensors["out"][:] = out
+
+
+def golden_moe_selected_decode_experts_forward(tensors):
+    """Golden for selected decode experts after gate weights are known."""
+    x = tensors["x"]
+    bsz, seq_len, _ = x.shape
+    if bsz != B:
+        raise ValueError(f"selected decode expects batch {B}, got {bsz}")
+    if seq_len != S_DECODE:
+        raise ValueError(f"selected decode expects sequence length {S_DECODE}, got {seq_len}")
+
+    route_y = torch.zeros(bsz, seq_len, TOPK, HIDDEN, dtype=torch.bfloat16)
+    weights = tensors["weights"]
+    for k in range(TOPK):
+        route_weight = weights[:, :, k : k + 1]
+        _, _, _, route_out = _expert_forward_golden(
+            x,
+            tensors["selected_w1_t"][k],
+            tensors["selected_w2_t"][k],
+            tensors["selected_w3_t"][k],
+            route_weight,
+        )
+        route_y[:, :, k, :] = route_out
+
+    _, _, _, shared_y = _expert_forward_golden(
+        x,
+        tensors["shared_w1_t"],
+        tensors["shared_w2_t"],
+        tensors["shared_w3_t"],
+        weights=None,
+    )
+    out = (route_y.float().sum(dim=2) + shared_y.float()).to(torch.bfloat16)
     tensors["out"][:] = out
 
 
@@ -439,6 +615,51 @@ def build_moe_topk_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return _build_tensor_specs(seq_len, hash_route=False)
 
 
+def build_moe_selected_decode_specs(seq_len: int = S_DECODE):
+    from models.golden import TensorSpec
+
+    if seq_len != S_DECODE:
+        raise ValueError(f"selected decode specs require seq_len={S_DECODE}, got {seq_len}")
+
+    def init_x():
+        return torch.randn(B, seq_len, HIDDEN) * 0.2
+
+    def init_weights():
+        weights = torch.rand(B, seq_len, TOPK, dtype=torch.float32)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        return weights * ROUTE_SCALE
+
+    def init_selected_w1_t():
+        return torch.randn(TOPK, HIDDEN, MOE_INTER_DIM) * 0.02
+
+    def init_selected_w2_t():
+        return torch.randn(TOPK, MOE_INTER_DIM, HIDDEN) * 0.02
+
+    def init_selected_w3_t():
+        return torch.randn(TOPK, HIDDEN, MOE_INTER_DIM) * 0.02
+
+    def init_shared_w1_t():
+        return torch.randn(HIDDEN, MOE_INTER_DIM) * 0.02
+
+    def init_shared_w2_t():
+        return torch.randn(MOE_INTER_DIM, HIDDEN) * 0.02
+
+    def init_shared_w3_t():
+        return torch.randn(HIDDEN, MOE_INTER_DIM) * 0.02
+
+    return [
+        TensorSpec("x", [B, seq_len, HIDDEN], torch.bfloat16, init_value=init_x),
+        TensorSpec("weights", [B, seq_len, TOPK], torch.float32, init_value=init_weights),
+        TensorSpec("selected_w1_t", [TOPK, HIDDEN, MOE_INTER_DIM], torch.bfloat16, init_value=init_selected_w1_t),
+        TensorSpec("selected_w2_t", [TOPK, MOE_INTER_DIM, HIDDEN], torch.bfloat16, init_value=init_selected_w2_t),
+        TensorSpec("selected_w3_t", [TOPK, HIDDEN, MOE_INTER_DIM], torch.bfloat16, init_value=init_selected_w3_t),
+        TensorSpec("shared_w1_t", [HIDDEN, MOE_INTER_DIM], torch.bfloat16, init_value=init_shared_w1_t),
+        TensorSpec("shared_w2_t", [MOE_INTER_DIM, HIDDEN], torch.bfloat16, init_value=init_shared_w2_t),
+        TensorSpec("shared_w3_t", [HIDDEN, MOE_INTER_DIM], torch.bfloat16, init_value=init_shared_w3_t),
+        TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
+    ]
+
+
 def main() -> int:
     import argparse
 
@@ -448,7 +669,7 @@ def main() -> int:
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-s", "--seq-len", type=int, default=DEFAULT_SEQ_LEN)
-    parser.add_argument("--case", choices=["all", "hash", "topk"], default="all")
+    parser.add_argument("--case", choices=["all", "hash", "topk", "selected-decode"], default="all")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
@@ -464,18 +685,25 @@ def main() -> int:
     all_cases = {
         "hash": ("moe-hash", moe_hash_test, build_moe_hash_specs, golden_moe_hash),
         "topk": ("moe-topk", moe_topk_test, build_moe_topk_specs, golden_moe_topk),
+        "selected-decode": (
+            "moe-selected-decode",
+            moe_selected_decode_experts_test,
+            build_moe_selected_decode_specs,
+            golden_moe_selected_decode_experts_forward,
+        ),
     }
     if args.case == "all":
-        cases = [all_cases["hash"], all_cases["topk"]]
+        cases = [all_cases["hash"], all_cases["topk"], all_cases["selected-decode"]]
     else:
         cases = [all_cases[args.case]]
 
     failed = False
     for name, fn, build_specs, golden_fn in cases:
         print(f"[CASE] {name}", flush=True)
+        seq_len = S_DECODE if name == "moe-selected-decode" else args.seq_len
         result = run_jit(
             fn=fn,
-            specs=build_specs(args.seq_len),
+            specs=build_specs(seq_len),
             golden_fn=golden_fn,
             runtime_cfg=runtime_cfg,
             compile_only=args.compile_only,
@@ -504,15 +732,21 @@ __all__ = [
     "ROUTE_SCALE",
     "SWIGLU_LIMIT",
     "DEFAULT_SEQ_LEN",
+    "S_DECODE",
     "_run_route_major_routed_experts",
+    "_run_selected_experts_decode",
     "_combine_route_major",
     "moe_hash_fwd",
     "moe_topk_fwd",
+    "moe_selected_decode_experts_fwd",
     "moe_hash_test",
     "moe_topk_test",
+    "moe_selected_decode_experts_test",
     "golden_moe_forward",
+    "golden_moe_selected_decode_experts_forward",
     "golden_moe_hash",
     "golden_moe_topk",
     "build_moe_hash_specs",
     "build_moe_topk_specs",
+    "build_moe_selected_decode_specs",
 ]

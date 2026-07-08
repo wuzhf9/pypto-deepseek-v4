@@ -127,6 +127,31 @@ def _moe_tensors(module: torch.nn.Module, x: torch.Tensor, input_ids: torch.Tens
         tensors["gate_bias"] = module.gate.bias.detach().clone()
     return tensors
 
+
+def _selected_decode_tensors(
+    packed_tensors: dict[str, torch.Tensor],
+    *,
+    hash_route: bool,
+) -> dict[str, torch.Tensor]:
+    gate_tensors = dict(packed_tensors)
+    gate_tensors["indices"] = torch.zeros(1, 1, TOPK, dtype=torch.int32)
+    gate_tensors["weights"] = torch.zeros(1, 1, TOPK, dtype=torch.float32)
+    gate.golden_gate_forward(gate_tensors, hash_route=hash_route)
+
+    indices = gate_tensors["indices"][0, 0].long()
+    return {
+        "x": packed_tensors["x"].clone(),
+        "weights": gate_tensors["weights"].clone(),
+        "selected_w1_t": packed_tensors["routed_w1_t"][indices].contiguous(),
+        "selected_w2_t": packed_tensors["routed_w2_t"][indices].contiguous(),
+        "selected_w3_t": packed_tensors["routed_w3_t"][indices].contiguous(),
+        "shared_w1_t": packed_tensors["shared_w1_t"],
+        "shared_w2_t": packed_tensors["shared_w2_t"],
+        "shared_w3_t": packed_tensors["shared_w3_t"],
+        "out": torch.zeros(1, 1, DIM, dtype=torch.bfloat16),
+    }
+
+
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 def test_golden_moe_hash_matches_official_model(tiny_moe_args, seq_len: int) -> None:
     module = _make_official_moe(tiny_moe_args, layer_id=0)
@@ -140,6 +165,22 @@ def test_golden_moe_hash_matches_official_model(tiny_moe_args, seq_len: int) -> 
     moe.golden_moe_hash(tensors)
 
     torch.testing.assert_close(tensors["out"], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("hash_route,layer_id", [(True, 0), (False, 1)])
+def test_golden_moe_selected_decode_matches_packed_golden(tiny_moe_args, hash_route: bool, layer_id: int) -> None:
+    module = _make_official_moe(tiny_moe_args, layer_id=layer_id)
+    x = (torch.randn(1, 1, DIM, dtype=torch.float32) * 0.8).to(torch.bfloat16)
+    input_ids = torch.randint(0, VOCAB, (1, 1), dtype=torch.int64)
+
+    packed_tensors = _moe_tensors(module, x, input_ids, hash_route=hash_route)
+    moe.golden_moe_forward(packed_tensors, hash_route=hash_route)
+
+    selected_tensors = _selected_decode_tensors(packed_tensors, hash_route=hash_route)
+    moe.golden_moe_selected_decode_experts_forward(selected_tensors)
+
+    torch.testing.assert_close(selected_tensors["out"], packed_tensors["out"], rtol=1e-3, atol=1e-3)
+
 
 @pytest.mark.parametrize("seq_len", SEQ_LENS)
 def test_golden_moe_topk_matches_official_model(tiny_moe_args, seq_len: int) -> None:
