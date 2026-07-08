@@ -88,15 +88,14 @@ def hc_pre_fwd(
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
 
-    for t in pl.range(padded_tokens):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_pad_x"):
-            for kb in pl.range(HC_DIM // D_TILE):
-                k0 = kb * D_TILE
-                if t < tokens:
-                    x_row = x_src_flat[t : t + 1, k0 : k0 + D_TILE]
-                else:
-                    x_row = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
-                x_flat[t : t + 1, k0 : k0 + D_TILE] = x_row
+    for t in pl.spmd(padded_tokens, name_hint="hc_pre_pad_x"):
+        for kb in pl.range(HC_DIM // D_TILE):
+            k0 = kb * D_TILE
+            if t < tokens:
+                x_row = x_src_flat[t : t + 1, k0 : k0 + D_TILE]
+            else:
+                x_row = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+            x_flat[t : t + 1, k0 : k0 + D_TILE] = x_row
 
     for tb in pl.range(token_blocks):
         t0 = tb * T_TILE
@@ -273,40 +272,43 @@ def hc_pre_fwd(
             pl.store(row2_out, [t0, 2 * HC_MULT], comb_pad_flat)
             pl.store(row3_out, [t0, 3 * HC_MULT], comb_pad_flat)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_mix_x"):
-            pre_tile = pl.slice(pre_flat, [T_TILE, HC_PAD], [t0, 0], valid_shape=[valid_tok, HC_MULT])
-            pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
-            pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
-            pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
-            pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
-            pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
-            for db in pl.range(HIDDEN_BLOCKS):
-                d0 = db * D_TILE
-                x0 = pl.cast(
-                    pl.slice(x_flat, [T_TILE, D_TILE], [t0, 0 * HIDDEN + d0], valid_shape=[valid_tok, D_TILE]),
-                    target_type=pl.FP32,
-                )
-                x1 = pl.cast(
-                    pl.slice(x_flat, [T_TILE, D_TILE], [t0, 1 * HIDDEN + d0], valid_shape=[valid_tok, D_TILE]),
-                    target_type=pl.FP32,
-                )
-                x2 = pl.cast(
-                    pl.slice(x_flat, [T_TILE, D_TILE], [t0, 2 * HIDDEN + d0], valid_shape=[valid_tok, D_TILE]),
-                    target_type=pl.FP32,
-                )
-                x3 = pl.cast(
-                    pl.slice(x_flat, [T_TILE, D_TILE], [t0, 3 * HIDDEN + d0], valid_shape=[valid_tok, D_TILE]),
-                    target_type=pl.FP32,
-                )
-                y0 = pl.row_expand_mul(x0, pre0)
-                y1 = pl.row_expand_mul(x1, pre1)
-                y2 = pl.row_expand_mul(x2, pre2)
-                y3 = pl.row_expand_mul(x3, pre3)
-                y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-                y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-                for row in pl.range(valid_tok):
-                    y_row = pl.slice(y_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
-                    x_mixed_pad_flat[t0 + row : t0 + row + 1, d0 : d0 + D_TILE] = y_row
+    for task in pl.spmd(token_blocks * HIDDEN_BLOCKS, name_hint="hc_pre_mix_x"):
+        tb = task // HIDDEN_BLOCKS
+        db = task % HIDDEN_BLOCKS
+        t0 = tb * T_TILE
+        d0 = db * D_TILE
+        valid_tok = T_TILE
+        mix_pre = pl.slice(pre_flat, [T_TILE, HC_PAD], [t0, 0], valid_shape=[valid_tok, HC_MULT])
+        mix_pre_t = pl.transpose(mix_pre, axis1=0, axis2=1)
+        pre0 = pl.reshape(mix_pre_t[0:1, 0:T_TILE], [T_TILE, 1])
+        pre1 = pl.reshape(mix_pre_t[1:2, 0:T_TILE], [T_TILE, 1])
+        pre2 = pl.reshape(mix_pre_t[2:3, 0:T_TILE], [T_TILE, 1])
+        pre3 = pl.reshape(mix_pre_t[3:4, 0:T_TILE], [T_TILE, 1])
+        x0 = pl.cast(
+            pl.slice(x_flat, [T_TILE, D_TILE], [t0, 0 * HIDDEN + d0], valid_shape=[valid_tok, D_TILE]),
+            target_type=pl.FP32,
+        )
+        x1 = pl.cast(
+            pl.slice(x_flat, [T_TILE, D_TILE], [t0, 1 * HIDDEN + d0], valid_shape=[valid_tok, D_TILE]),
+            target_type=pl.FP32,
+        )
+        x2 = pl.cast(
+            pl.slice(x_flat, [T_TILE, D_TILE], [t0, 2 * HIDDEN + d0], valid_shape=[valid_tok, D_TILE]),
+            target_type=pl.FP32,
+        )
+        x3 = pl.cast(
+            pl.slice(x_flat, [T_TILE, D_TILE], [t0, 3 * HIDDEN + d0], valid_shape=[valid_tok, D_TILE]),
+            target_type=pl.FP32,
+        )
+        y0 = pl.row_expand_mul(x0, pre0)
+        y1 = pl.row_expand_mul(x1, pre1)
+        y2 = pl.row_expand_mul(x2, pre2)
+        y3 = pl.row_expand_mul(x3, pre3)
+        y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
+        y_bf16 = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+        for row in pl.range(valid_tok):
+            y_row = pl.slice(y_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+            x_mixed_pad_flat[t0 + row : t0 + row + 1, d0 : d0 + D_TILE] = y_row
 
     for t in pl.range(tokens):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_copy_out"):
