@@ -17,7 +17,7 @@ from models import embedding as embedding_kernel
 from models import head as head_kernel
 from models.config import FLASH_CONFIG, DeepSeekV4FlashConfig
 from models.golden import TensorSpec
-from serving.profile import ProfileRecorder
+from serving.profiler import ProfileRecorder, block_profile_fields
 from serving.state import COMPRESS_RATIO4, COMPRESS_RATIO128, DEFAULT_MAX_SEQ_LEN, DeepSeekV4State, LayerSpec
 from serving.weight_loader import DeepSeekV4WeightLoader
 
@@ -245,17 +245,24 @@ class DeepSeekV4Runner:
                 flush=True,
             )
 
-        with self.profiler.timer("layer.total", layer=layer_id, mode=mode, ratio=spec.ratio, kernel=case.name):
-            with self.profiler.timer("layer.values", layer=layer_id, mode=mode, ratio=spec.ratio):
+        profile_fields = block_profile_fields(
+            layer=layer_id,
+            mode=mode,
+            ratio=spec.ratio,
+            hash_route=spec.hash_route,
+            kernel=case.name,
+        )
+        with self.profiler.timer("layer.total", **profile_fields):
+            with self.profiler.timer("layer.values", **profile_fields):
                 if self.profiler.enabled:
                     self.weight_loader.reset_profile_stats()
                 values = self._layer_values(layer_id, hidden, input_ids=input_ids, start_pos=start_pos, decode=decode)
-            self.profiler.record_weight_loader("layer.weight_loader", self.weight_loader, layer=layer_id, mode=mode, ratio=spec.ratio)
-            with self.profiler.timer("layer.materialize", layer=layer_id, mode=mode, ratio=spec.ratio):
+            self.profiler.record_weight_loader("layer.weight_loader", self.weight_loader, **profile_fields)
+            with self.profiler.timer("layer.materialize", **profile_fields):
                 tensors = self._materialize_specs(specs, values)
-            with self.profiler.backend_timer("layer.kernel", self.backend, layer=layer_id, mode=mode, ratio=spec.ratio, kernel=case.name):
+            with self.profiler.backend_timer("layer.kernel", self.backend, **profile_fields):
                 outputs = self.backend.run(case, specs, tensors)
-            with self.profiler.timer("layer.state_update", layer=layer_id, mode=mode, ratio=spec.ratio):
+            with self.profiler.timer("layer.state_update", **profile_fields):
                 self.state.update_layer_state(layer_id, outputs)
             out = outputs["out"].contiguous()
             if self.verbose_layer_log:

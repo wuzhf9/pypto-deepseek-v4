@@ -332,25 +332,24 @@ def compressor_ratio128_decode_fwd(
     slot_idx = pl.cast(raw_slot, pl.INDEX)
     should_flag = pl.read(should_compress, [0])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c128_decode_state_copy_update"):
-        for row in pl.range(COMPRESS_RATIO):
-            for hb in pl.range(HEAD_CHUNKS):
-                h0 = hb * HEAD_CHUNK
-                if row == slot_idx:
-                    kv_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
-                        0:1, h0 : h0 + HEAD_CHUNK
-                    ]
-                    score_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
-                        score_proj_flat[0:1, h0 : h0 + HEAD_CHUNK],
-                        ape[row : row + 1, h0 : h0 + HEAD_CHUNK],
-                    )
-                else:
-                    kv_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_state_flat[
-                        row : row + 1, h0 : h0 + HEAD_CHUNK
-                    ]
-                    score_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = score_state_flat[
-                        row : row + 1, h0 : h0 + HEAD_CHUNK
-                    ]
+    for row in pl.spmd(COMPRESS_RATIO, name_hint="compressor_c128_decode_state_copy_update"):
+        for hb in pl.range(HEAD_CHUNKS):
+            h0 = hb * HEAD_CHUNK
+            if row == slot_idx:
+                kv_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_proj_flat[
+                    0:1, h0 : h0 + HEAD_CHUNK
+                ]
+                score_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = pl.add(
+                    score_proj_flat[0:1, h0 : h0 + HEAD_CHUNK],
+                    ape[row : row + 1, h0 : h0 + HEAD_CHUNK],
+                )
+            else:
+                kv_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = kv_state_flat[
+                    row : row + 1, h0 : h0 + HEAD_CHUNK
+                ]
+                score_state_out_flat[row : row + 1, h0 : h0 + HEAD_CHUNK] = score_state_flat[
+                    row : row + 1, h0 : h0 + HEAD_CHUNK
+                ]
 
     raw_cache_slot = pl.read(cache_slot, [0])
     cache_slot_idx = pl.cast(raw_cache_slot, pl.INDEX)

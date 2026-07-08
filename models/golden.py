@@ -5,6 +5,8 @@ this repository: create tensors, compile a ``@pl.jit`` kernel, run it through
 PyPTO, compute a PyTorch reference, and compare outputs.
 """
 
+import multiprocessing as mp
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+
+_L2_SWIMLANE_CHILD_ENV = "PYPTO_DSV4_L2_SWIMLANE_CHILD"
 
 
 @dataclass
@@ -405,6 +410,105 @@ def run_jit(
 ) -> RunResult:
     """Compile a ``@pl.jit`` kernel, run it, and validate output tensors."""
 
+    runtime_cfg = dict(runtime_cfg or {})
+    if _should_isolate_l2_swimlane(runtime_cfg, compile_only):
+        return _run_jit_in_child(
+            fn=fn,
+            specs=specs,
+            golden_fn=golden_fn,
+            runtime_cfg=runtime_cfg,
+            rtol=rtol,
+            atol=atol,
+            compare_fn=compare_fn,
+            compile_only=compile_only,
+        )
+
+    return _run_jit_impl(
+        fn=fn,
+        specs=specs,
+        golden_fn=golden_fn,
+        runtime_cfg=runtime_cfg,
+        rtol=rtol,
+        atol=atol,
+        compare_fn=compare_fn,
+        compile_only=compile_only,
+    )
+
+
+def _should_isolate_l2_swimlane(runtime_cfg: dict[str, Any], compile_only: bool) -> bool:
+    if compile_only:
+        return False
+    if os.environ.get(_L2_SWIMLANE_CHILD_ENV) == "1":
+        return False
+    if not runtime_cfg.get("enable_l2_swimlane", False):
+        return False
+    platform = str(runtime_cfg.get("platform", ""))
+    if platform.endswith("sim"):
+        return False
+    return "fork" in mp.get_all_start_methods()
+
+
+def _run_jit_in_child(
+    *,
+    fn: Any,
+    specs: list[TensorSpec],
+    golden_fn: Callable | None,
+    runtime_cfg: dict[str, Any],
+    rtol: float,
+    atol: float,
+    compare_fn: dict[str, Callable] | None,
+    compile_only: bool,
+) -> RunResult:
+    ctx = mp.get_context("fork")
+    queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=_run_jit_child_main,
+        args=(queue, fn, specs, golden_fn, runtime_cfg, rtol, atol, compare_fn, compile_only),
+    )
+    process.start()
+    process.join()
+    if not queue.empty():
+        return queue.get()
+    if process.exitcode == 0:
+        return RunResult(False, error="isolated L2 swimlane child exited without returning a result")
+    return RunResult(False, error=f"isolated L2 swimlane child failed with exit code {process.exitcode}")
+
+
+def _run_jit_child_main(
+    queue: Any,
+    fn: Any,
+    specs: list[TensorSpec],
+    golden_fn: Callable | None,
+    runtime_cfg: dict[str, Any],
+    rtol: float,
+    atol: float,
+    compare_fn: dict[str, Callable] | None,
+    compile_only: bool,
+) -> None:
+    os.environ[_L2_SWIMLANE_CHILD_ENV] = "1"
+    result = _run_jit_impl(
+        fn=fn,
+        specs=specs,
+        golden_fn=golden_fn,
+        runtime_cfg=runtime_cfg,
+        rtol=rtol,
+        atol=atol,
+        compare_fn=compare_fn,
+        compile_only=compile_only,
+    )
+    queue.put(result)
+
+
+def _run_jit_impl(
+    fn: Any,
+    specs: list[TensorSpec],
+    golden_fn: Callable | None = None,
+    runtime_cfg: dict[str, Any] | None = None,
+    rtol: float = 1e-5,
+    atol: float = 1e-5,
+    compare_fn: dict[str, Callable] | None = None,
+    compile_only: bool = False,
+) -> RunResult:
     runtime_cfg = dict(runtime_cfg or {})
     compare_fn = compare_fn or {}
     start = time.time()

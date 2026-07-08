@@ -30,8 +30,12 @@ SPARSE_D_TILE = 32
 HEAD_D_BLOCKS = HEAD_DIM // SPARSE_D_TILE
 SPARSE_D_TILE_CSA = 32
 HEAD_D_BLOCKS_CSA = HEAD_DIM // SPARSE_D_TILE_CSA
+CSA_OUT_D_TILE = 256
+CSA_OUT_D_BLOCKS = HEAD_DIM // CSA_OUT_D_TILE
 DEFAULT_SEQ_LEN = 8
 DEFAULT_DECODE_START_POS = 1
+
+assert HEAD_DIM % CSA_OUT_D_TILE == 0
 
 
 @pl.jit.inline
@@ -231,22 +235,22 @@ def sparse_attn_csa_fwd(
 
             sparse_kv = pl.create_tensor([TOPK_CSA_TILE, HEAD_DIM], dtype=pl.BF16)
             sparse_bias = pl.create_tensor([1, TOPK_CSA_TILE], dtype=pl.FP32)
-            sparse_value = pl.create_tensor([TOPK_CSA_TILE, SPARSE_D_TILE_CSA], dtype=pl.BF16)
+            sparse_value = pl.create_tensor([TOPK_CSA_TILE, CSA_OUT_D_TILE], dtype=pl.BF16)
 
-            for db in pl.range(HEAD_D_BLOCKS_CSA):
-                d0 = db * SPARSE_D_TILE_CSA
+            for db in pl.range(CSA_OUT_D_BLOCKS):
+                d0 = db * CSA_OUT_D_TILE
                 sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
                 qk_mi = sink_bias
                 denom = pl.exp(pl.sub(sink_bias, sink_bias))
-                out_num = pl.full([H_TILE, SPARSE_D_TILE_CSA], dtype=pl.FP32, value=0.0)
+                out_num = pl.full([H_TILE, CSA_OUT_D_TILE], dtype=pl.FP32, value=0.0)
 
                 for cb in pl.range(TOPK_CSA_BLOCKS):
                     k_base = cb * TOPK_CSA_TILE
                     sparse_kv[0:TOPK_CSA_TILE, 0:HEAD_DIM] = pl.full(
                         [TOPK_CSA_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0
                     )
-                    sparse_value[0:TOPK_CSA_TILE, 0:SPARSE_D_TILE_CSA] = pl.full(
-                        [TOPK_CSA_TILE, SPARSE_D_TILE_CSA], dtype=pl.BF16, value=0.0
+                    sparse_value[0:TOPK_CSA_TILE, 0:CSA_OUT_D_TILE] = pl.full(
+                        [TOPK_CSA_TILE, CSA_OUT_D_TILE], dtype=pl.BF16, value=0.0
                     )
                     topk_row = topk_flat[t : t + 1, k_base : k_base + TOPK_CSA_TILE]
                     topk_fp32 = pl.cast(topk_row, target_type=pl.FP32)
@@ -259,8 +263,11 @@ def sparse_attn_csa_fwd(
                             if raw < kv_len:
                                 src = pl.cast(raw, pl.INDEX)
                                 sparse_kv[ki : ki + 1, 0:HEAD_DIM] = kv_flat[src : src + 1, 0:HEAD_DIM]
-                                value_row = pl.slice(kv_flat, [1, SPARSE_D_TILE_CSA], [src, d0])
-                                sparse_value[ki : ki + 1, 0:SPARSE_D_TILE_CSA] = value_row
+                                sparse_value[ki : ki + 1, 0:CSA_OUT_D_TILE] = pl.slice(
+                                    kv_flat,
+                                    [1, CSA_OUT_D_TILE],
+                                    [src, d0],
+                                )
 
                     qk_raw = pl.matmul(q_tile, sparse_kv, b_trans=True, out_dtype=pl.FP32)
                     qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
@@ -283,8 +290,7 @@ def sparse_attn_csa_fwd(
 
                 out_fp32 = pl.row_expand_div(out_num, denom)
                 out_bf16 = pl.cast(out_fp32, target_type=pl.BF16, mode="rint")
-
-                out_flat[out_row : out_row + H_TILE, d0 : d0 + SPARSE_D_TILE_CSA] = out_bf16
+                out_flat[out_row : out_row + H_TILE, d0 : d0 + CSA_OUT_D_TILE] = out_bf16
 
     return pl.reshape(out_flat, [B, tokens, N_HEADS, HEAD_DIM])
 

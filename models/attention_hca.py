@@ -47,6 +47,7 @@ EPS = M.rms_norm_eps
 
 DEFAULT_SEQ_LEN = 256
 DEFAULT_DECODE_START_POS = COMPRESS_RATIO - 1
+DECODE_KV_POOL_ROW_TILE = 16
 
 
 @pl.jit.inline
@@ -89,15 +90,22 @@ def build_decode_kv_pool(
     compressed_len = pl.tensor.dim(compressed_cache, 1)
     cache_flat = pl.reshape(kv_cache, [WINDOW_SIZE, HEAD_DIM])
     compressed_flat = pl.reshape(compressed_cache, [compressed_len, HEAD_DIM])
-    pool_flat = pl.reshape(kv_pool, [WINDOW_SIZE + compressed_len, HEAD_DIM])
+    pool_rows = WINDOW_SIZE + compressed_len
+    pool_flat = pl.reshape(kv_pool, [pool_rows, HEAD_DIM])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_kv_pool"):
-        pool_flat[0:WINDOW_SIZE, 0:HEAD_DIM] = cache_flat[0:WINDOW_SIZE, 0:HEAD_DIM]
-        for c in pl.range(compressed_len):
-            dst = WINDOW_SIZE + c
-            pool_flat[dst : dst + 1, 0:HEAD_DIM] = compressed_flat[c : c + 1, 0:HEAD_DIM]
+    pool_blocks = (pool_rows + DECODE_KV_POOL_ROW_TILE - 1) // DECODE_KV_POOL_ROW_TILE
+    for block in pl.spmd(pool_blocks, name_hint="decode_kv_pool"):
+        row0 = block * DECODE_KV_POOL_ROW_TILE
+        for offset in pl.range(DECODE_KV_POOL_ROW_TILE):
+            row = row0 + offset
+            if row < pool_rows:
+                if row < WINDOW_SIZE:
+                    pool_flat[row : row + 1, 0:HEAD_DIM] = cache_flat[row : row + 1, 0:HEAD_DIM]
+                else:
+                    src = row - WINDOW_SIZE
+                    pool_flat[row : row + 1, 0:HEAD_DIM] = compressed_flat[src : src + 1, 0:HEAD_DIM]
 
-    return pl.reshape(pool_flat, [B, WINDOW_SIZE + compressed_len, HEAD_DIM])
+    return pl.reshape(pool_flat, [B, pool_rows, HEAD_DIM])
 
 
 @pl.jit.inline

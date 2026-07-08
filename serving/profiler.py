@@ -5,6 +5,32 @@ import time
 from typing import Any, Iterator
 
 
+def block_shape_from_kernel(kernel: str) -> str:
+    name = kernel.removeprefix("block_").removesuffix("_fwd")
+    for suffix in ("_prefill", "_decode"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def block_profile_fields(
+    *,
+    layer: int,
+    mode: str,
+    ratio: int,
+    hash_route: bool,
+    kernel: str,
+) -> dict[str, Any]:
+    return {
+        "layer": layer,
+        "mode": mode,
+        "ratio": ratio,
+        "hash_route": hash_route,
+        "block_shape": block_shape_from_kernel(kernel),
+        "kernel": kernel,
+    }
+
+
 class ProfileRecorder:
     """Print profile events without coupling formatting to runner logic."""
 
@@ -67,4 +93,4 @@ def _format_fields(fields: dict[str, Any]) -> str:
     return " ".join(f"{key}={value}" for key, value in fields.items())
 
 
-__all__ = ["ProfileRecorder"]
+__all__ = ["ProfileRecorder", "block_profile_fields", "block_shape_from_kernel"]

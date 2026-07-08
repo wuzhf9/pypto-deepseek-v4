@@ -470,19 +470,18 @@ def compressor_ratio4_indexer_decode_fwd(
     raw_cache_slot = pl.read(cache_slot, [0])
     cache_slot_idx = pl.cast(raw_cache_slot, pl.INDEX)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c4_index_decode_cache_copy"):
-        for cache_row in pl.range(TOPK_CSA_COMPRESSED):
-            for hb in pl.range(INDEX_HEAD_CHUNKS):
-                h0 = hb * HEAD_CHUNK
-                if should_flag != 0:
-                    if cache_row != cache_slot_idx:
-                        cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
-                            cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
-                        ]
-                else:
+    for cache_row in pl.spmd(TOPK_CSA_COMPRESSED, name_hint="compressor_c4_index_decode_cache_copy"):
+        for hb in pl.range(INDEX_HEAD_CHUNKS):
+            h0 = hb * HEAD_CHUNK
+            if should_flag != 0:
+                if cache_row != cache_slot_idx:
                     cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
                         cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
                     ]
+            else:
+                cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
+                    cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
+                ]
 
     if should_flag != 0:
         pooled_flat = pl.reshape(pooled, [1, INDEX_HEAD_DIM])
@@ -1062,19 +1061,18 @@ def compressor_ratio4_attention_decode_fwd(
     raw_cache_slot = pl.read(cache_slot, [0])
     cache_slot_idx = pl.cast(raw_cache_slot, pl.INDEX)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="compressor_c4_attn_decode_cache_copy"):
-        for cache_row in pl.range(TOPK_CSA_COMPRESSED):
-            for hb in pl.range(ATTN_HEAD_CHUNKS):
-                h0 = hb * HEAD_CHUNK
-                if should_flag != 0:
-                    if cache_row != cache_slot_idx:
-                        cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
-                            cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
-                        ]
-                else:
+    for cache_row in pl.spmd(TOPK_CSA_COMPRESSED, name_hint="compressor_c4_attn_decode_cache_copy"):
+        for hb in pl.range(ATTN_HEAD_CHUNKS):
+            h0 = hb * HEAD_CHUNK
+            if should_flag != 0:
+                if cache_row != cache_slot_idx:
                     cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
                         cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
                     ]
+            else:
+                cache_out_flat[cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK] = cache_flat[
+                    cache_row : cache_row + 1, h0 : h0 + HEAD_CHUNK
+                ]
 
     if should_flag != 0:
         pooled_flat = pl.reshape(pooled, [1, ATTN_HEAD_DIM])
