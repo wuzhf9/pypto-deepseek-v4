@@ -31,11 +31,12 @@ def embedding_fwd(
     input_flat = pl.reshape(input_ids, [tokens])
     out_flat = pl.reshape(out, [tokens, HIDDEN])
 
-    for t in pl.range(tokens):
-        for hb in pl.spmd(H_BLOCKS, name_hint="embedding"):
-            token_id = pl.cast(pl.read(input_flat, [t]), pl.INDEX)
-            h0 = hb * D_TILE
-            out_flat[t : t + 1, h0 : h0 + D_TILE] = weight[token_id : token_id + 1, h0 : h0 + D_TILE]
+    for work in pl.spmd(tokens * H_BLOCKS, name_hint="embedding"):
+        t = work // H_BLOCKS
+        hb = work - t * H_BLOCKS
+        token_id = pl.cast(pl.read(input_flat, [t]), pl.INDEX)
+        h0 = hb * D_TILE
+        out_flat[t : t + 1, h0 : h0 + D_TILE] = weight[token_id : token_id + 1, h0 : h0 + D_TILE]
 
     return pl.reshape(out_flat, [B, tokens, HIDDEN])
 
