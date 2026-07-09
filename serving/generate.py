@@ -160,9 +160,6 @@ def run_generation(args: argparse.Namespace) -> GenerationResult:
         thinking_mode=args.thinking_mode,
         helpers=helpers,
     )
-    if args.print_prompt:
-        print(prompt_text, flush=True)
-
     torch.manual_seed(args.seed)
     runner = _create_runner(args)
     try:
@@ -227,7 +224,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--include-eos", action="store_true")
     parser.add_argument("--parse-eos", action="store_true")
     parser.add_argument("--skip-special-tokens", action="store_true")
-    parser.add_argument("--print-prompt", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose-layer-log", action="store_true")
     parser.add_argument("--stats", action=argparse.BooleanOptionalAction, default=True)
@@ -237,6 +233,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     result = run_generation(args)
+    print(f"User: {args.prompt}")
     print(f"AI: {result.text}")
     if args.stats:
         print_stats(result)
