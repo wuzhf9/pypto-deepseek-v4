@@ -50,35 +50,34 @@ def rmsnorm_4096(
     out_flat = pl.reshape(out, [tokens, D_4096])
     token_blocks = (tokens + T_TILE - 1) // T_TILE
 
-    for tb in pl.range(token_blocks):
+    for tb in pl.spmd(token_blocks, name_hint="rmsnorm_4096"):
         t0 = tb * T_TILE
         valid_tok = pl.min(T_TILE, tokens - t0)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_4096"):
-            partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(BLOCKS_4096):
-                k0 = kb * D_TILE
-                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
-                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
-                )
+        partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.range(BLOCKS_4096):
+            k0 = kb * D_TILE
+            x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+            x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+            partial_sq = pl.add(
+                partial_sq,
+                pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
+            )
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_4096), EPS), [T_TILE, 1])
-            inv_rms = pl.rsqrt(variance, high_precision=True)
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_4096), EPS), [T_TILE, 1])
+        inv_rms = pl.rsqrt(variance, high_precision=True)
 
-            for kb in pl.range(BLOCKS_4096):
-                k0 = kb * D_TILE
-                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
-                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
-                weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
-                weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
-                normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
-                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
-                for row in pl.range(valid_tok):
-                    out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
-                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
+        for kb in pl.range(BLOCKS_4096):
+            k0 = kb * D_TILE
+            x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+            x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+            weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
+            weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
+            normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
+            normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
+            for row in pl.range(valid_tok):
+                out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
 
     return pl.reshape(out_flat, [B, tokens, D_4096])
 
@@ -98,35 +97,34 @@ def rmsnorm_1024(
     out_flat = pl.reshape(out, [tokens, D_1024])
     token_blocks = (tokens + T_TILE - 1) // T_TILE
 
-    for tb in pl.range(token_blocks):
+    for tb in pl.spmd(token_blocks, name_hint="rmsnorm_1024"):
         t0 = tb * T_TILE
         valid_tok = pl.min(T_TILE, tokens - t0)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_1024"):
-            partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(BLOCKS_1024):
-                k0 = kb * D_TILE
-                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
-                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
-                )
+        partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.range(BLOCKS_1024):
+            k0 = kb * D_TILE
+            x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+            x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+            partial_sq = pl.add(
+                partial_sq,
+                pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
+            )
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_1024), EPS), [T_TILE, 1])
-            inv_rms = pl.rsqrt(variance, high_precision=True)
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_1024), EPS), [T_TILE, 1])
+        inv_rms = pl.rsqrt(variance, high_precision=True)
 
-            for kb in pl.range(BLOCKS_1024):
-                k0 = kb * D_TILE
-                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
-                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
-                weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
-                weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
-                normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
-                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
-                for row in pl.range(valid_tok):
-                    out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
-                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
+        for kb in pl.range(BLOCKS_1024):
+            k0 = kb * D_TILE
+            x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+            x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+            weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
+            weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
+            normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
+            normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
+            for row in pl.range(valid_tok):
+                out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
 
     return pl.reshape(out_flat, [B, tokens, D_1024])
 
@@ -146,35 +144,34 @@ def rmsnorm_512(
     out_flat = pl.reshape(out, [tokens, D_512])
     token_blocks = (tokens + T_TILE - 1) // T_TILE
 
-    for tb in pl.range(token_blocks):
+    for tb in pl.spmd(token_blocks, name_hint="rmsnorm_512"):
         t0 = tb * T_TILE
         valid_tok = pl.min(T_TILE, tokens - t0)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_512"):
-            partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(BLOCKS_512):
-                k0 = kb * D_TILE
-                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
-                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
-                )
+        partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.range(BLOCKS_512):
+            k0 = kb * D_TILE
+            x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+            x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+            partial_sq = pl.add(
+                partial_sq,
+                pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
+            )
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_512), EPS), [T_TILE, 1])
-            inv_rms = pl.rsqrt(variance, high_precision=True)
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_512), EPS), [T_TILE, 1])
+        inv_rms = pl.rsqrt(variance, high_precision=True)
 
-            for kb in pl.range(BLOCKS_512):
-                k0 = kb * D_TILE
-                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
-                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
-                weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
-                weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
-                normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
-                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
-                for row in pl.range(valid_tok):
-                    out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
-                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
+        for kb in pl.range(BLOCKS_512):
+            k0 = kb * D_TILE
+            x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+            x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+            weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
+            weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
+            normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
+            normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
+            for row in pl.range(valid_tok):
+                out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
 
     return pl.reshape(out_flat, [B, tokens, D_512])
 
@@ -194,35 +191,34 @@ def rmsnorm_128(
     out_flat = pl.reshape(out, [tokens, D_128])
     token_blocks = (tokens + T_TILE - 1) // T_TILE
 
-    for tb in pl.range(token_blocks):
+    for tb in pl.spmd(token_blocks, name_hint="rmsnorm_128"):
         t0 = tb * T_TILE
         valid_tok = pl.min(T_TILE, tokens - t0)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_128"):
-            partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(BLOCKS_128):
-                k0 = kb * D_TILE
-                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
-                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
-                )
+        partial_sq = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.range(BLOCKS_128):
+            k0 = kb * D_TILE
+            x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+            x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+            partial_sq = pl.add(
+                partial_sq,
+                pl.reshape(pl.row_sum(pl.mul(x_fp32, x_fp32)), [1, T_TILE]),
+            )
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_128), EPS), [T_TILE, 1])
-            inv_rms = pl.rsqrt(variance, high_precision=True)
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, INV_128), EPS), [T_TILE, 1])
+        inv_rms = pl.rsqrt(variance, high_precision=True)
 
-            for kb in pl.range(BLOCKS_128):
-                k0 = kb * D_TILE
-                x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
-                x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
-                weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
-                weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
-                normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
-                normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
-                for row in pl.range(valid_tok):
-                    out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
-                    out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
+        for kb in pl.range(BLOCKS_128):
+            k0 = kb * D_TILE
+            x_bf16 = pl.slice(x_flat, [T_TILE, D_TILE], [t0, k0], valid_shape=[valid_tok, D_TILE])
+            x_fp32 = pl.cast(x_bf16, target_type=pl.FP32)
+            weight_bf16 = pl.reshape(norm_w[k0 : k0 + D_TILE], [1, D_TILE])
+            weight_fp32 = pl.cast(weight_bf16, target_type=pl.FP32)
+            normed = pl.col_expand_mul(pl.row_expand_mul(x_fp32, inv_rms), weight_fp32)
+            normed_bf16 = pl.cast(normed, target_type=pl.BF16, mode="rint")
+            for row in pl.range(valid_tok):
+                out_row = pl.slice(normed_bf16, [1, D_TILE], [row, 0], valid_shape=[1, D_TILE])
+                out_flat = pl.assemble(out_flat, out_row, [t0 + row, k0])
 
     return pl.reshape(out_flat, [B, tokens, D_128])
 
