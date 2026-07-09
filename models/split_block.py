@@ -712,7 +712,7 @@ def hca_topk_selected_decode_pre_moe_fwd(
 
 
 @pl.jit
-def swa_hash_selected_decode_post_moe_fwd(
+def selected_decode_post_moe_fwd(
     ffn_normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     weights: pl.Tensor[[B, S_DYN, TOPK], pl.FP32],
     selected_w1_t: pl.Tensor[[TOPK, HIDDEN, MOE_INTER_DIM], pl.BF16],
@@ -726,7 +726,7 @@ def swa_hash_selected_decode_post_moe_fwd(
     ffn_hc_comb: pl.Tensor[[B, S_DYN, HC_MULT * HC_MULT], pl.FP32],
     out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
-    """Run selected FFN MoE and HC post for SWA hash decode block."""
+    """Run selected FFN MoE and HC post for any split decode block."""
     ffn_normed.bind_dynamic(1, S_DYN)
     tokens = pl.tensor.dim(ffn_normed, 1)
     moe_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
@@ -824,7 +824,7 @@ def golden_csa_topk_selected_decode_pre_moe(tensors: dict[str, torch.Tensor], st
     _golden_selected_decode_pre_moe(tensors, start_pos=start_pos, attention_kind="csa", hash_route=False)
 
 
-def _golden_selected_decode_post_moe(tensors: dict[str, torch.Tensor]) -> None:
+def golden_selected_decode_post_moe(tensors: dict[str, torch.Tensor]) -> None:
     """Run selected FFN MoE and HC post for split decode block."""
     moe_tensors = {
         "x": tensors["ffn_normed"],
@@ -852,22 +852,22 @@ def _golden_selected_decode_post_moe(tensors: dict[str, torch.Tensor]) -> None:
 
 def golden_swa_hash_selected_decode_post_moe(tensors: dict[str, torch.Tensor]) -> None:
     """Run selected FFN MoE and HC post for SWA hash decode block."""
-    _golden_selected_decode_post_moe(tensors)
+    golden_selected_decode_post_moe(tensors)
 
 
 def golden_csa_hash_selected_decode_post_moe(tensors: dict[str, torch.Tensor]) -> None:
     """Run selected FFN MoE and HC post for CSA hash decode block."""
-    _golden_selected_decode_post_moe(tensors)
+    golden_selected_decode_post_moe(tensors)
 
 
 def golden_hca_topk_selected_decode_post_moe(tensors: dict[str, torch.Tensor]) -> None:
     """Run selected FFN MoE and HC post for HCA topk decode block."""
-    _golden_selected_decode_post_moe(tensors)
+    golden_selected_decode_post_moe(tensors)
 
 
 def golden_csa_topk_selected_decode_post_moe(tensors: dict[str, torch.Tensor]) -> None:
     """Run selected FFN MoE and HC post for CSA topk decode block."""
-    _golden_selected_decode_post_moe(tensors)
+    golden_selected_decode_post_moe(tensors)
 
 
 def _spec_map(specs):
@@ -1194,7 +1194,7 @@ def build_hca_topk_selected_decode_pre_moe_specs(start_pos: int = DEFAULT_DECODE
     return specs
 
 
-def build_swa_hash_selected_decode_post_moe_specs(_start_pos: int = DEFAULT_DECODE_START_POS):
+def build_selected_decode_post_moe_specs(_start_pos: int = DEFAULT_DECODE_START_POS):
     from models.golden import TensorSpec
 
     seq_len = 1
@@ -1321,9 +1321,9 @@ def main() -> int:
         cases.append(
             (
                 "swa-hash-post",
-                swa_hash_selected_decode_post_moe_fwd,
-                lambda: build_swa_hash_selected_decode_post_moe_specs(args.decode_start_pos),
-                golden_swa_hash_selected_decode_post_moe,
+                selected_decode_post_moe_fwd,
+                lambda: build_selected_decode_post_moe_specs(args.decode_start_pos),
+                golden_selected_decode_post_moe,
             )
         )
     if args.case in ("all", "pre", "csa-hash-pre"):
@@ -1339,9 +1339,9 @@ def main() -> int:
         cases.append(
             (
                 "csa-hash-post",
-                swa_hash_selected_decode_post_moe_fwd,
-                lambda: build_swa_hash_selected_decode_post_moe_specs(args.decode_start_pos),
-                golden_csa_hash_selected_decode_post_moe,
+                selected_decode_post_moe_fwd,
+                lambda: build_selected_decode_post_moe_specs(args.decode_start_pos),
+                golden_selected_decode_post_moe,
             )
         )
     if args.case in ("all", "pre", "hca-topk-pre"):
@@ -1357,9 +1357,9 @@ def main() -> int:
         cases.append(
             (
                 "hca-topk-post",
-                swa_hash_selected_decode_post_moe_fwd,
-                lambda: build_swa_hash_selected_decode_post_moe_specs(args.decode_start_pos),
-                golden_hca_topk_selected_decode_post_moe,
+                selected_decode_post_moe_fwd,
+                lambda: build_selected_decode_post_moe_specs(args.decode_start_pos),
+                golden_selected_decode_post_moe,
             )
         )
     if args.case in ("all", "pre", "csa-topk-pre"):
@@ -1375,9 +1375,9 @@ def main() -> int:
         cases.append(
             (
                 "csa-topk-post",
-                swa_hash_selected_decode_post_moe_fwd,
-                lambda: build_swa_hash_selected_decode_post_moe_specs(args.decode_start_pos),
-                golden_csa_topk_selected_decode_post_moe,
+                selected_decode_post_moe_fwd,
+                lambda: build_selected_decode_post_moe_specs(args.decode_start_pos),
+                golden_selected_decode_post_moe,
             )
         )
 
@@ -1410,7 +1410,8 @@ __all__ = [
     "csa_hash_selected_decode_pre_moe_fwd",
     "csa_topk_selected_decode_pre_moe_fwd",
     "hca_topk_selected_decode_pre_moe_fwd",
-    "swa_hash_selected_decode_post_moe_fwd",
+    "selected_decode_post_moe_fwd",
+    "golden_selected_decode_post_moe",
     "golden_swa_hash_selected_decode_pre_moe",
     "golden_swa_hash_selected_decode_post_moe",
     "golden_csa_hash_selected_decode_pre_moe",
@@ -1423,5 +1424,5 @@ __all__ = [
     "build_csa_hash_selected_decode_pre_moe_specs",
     "build_csa_topk_selected_decode_pre_moe_specs",
     "build_hca_topk_selected_decode_pre_moe_specs",
-    "build_swa_hash_selected_decode_post_moe_specs",
+    "build_selected_decode_post_moe_specs",
 ]

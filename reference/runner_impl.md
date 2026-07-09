@@ -393,7 +393,7 @@ runner 实现后按以下顺序验证：
   - 带 head 时使用上一步 logits 的 argmax 作为下一步 decode token；`--no-head` 时使用随机 token 做 kernel 串联验证。
   - `--profile` 打印 host 侧 timing，用于定位权重加载、tensor materialize、kernel compile/run 和 state 更新开销。
   - `--verbose-layer-log` 打印逐层 start/done 和 finite 检查；默认关闭，避免长生成输出过多。
-  - `--routed-pack-cache-dir PATH` 从离线 bf16 routed pack cache 读取 MoE routed expert packed 权重，缺失层回退在线转换。
+  - `--expert-cache-dir PATH` 从离线 bf16 expert cache 读取 MoE routed expert 权重，缺失 expert 回退在线转换。
 - 生成入口
   - `python serving/generate.py ...`
   - 按 `../deepseek_v4_flash` 的流程调用官方 `encode_messages(...)`，再调用 tokenizer `encode(...)`。
@@ -418,7 +418,7 @@ Ascend 端已经完成的关键验证：
 python serving/generate.py \
   --checkpoint ~/dsv4_ckpt \
   --encoding-path ~/dsv4_ckpt/encoding \
-  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --expert-cache-dir ~/dsv4_bf16_expert_cache \
   --prompt '你好' \
   --max-new-tokens 20 \
   -p a2a3 -d {}
@@ -505,7 +505,7 @@ python serving/runner.py --checkpoint ../deepseek_v4_flash -p a2a3 -d 0 -s 13 --
 python serving/generate.py \
   --checkpoint ~/dsv4_ckpt \
   --encoding-path ~/dsv4_ckpt/encoding \
-  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --expert-cache-dir ~/dsv4_bf16_expert_cache \
   --prompt '你好' \
   --max-new-tokens 20 \
   -p a2a3 -d {}
@@ -517,17 +517,17 @@ python serving/generate.py \
 python serving/generate.py \
   --checkpoint ~/dsv4_ckpt \
   --encoding-path ~/dsv4_ckpt/encoding \
-  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --expert-cache-dir ~/dsv4_bf16_expert_cache \
   --prompt '你好' \
   --max-new-tokens 2 \
   -p a2a3 -d {} \
   --profile
 ```
 
-如果已经生成离线 routed pack cache，可以增加：
+如果已经生成离线 expert cache，可以增加：
 
 ```bash
---routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache
+--expert-cache-dir ~/dsv4_bf16_expert_cache
 ```
 
 `--profile` 会输出如下维度：
@@ -551,9 +551,10 @@ fp4/fp8 dequant、transpose 和 copy 等权重加载细分耗时。
 只清理 tensor cache，不关闭 file handle；`release()` 无参数或 `close()` 会释放 tensor cache
 并关闭所有 file handle。
 
-当前已实现 routed expert 离线 bf16 pack cache。`DeepSeekV4WeightLoader.get_layer_moe_routed_pack(...)`
-会优先读取 `--routed-pack-cache-dir` 中的 `layer_NNN_routed_pack.safetensors`，缺失时回退到
-官方 checkpoint 在线 fp4 反量化、转置和 packed tensor 写入。
+当前已实现 routed expert 离线 bf16 expert cache。`DeepSeekV4WeightLoader.get_moe_routed_expert(...)`
+会优先读取 `--expert-cache-dir` 中的 `layer_NNN_experts.safetensors`，缺失时回退到
+官方 checkpoint 在线 fp4 反量化和转置。prefill 的 full routed pack 和 decode 的 selected
+experts 都复用这一条 per-expert 加载路径。
 
 ## 优化计划
 
@@ -567,7 +568,7 @@ fp4/fp8 dequant、transpose 和 copy 等权重加载细分耗时。
    - 不先假设瓶颈，后续优化按 profile 数据排序。
 3. 继续优化权重加载路径。
    - 已完成 safetensors file handle cache。
-   - 已完成 routed expert 离线 bf16 pack cache。
+   - 已完成 routed expert 离线 bf16 expert cache。
    - 根据 profile 决定是否增加非 routed 权重的离线 bf16/runtime-layout cache。
    - 候选对象包括频繁发生 fp8/fp4 反量化、转置或 dtype 转换的 attention、compressor、indexer、gate、shared expert 权重。
 4. 聚焦 block kernel runtime。

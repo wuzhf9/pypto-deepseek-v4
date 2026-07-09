@@ -201,7 +201,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         weight_index=None,
         tokenizer_path=None,
         encoding_path=None,
-        routed_pack_cache_dir="cache",
+        expert_cache_dir="cache",
         prompt="hello",
         thinking_mode="chat",
         max_new_tokens=2,
@@ -224,7 +224,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
 
     assert captured["tokenizer_path"] == checkpoint
     assert captured["runner_args"] == (str(checkpoint),)
-    assert captured["runner_kwargs"]["routed_pack_cache_dir"] == "cache"
+    assert captured["runner_kwargs"]["expert_cache_dir"] == "cache"
     assert captured["runner_kwargs"]["verbose_layer_log"] is False
     assert result.text == "4"
     assert result.prompt_tokens == 3

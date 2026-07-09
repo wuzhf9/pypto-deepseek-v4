@@ -15,6 +15,7 @@ import torch
 from models import block as block_kernels
 from models import embedding as embedding_kernel
 from models import head as head_kernel
+from models import split_block as split_block_kernels
 from models.config import FLASH_CONFIG, DeepSeekV4FlashConfig
 from models.golden import TensorSpec
 from serving.profiler import ProfileRecorder, block_profile_fields
@@ -113,7 +114,7 @@ class DeepSeekV4Runner:
         run_head: bool = True,
         profile: bool = False,
         verbose_layer_log: bool = False,
-        routed_pack_cache_dir: str | None = None,
+        expert_cache_dir: str | None = None,
         runtime_cfg: dict[str, Any] | None = None,
     ) -> None:
         if max_layers is not None and not 0 <= max_layers <= config.n_layers:
@@ -130,7 +131,7 @@ class DeepSeekV4Runner:
             config=config,
             default_device="cpu",
             profile=self.profiler.enabled,
-            routed_pack_cache_dir=routed_pack_cache_dir,
+            expert_cache_dir=expert_cache_dir,
         )
         self.state = DeepSeekV4State(config=config, max_seq_len=max_seq_len, device="cpu")
 
@@ -149,7 +150,7 @@ class DeepSeekV4Runner:
             hidden = hidden_3d.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
 
             for layer_id in range(self.max_layers):
-                hidden = self._run_block(layer_id, hidden, input_ids=input_ids, start_pos=0, decode=False)
+                hidden = self._run_prefill_block(layer_id, hidden, input_ids=input_ids)
                 with self.profiler.timer("layer.release", layer=layer_id, mode="prefill"):
                     self._release_layer_weights(layer_id)
 
@@ -164,7 +165,7 @@ class DeepSeekV4Runner:
             hidden = hidden_3d.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
 
             for layer_id in range(self.max_layers):
-                hidden = self._run_block(layer_id, hidden, input_ids=input_ids, start_pos=start_pos, decode=True)
+                hidden = self._run_decode_block(layer_id, hidden, input_ids=input_ids, start_pos=start_pos)
                 with self.profiler.timer("layer.release", layer=layer_id, mode="decode"):
                     self._release_layer_weights(layer_id)
 
@@ -224,20 +225,18 @@ class DeepSeekV4Runner:
                 )
             return outputs["logits"].contiguous()
 
-    def _run_block(
+    def _run_prefill_block(
         self,
         layer_id: int,
         hidden: torch.Tensor,
         *,
         input_ids: torch.Tensor,
-        start_pos: int,
-        decode: bool,
     ) -> torch.Tensor:
         spec = self.state.layer_spec(layer_id)
         seq_len = int(hidden.shape[1])
-        case = self._block_case(spec, decode=decode, start_pos=start_pos, seq_len=seq_len)
-        specs = case.spec_builder(start_pos) if decode else case.spec_builder(seq_len)
-        mode = "decode" if decode else "prefill"
+        case = self._block_case(spec, decode=False, start_pos=0, seq_len=seq_len)
+        specs = case.spec_builder(seq_len)
+        mode = "prefill"
         if self.verbose_layer_log:
             print(
                 f"[RUNNER] layer {layer_id} start: mode={mode} ratio={spec.ratio} "
@@ -256,7 +255,7 @@ class DeepSeekV4Runner:
             with self.profiler.timer("layer.values", **profile_fields):
                 if self.profiler.enabled:
                     self.weight_loader.reset_profile_stats()
-                values = self._layer_values(layer_id, hidden, input_ids=input_ids, start_pos=start_pos, decode=decode)
+                values = self._prefill_block_values(layer_id, hidden, input_ids=input_ids)
             self.profiler.record_weight_loader("layer.weight_loader", self.weight_loader, **profile_fields)
             with self.profiler.timer("layer.materialize", **profile_fields):
                 tensors = self._materialize_specs(specs, values)
@@ -274,29 +273,169 @@ class DeepSeekV4Runner:
                 )
             return out
 
-    def _layer_values(
+    def _run_decode_block(
         self,
         layer_id: int,
         hidden: torch.Tensor,
         *,
         input_ids: torch.Tensor,
         start_pos: int,
-        decode: bool,
+    ) -> torch.Tensor:
+        spec = self.state.layer_spec(layer_id)
+        pre_case = self._selected_decode_pre_case(spec)
+        post_case = self._selected_decode_post_case()
+        pre_specs = pre_case.spec_builder(start_pos)
+        post_specs = post_case.spec_builder(start_pos)
+        if self.verbose_layer_log:
+            print(
+                f"[RUNNER] layer {layer_id} start: mode=decode ratio={spec.ratio} "
+                f"hash_route={spec.hash_route} kernel={pre_case.name}+{post_case.name} "
+                f"input={tuple(hidden.shape)}",
+                flush=True,
+            )
+
+        profile_fields = block_profile_fields(
+            layer=layer_id,
+            mode="decode",
+            ratio=spec.ratio,
+            hash_route=spec.hash_route,
+            kernel=pre_case.name,
+        )
+        post_profile_fields = {
+            **profile_fields,
+            "kernel": post_case.name,
+            "block_shape": "selected_decode_post_moe",
+        }
+        with self.profiler.timer("layer.total", **profile_fields):
+            with self.profiler.timer("layer.selected_decode.pre_values", **profile_fields):
+                if self.profiler.enabled:
+                    self.weight_loader.reset_profile_stats()
+                pre_values = self._decode_pre_moe_values(
+                    layer_id,
+                    hidden,
+                    input_ids=input_ids,
+                    start_pos=start_pos,
+                )
+            self.profiler.record_weight_loader("layer.selected_decode.pre_weight_loader", self.weight_loader, **profile_fields)
+            with self.profiler.timer("layer.selected_decode.pre_materialize", **profile_fields):
+                pre_tensors = self._materialize_specs(pre_specs, pre_values)
+            with self.profiler.backend_timer("layer.selected_decode.pre_kernel", self.backend, **profile_fields):
+                pre_outputs = self.backend.run(pre_case, pre_specs, pre_tensors)
+            with self.profiler.timer("layer.selected_decode.state_update", **profile_fields):
+                self.state.update_layer_state(layer_id, pre_outputs)
+
+            with self.profiler.timer("layer.selected_decode.post_values", **post_profile_fields):
+                if self.profiler.enabled:
+                    self.weight_loader.reset_profile_stats()
+                post_values = self._decode_post_moe_values(layer_id, pre_outputs)
+            self.profiler.record_weight_loader("layer.selected_decode.post_weight_loader", self.weight_loader, **post_profile_fields)
+            with self.profiler.timer("layer.selected_decode.post_materialize", **post_profile_fields):
+                post_tensors = self._materialize_specs(post_specs, post_values)
+            with self.profiler.backend_timer("layer.selected_decode.post_kernel", self.backend, **post_profile_fields):
+                post_outputs = self.backend.run(post_case, post_specs, post_tensors)
+
+            out = post_outputs["out"].contiguous()
+            if self.verbose_layer_log:
+                finite = bool(torch.isfinite(out.float()).all().item())
+                print(
+                    f"[RUNNER] layer {layer_id} done: output={tuple(out.shape)} "
+                    f"dtype={out.dtype} finite={finite}",
+                    flush=True,
+                )
+            return out
+
+    def _prefill_block_values(
+        self,
+        layer_id: int,
+        hidden: torch.Tensor,
+        *,
+        input_ids: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         spec = self.state.layer_spec(layer_id)
-        mode = "decode" if decode else "prefill"
+        mode = "prefill"
         with self.profiler.timer("layer.values.aux", layer=layer_id, mode=mode, ratio=spec.ratio):
-            aux = self.state.build_decode_inputs(layer_id, start_pos) if decode else self.state.build_prefill_inputs(layer_id, int(hidden.shape[1]))
+            aux = self.state.build_prefill_inputs(layer_id, int(hidden.shape[1]))
+        values = self._block_pre_moe_values(
+            layer_id,
+            hidden,
+            input_ids=input_ids,
+            mode=mode,
+            aux=aux,
+        )
+        with self.profiler.timer("layer.values.shared", layer=layer_id, mode=mode, ratio=spec.ratio):
+            shared = self.weight_loader.get_layer_moe_shared(layer_id)
+        values.update(
+            {
+                "shared_w1_t": shared.shared_w1_t,
+                "shared_w2_t": shared.shared_w2_t,
+                "shared_w3_t": shared.shared_w3_t,
+            }
+        )
+
+        with self.profiler.timer("layer.values.routed_pack", layer=layer_id, mode=mode, ratio=spec.ratio):
+            routed = self.weight_loader.get_layer_moe_routed_pack(layer_id, release_each_expert=True)
+        values.update(
+            {
+                "routed_w1_t": routed.routed_w1_t,
+                "routed_w2_t": routed.routed_w2_t,
+                "routed_w3_t": routed.routed_w3_t,
+            }
+        )
+        return values
+
+    def _decode_pre_moe_values(
+        self,
+        layer_id: int,
+        hidden: torch.Tensor,
+        *,
+        input_ids: torch.Tensor,
+        start_pos: int,
+    ) -> dict[str, torch.Tensor]:
+        spec = self.state.layer_spec(layer_id)
+        mode = "decode"
+        with self.profiler.timer("layer.values.aux", layer=layer_id, mode=mode, ratio=spec.ratio):
+            aux = self.state.build_decode_inputs(layer_id, start_pos)
+        return self._block_pre_moe_values(
+            layer_id,
+            hidden,
+            input_ids=input_ids,
+            mode=mode,
+            aux=aux,
+        )
+
+    def _decode_post_moe_values(self, layer_id: int, pre_outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        shared = self.weight_loader.get_layer_moe_shared(layer_id)
+        selected = self.weight_loader.get_layer_moe_selected_experts(layer_id, pre_outputs["indices"])
+        return {
+            "ffn_normed": pre_outputs["ffn_normed"],
+            "weights": pre_outputs["weights"],
+            "selected_w1_t": selected.selected_w1_t,
+            "selected_w2_t": selected.selected_w2_t,
+            "selected_w3_t": selected.selected_w3_t,
+            "shared_w1_t": shared.shared_w1_t,
+            "shared_w2_t": shared.shared_w2_t,
+            "shared_w3_t": shared.shared_w3_t,
+            "attn_hc_out": pre_outputs["attn_hc_out"],
+            "ffn_hc_post": pre_outputs["ffn_hc_post"],
+            "ffn_hc_comb": pre_outputs["ffn_hc_comb"],
+        }
+
+    def _block_pre_moe_values(
+        self,
+        layer_id: int,
+        hidden: torch.Tensor,
+        *,
+        input_ids: torch.Tensor,
+        mode: str,
+        aux: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        spec = self.state.layer_spec(layer_id)
         with self.profiler.timer("layer.values.hc", layer=layer_id, mode=mode, ratio=spec.ratio):
             hc = self.weight_loader.get_layer_hc(layer_id)
         with self.profiler.timer("layer.values.attn", layer=layer_id, mode=mode, ratio=spec.ratio):
             attn = self.weight_loader.get_layer_attention_common(layer_id)
         with self.profiler.timer("layer.values.gate", layer=layer_id, mode=mode, ratio=spec.ratio):
             gate = self.weight_loader.get_layer_moe_gate(layer_id, hash_route=spec.hash_route)
-        with self.profiler.timer("layer.values.shared", layer=layer_id, mode=mode, ratio=spec.ratio):
-            shared = self.weight_loader.get_layer_moe_shared(layer_id)
-        with self.profiler.timer("layer.values.routed_pack", layer=layer_id, mode=mode, ratio=spec.ratio):
-            routed = self.weight_loader.get_layer_moe_routed_pack(layer_id, release_each_expert=True)
         with self.profiler.timer("layer.values.ffn_norm", layer=layer_id, mode=mode, ratio=spec.ratio):
             ffn_norm_w = self.weight_loader.get_tensor(
                 f"layers.{layer_id}.ffn_norm.weight",
@@ -322,12 +461,6 @@ class DeepSeekV4Runner:
             "ffn_hc_base": hc.ffn_hc_base,
             "ffn_norm_w": ffn_norm_w,
             "gate_w_t": gate.gate_w_t,
-            "routed_w1_t": routed.routed_w1_t,
-            "routed_w2_t": routed.routed_w2_t,
-            "routed_w3_t": routed.routed_w3_t,
-            "shared_w1_t": shared.shared_w1_t,
-            "shared_w2_t": shared.shared_w2_t,
-            "shared_w3_t": shared.shared_w3_t,
             **aux,
         }
 
@@ -427,6 +560,41 @@ class DeepSeekV4Runner:
             )
         raise ValueError(f"unsupported block shape: layer={spec.layer_id} ratio={spec.ratio} hash_route={spec.hash_route}")
 
+    def _selected_decode_pre_case(self, spec: LayerSpec) -> _KernelCase:
+        if spec.ratio == 0 and spec.hash_route:
+            return _KernelCase(
+                "block_swa_hash_selected_decode_pre_moe_fwd",
+                split_block_kernels.swa_hash_selected_decode_pre_moe_fwd,
+                split_block_kernels.build_swa_hash_selected_decode_pre_moe_specs,
+            )
+        if spec.ratio == COMPRESS_RATIO4 and spec.hash_route:
+            return _KernelCase(
+                "block_csa_hash_selected_decode_pre_moe_fwd",
+                split_block_kernels.csa_hash_selected_decode_pre_moe_fwd,
+                split_block_kernels.build_csa_hash_selected_decode_pre_moe_specs,
+            )
+        if spec.ratio == COMPRESS_RATIO128 and not spec.hash_route:
+            return _KernelCase(
+                "block_hca_topk_selected_decode_pre_moe_fwd",
+                split_block_kernels.hca_topk_selected_decode_pre_moe_fwd,
+                split_block_kernels.build_hca_topk_selected_decode_pre_moe_specs,
+            )
+        if spec.ratio == COMPRESS_RATIO4 and not spec.hash_route:
+            return _KernelCase(
+                "block_csa_topk_selected_decode_pre_moe_fwd",
+                split_block_kernels.csa_topk_selected_decode_pre_moe_fwd,
+                split_block_kernels.build_csa_topk_selected_decode_pre_moe_specs,
+            )
+        raise ValueError(f"unsupported selected decode block shape: layer={spec.layer_id} ratio={spec.ratio} hash_route={spec.hash_route}")
+
+    @staticmethod
+    def _selected_decode_post_case() -> _KernelCase:
+        return _KernelCase(
+            "block_selected_decode_post_moe_fwd",
+            split_block_kernels.selected_decode_post_moe_fwd,
+            split_block_kernels.build_selected_decode_post_moe_specs,
+        )
+
     def _release_layer_weights(self, layer_id: int) -> None:
         self.weight_loader.release_prefix(f"layers.{layer_id}.")
 
@@ -470,7 +638,7 @@ def main() -> int:
     parser.add_argument("--decode-steps", type=int, default=0)
     parser.add_argument("--profile", action="store_true", default=False)
     parser.add_argument("--verbose-layer-log", action="store_true", default=False)
-    parser.add_argument("--routed-pack-cache-dir", type=str, default=None)
+    parser.add_argument("--expert-cache-dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if args.decode_steps < 0:
@@ -493,7 +661,7 @@ def main() -> int:
         run_head=not args.no_head,
         profile=args.profile,
         verbose_layer_log=args.verbose_layer_log,
-        routed_pack_cache_dir=args.routed_pack_cache_dir,
+        expert_cache_dir=args.expert_cache_dir,
     )
     try:
         out = runner.prefill(input_ids)

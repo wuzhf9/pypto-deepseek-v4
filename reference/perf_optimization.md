@@ -29,7 +29,7 @@
 python serving/generate.py \
   --checkpoint ~/dsv4_ckpt \
   --encoding-path ~/dsv4_ckpt/encoding \
-  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --expert-cache-dir ~/dsv4_bf16_expert_cache \
   --prompt '你好' \
   --max-new-tokens 2 \
   -p a2a3 -d {} \
@@ -41,7 +41,7 @@ python serving/generate.py \
 ```bash
 python serving/runner.py \
   --checkpoint ~/dsv4_ckpt \
-  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --expert-cache-dir ~/dsv4_bf16_expert_cache \
   -p a2a3 -d {} \
   -s 1 --decode-steps 1 --profile
 ```

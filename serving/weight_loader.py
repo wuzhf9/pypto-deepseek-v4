@@ -3,8 +3,9 @@
 This module is intentionally host-only.  It converts DeepSeek V4 Flash
 checkpoint tensors into the layouts expected by the kernels under ``models/``:
 quantized weights are materialized as BF16, ordinary linear weights are
-transposed to ``[in, out]`` except the LM head, and packed routed experts are
-stacked into the route-major tensors used by ``models/moe.py``.
+transposed to ``[in, out]`` except the LM head, and routed expert weights are
+materialized as the layouts expected by ``models/moe.py`` and
+``models/split_block.py``.
 """
 
 from collections import OrderedDict
@@ -149,6 +150,13 @@ class MoERoutedPackWeights:
     routed_w3_t: torch.Tensor
 
 
+@dataclass(frozen=True)
+class MoESelectedExpertWeights:
+    selected_w1_t: torch.Tensor
+    selected_w2_t: torch.Tensor
+    selected_w3_t: torch.Tensor
+
+
 def normalize_param_name(name: str) -> str:
     """Map HF checkpoint parameter names to inference-side names."""
     if name.startswith("model."):
@@ -225,7 +233,7 @@ class DeepSeekV4WeightLoader:
         default_device: str | torch.device = "cpu",
         max_cache_bytes: int = 0,
         profile: bool = False,
-        routed_pack_cache_dir: str | os.PathLike[str] | None = None,
+        expert_cache_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.index = self._load_index(weight_index)
@@ -233,7 +241,7 @@ class DeepSeekV4WeightLoader:
         self.default_device = torch.device(default_device)
         self.max_cache_bytes = max_cache_bytes
         self.profile = bool(profile)
-        self.routed_pack_cache_dir = Path(routed_pack_cache_dir) if routed_pack_cache_dir is not None else None
+        self.expert_cache_dir = Path(expert_cache_dir) if expert_cache_dir is not None else None
         self._cache: OrderedDict[tuple[str, str, bool, str | None], torch.Tensor] = OrderedDict()
         self._cache_bytes = 0
         self._file_handles: dict[Path, Any] = {}
@@ -427,11 +435,60 @@ class DeepSeekV4WeightLoader:
     ) -> MoERoutedExpertWeights:
         if not 0 <= expert_id < self.config.n_routed_experts:
             raise ValueError(f"expert_id must be in [0, {self.config.n_routed_experts}), got {expert_id}")
+        target = torch.device(device) if device is not None else self.default_device
+        cached = self._load_cached_expert(layer_id, expert_id, device=target)
+        if cached is not None:
+            return cached
+
         prefix = f"{self._layer_prefix(layer_id)}.ffn.experts.{expert_id}"
         return MoERoutedExpertWeights(
-            w1_t=self.get_linear_t(f"{prefix}.w1.weight", device=device),
-            w2_t=self.get_linear_t(f"{prefix}.w2.weight", device=device),
-            w3_t=self.get_linear_t(f"{prefix}.w3.weight", device=device),
+            w1_t=self.get_linear_t(f"{prefix}.w1.weight", device=target, cache=False),
+            w2_t=self.get_linear_t(f"{prefix}.w2.weight", device=target, cache=False),
+            w3_t=self.get_linear_t(f"{prefix}.w3.weight", device=target, cache=False),
+        )
+
+    def get_layer_moe_selected_experts(
+        self,
+        layer_id: int,
+        expert_ids: torch.Tensor | list[int] | tuple[int, ...],
+        *,
+        device: str | torch.device | None = None,
+    ) -> MoESelectedExpertWeights:
+        target = torch.device(device) if device is not None else self.default_device
+        ids = self._normalize_selected_expert_ids(expert_ids)
+        selected_w1_t = torch.empty(
+            self.config.n_activated_experts,
+            self.config.dim,
+            self.config.moe_inter_dim,
+            dtype=torch.bfloat16,
+            device=target,
+        )
+        selected_w2_t = torch.empty(
+            self.config.n_activated_experts,
+            self.config.moe_inter_dim,
+            self.config.dim,
+            dtype=torch.bfloat16,
+            device=target,
+        )
+        selected_w3_t = torch.empty(
+            self.config.n_activated_experts,
+            self.config.dim,
+            self.config.moe_inter_dim,
+            dtype=torch.bfloat16,
+            device=target,
+        )
+
+        start = time.perf_counter()
+        for slot, expert_id in enumerate(ids):
+            expert = self.get_moe_routed_expert(layer_id, expert_id, device=target)
+            selected_w1_t[slot].copy_(expert.w1_t)
+            selected_w2_t[slot].copy_(expert.w2_t)
+            selected_w3_t[slot].copy_(expert.w3_t)
+        self._record_profile("selected_experts.build", start)
+        return MoESelectedExpertWeights(
+            selected_w1_t=selected_w1_t.contiguous(),
+            selected_w2_t=selected_w2_t.contiguous(),
+            selected_w3_t=selected_w3_t.contiguous(),
         )
 
     def get_layer_moe_routed_pack(
@@ -443,9 +500,6 @@ class DeepSeekV4WeightLoader:
     ) -> MoERoutedPackWeights:
         del release_each_expert
         target = torch.device(device) if device is not None else self.default_device
-        cached = self._load_cached_routed_pack(layer_id, device=target)
-        if cached is not None:
-            return cached
 
         routed_w1_t = torch.empty(
             self.config.n_routed_experts,
@@ -470,10 +524,10 @@ class DeepSeekV4WeightLoader:
         )
 
         for expert_id in range(self.config.n_routed_experts):
-            prefix = f"{self._layer_prefix(layer_id)}.ffn.experts.{expert_id}"
-            self._copy_linear_t_into(routed_w1_t[expert_id], f"{prefix}.w1.weight", device=target)
-            self._copy_linear_t_into(routed_w2_t[expert_id], f"{prefix}.w2.weight", device=target)
-            self._copy_linear_t_into(routed_w3_t[expert_id], f"{prefix}.w3.weight", device=target)
+            expert = self.get_moe_routed_expert(layer_id, expert_id, device=target)
+            routed_w1_t[expert_id].copy_(expert.w1_t)
+            routed_w2_t[expert_id].copy_(expert.w2_t)
+            routed_w3_t[expert_id].copy_(expert.w3_t)
         return MoERoutedPackWeights(
             routed_w1_t=routed_w1_t.contiguous(),
             routed_w2_t=routed_w2_t.contiguous(),
@@ -513,6 +567,19 @@ class DeepSeekV4WeightLoader:
         self._validate_layer_id(layer_id)
         return f"layers.{layer_id}"
 
+    def _normalize_selected_expert_ids(self, expert_ids: torch.Tensor | list[int] | tuple[int, ...]) -> list[int]:
+        if isinstance(expert_ids, torch.Tensor):
+            ids = [int(x) for x in expert_ids.detach().cpu().reshape(-1).tolist()]
+        else:
+            ids = [int(x) for x in expert_ids]
+        expected = self.config.n_activated_experts
+        if len(ids) != expected:
+            raise ValueError(f"selected expert ids must contain {expected} entries, got {len(ids)}")
+        for expert_id in ids:
+            if not 0 <= expert_id < self.config.n_routed_experts:
+                raise ValueError(f"expert_id must be in [0, {self.config.n_routed_experts}), got {expert_id}")
+        return ids
+
     def _copy_linear_t_into(self, out: torch.Tensor, name: str, *, device: torch.device) -> None:
         tensor = self.get_linear_t(name, device=device, cache=False)
         if tuple(tensor.shape) != tuple(out.shape):
@@ -521,43 +588,41 @@ class DeepSeekV4WeightLoader:
         out.copy_(tensor)
         self._record_profile("copy_linear_t", start)
 
-    def routed_pack_cache_path(self, layer_id: int) -> Path | None:
+    def expert_cache_path(self, layer_id: int) -> Path | None:
         self._validate_layer_id(layer_id)
-        if self.routed_pack_cache_dir is None:
+        if self.expert_cache_dir is None:
             return None
-        return self.routed_pack_cache_dir / f"layer_{layer_id:03d}_routed_pack.safetensors"
+        return self.expert_cache_dir / f"layer_{layer_id:03d}_experts.safetensors"
 
-    def _load_cached_routed_pack(self, layer_id: int, *, device: torch.device) -> MoERoutedPackWeights | None:
-        path = self.routed_pack_cache_path(layer_id)
+    def _load_cached_expert(self, layer_id: int, expert_id: int, *, device: torch.device) -> MoERoutedExpertWeights | None:
+        path = self.expert_cache_path(layer_id)
         if path is None or not path.exists():
             return None
 
+        prefix = f"expert_{expert_id:03d}"
+        names = {
+            "w1_t": f"{prefix}.w1_t",
+            "w2_t": f"{prefix}.w2_t",
+            "w3_t": f"{prefix}.w3_t",
+        }
         start = time.perf_counter()
         handle = self._get_file_handle(path)
-        routed_w1_t = self._materialize_cached_tensor(handle.get_tensor("routed_w1_t"), device)
-        routed_w2_t = self._materialize_cached_tensor(handle.get_tensor("routed_w2_t"), device)
-        routed_w3_t = self._materialize_cached_tensor(handle.get_tensor("routed_w3_t"), device)
-        self._record_profile("routed_pack_cache.load", start)
+        keys = set(handle.keys())
+        if any(name not in keys for name in names.values()):
+            return None
 
-        self._validate_routed_pack_tensor(
-            "routed_w1_t",
-            routed_w1_t,
-            (self.config.n_routed_experts, self.config.dim, self.config.moe_inter_dim),
-        )
-        self._validate_routed_pack_tensor(
-            "routed_w2_t",
-            routed_w2_t,
-            (self.config.n_routed_experts, self.config.moe_inter_dim, self.config.dim),
-        )
-        self._validate_routed_pack_tensor(
-            "routed_w3_t",
-            routed_w3_t,
-            (self.config.n_routed_experts, self.config.dim, self.config.moe_inter_dim),
-        )
-        return MoERoutedPackWeights(
-            routed_w1_t=routed_w1_t.contiguous(),
-            routed_w2_t=routed_w2_t.contiguous(),
-            routed_w3_t=routed_w3_t.contiguous(),
+        w1_t = self._materialize_cached_tensor(handle.get_tensor(names["w1_t"]), device)
+        w2_t = self._materialize_cached_tensor(handle.get_tensor(names["w2_t"]), device)
+        w3_t = self._materialize_cached_tensor(handle.get_tensor(names["w3_t"]), device)
+        self._record_profile("expert_cache.load", start)
+
+        self._validate_expert_tensor("w1_t", w1_t, (self.config.dim, self.config.moe_inter_dim))
+        self._validate_expert_tensor("w2_t", w2_t, (self.config.moe_inter_dim, self.config.dim))
+        self._validate_expert_tensor("w3_t", w3_t, (self.config.dim, self.config.moe_inter_dim))
+        return MoERoutedExpertWeights(
+            w1_t=w1_t.contiguous(),
+            w2_t=w2_t.contiguous(),
+            w3_t=w3_t.contiguous(),
         )
 
     def _validate_layer_id(self, layer_id: int) -> None:
@@ -565,11 +630,11 @@ class DeepSeekV4WeightLoader:
             raise ValueError(f"layer_id must be in [0, {self.config.n_layers}), got {layer_id}")
 
     @staticmethod
-    def _validate_routed_pack_tensor(name: str, tensor: torch.Tensor, shape: tuple[int, ...]) -> None:
+    def _validate_expert_tensor(name: str, tensor: torch.Tensor, shape: tuple[int, ...]) -> None:
         if tuple(tensor.shape) != shape:
-            raise ValueError(f"{name} cache shape mismatch: expected {shape}, got {tuple(tensor.shape)}")
+            raise ValueError(f"{name} expert cache shape mismatch: expected {shape}, got {tuple(tensor.shape)}")
         if tensor.dtype is not torch.bfloat16:
-            raise TypeError(f"{name} cache dtype mismatch: expected torch.bfloat16, got {tensor.dtype}")
+            raise TypeError(f"{name} expert cache dtype mismatch: expected torch.bfloat16, got {tensor.dtype}")
 
     @staticmethod
     def _materialize_cached_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -740,13 +805,13 @@ def load_weight_loader_from_checkpoint(
     *,
     default_device: str | torch.device = "cpu",
     max_cache_bytes: int = 0,
-    routed_pack_cache_dir: str | os.PathLike[str] | None = None,
+    expert_cache_dir: str | os.PathLike[str] | None = None,
 ) -> DeepSeekV4WeightLoader:
     return DeepSeekV4WeightLoader(
         checkpoint_path,
         default_device=default_device,
         max_cache_bytes=max_cache_bytes,
-        routed_pack_cache_dir=routed_pack_cache_dir,
+        expert_cache_dir=expert_cache_dir,
     )
 
 
@@ -760,6 +825,7 @@ __all__ = [
     "MoEGateWeights",
     "MoERoutedExpertWeights",
     "MoERoutedPackWeights",
+    "MoESelectedExpertWeights",
     "MoESharedWeights",
     "dequant_fp4_weight_to_bf16",
     "dequant_fp8_weight_to_bf16",

@@ -27,6 +27,7 @@ def _small_config():
         hc_mult=2,
         n_layers=1,
         n_routed_experts=2,
+        n_activated_experts=2,
         moe_inter_dim=3,
         vocab_size=8,
     )
@@ -168,6 +169,36 @@ def test_loader_compressor_indexer_and_moe_layouts(tmp_path):
     assert packed.routed_w2_t.shape == (2, 3, 4)
     assert torch.equal(packed.routed_w3_t[0], tensors["model.layers.0.mlp.experts.0.up_proj.weight"].t())
 
+    selected = loader.get_layer_moe_selected_experts(0, torch.tensor([[1, 0]], dtype=torch.int32))
+    assert selected.selected_w1_t.shape == (2, 4, 3)
+    assert selected.selected_w2_t.shape == (2, 3, 4)
+    assert selected.selected_w3_t.shape == (2, 4, 3)
+    assert torch.equal(selected.selected_w1_t[0], tensors["model.layers.0.mlp.experts.1.gate_proj.weight"].t())
+    assert torch.equal(selected.selected_w2_t[0], tensors["model.layers.0.mlp.experts.1.down_proj.weight"].t())
+    assert torch.equal(selected.selected_w3_t[0], tensors["model.layers.0.mlp.experts.1.up_proj.weight"].t())
+    assert torch.equal(selected.selected_w1_t[1], tensors["model.layers.0.mlp.experts.0.gate_proj.weight"].t())
+    assert torch.equal(selected.selected_w2_t[1], tensors["model.layers.0.mlp.experts.0.down_proj.weight"].t())
+    assert torch.equal(selected.selected_w3_t[1], tensors["model.layers.0.mlp.experts.0.up_proj.weight"].t())
+
+
+def test_loader_selected_experts_validate_ids(tmp_path):
+    cfg = _small_config()
+    tensors = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": torch.full((3, 4), 1.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.0.down_proj.weight": torch.full((4, 3), 2.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.0.up_proj.weight": torch.full((3, 4), 3.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.gate_proj.weight": torch.full((3, 4), 4.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.down_proj.weight": torch.full((4, 3), 5.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.up_proj.weight": torch.full((3, 4), 6.0, dtype=torch.bfloat16),
+    }
+    index = _save_checkpoint(tmp_path, tensors)
+    loader = DeepSeekV4WeightLoader(tmp_path, index, config=cfg)
+
+    with pytest.raises(ValueError, match="selected expert ids"):
+        loader.get_layer_moe_selected_experts(0, [0])
+    with pytest.raises(ValueError, match="expert_id"):
+        loader.get_layer_moe_selected_experts(0, [0, cfg.n_routed_experts])
+
 
 def test_loader_dequantizes_quantized_weight_from_weight_map(tmp_path):
     if not hasattr(torch, "float8_e4m3fn"):
@@ -230,36 +261,55 @@ def test_loader_reuses_safetensors_file_handle(tmp_path):
     assert len(loader._file_handles) == 0
 
 
-def test_loader_uses_routed_pack_cache_when_available(tmp_path):
+def test_loader_uses_layer_expert_cache_for_expert_selected_and_pack(tmp_path):
     cfg = _small_config()
     checkpoint = tmp_path / "ckpt"
     checkpoint.mkdir()
-    cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
+    expert_cache_dir = tmp_path / "expert_cache"
+    expert_cache_dir.mkdir()
 
     tensors = {
         "model.layers.0.mlp.experts.0.gate_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
-        "model.layers.0.mlp.experts.0.down_proj.weight": torch.full((4, 3), -1.0, dtype=torch.bfloat16),
-        "model.layers.0.mlp.experts.0.up_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
-        "model.layers.0.mlp.experts.1.gate_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
-        "model.layers.0.mlp.experts.1.down_proj.weight": torch.full((4, 3), -1.0, dtype=torch.bfloat16),
-        "model.layers.0.mlp.experts.1.up_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.0.down_proj.weight": torch.full((4, 3), -2.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.0.up_proj.weight": torch.full((3, 4), -3.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.gate_proj.weight": torch.full((3, 4), -4.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.down_proj.weight": torch.full((4, 3), -5.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.up_proj.weight": torch.full((3, 4), -6.0, dtype=torch.bfloat16),
     }
     index = _save_checkpoint(checkpoint, tensors)
     save_file(
         {
-            "routed_w1_t": torch.full((2, 4, 3), 1.0, dtype=torch.bfloat16),
-            "routed_w2_t": torch.full((2, 3, 4), 2.0, dtype=torch.bfloat16),
-            "routed_w3_t": torch.full((2, 4, 3), 3.0, dtype=torch.bfloat16),
+            "expert_000.w1_t": torch.full((4, 3), 1.0, dtype=torch.bfloat16),
+            "expert_000.w2_t": torch.full((3, 4), 2.0, dtype=torch.bfloat16),
+            "expert_000.w3_t": torch.full((4, 3), 3.0, dtype=torch.bfloat16),
+            "expert_001.w1_t": torch.full((4, 3), 4.0, dtype=torch.bfloat16),
+            "expert_001.w2_t": torch.full((3, 4), 5.0, dtype=torch.bfloat16),
+            "expert_001.w3_t": torch.full((4, 3), 6.0, dtype=torch.bfloat16),
         },
-        cache_dir / "layer_000_routed_pack.safetensors",
+        expert_cache_dir / "layer_000_experts.safetensors",
     )
 
-    loader = DeepSeekV4WeightLoader(checkpoint, index, config=cfg, routed_pack_cache_dir=cache_dir)
+    loader = DeepSeekV4WeightLoader(checkpoint, index, config=cfg, expert_cache_dir=expert_cache_dir)
+    expert = loader.get_moe_routed_expert(0, 1)
+    assert torch.equal(expert.w1_t, torch.full((4, 3), 4.0, dtype=torch.bfloat16))
+    assert torch.equal(expert.w2_t, torch.full((3, 4), 5.0, dtype=torch.bfloat16))
+    assert torch.equal(expert.w3_t, torch.full((4, 3), 6.0, dtype=torch.bfloat16))
+
+    selected = loader.get_layer_moe_selected_experts(0, [1, 0])
+    assert torch.equal(selected.selected_w1_t[0], torch.full((4, 3), 4.0, dtype=torch.bfloat16))
+    assert torch.equal(selected.selected_w2_t[0], torch.full((3, 4), 5.0, dtype=torch.bfloat16))
+    assert torch.equal(selected.selected_w3_t[0], torch.full((4, 3), 6.0, dtype=torch.bfloat16))
+    assert torch.equal(selected.selected_w1_t[1], torch.full((4, 3), 1.0, dtype=torch.bfloat16))
+    assert torch.equal(selected.selected_w2_t[1], torch.full((3, 4), 2.0, dtype=torch.bfloat16))
+    assert torch.equal(selected.selected_w3_t[1], torch.full((4, 3), 3.0, dtype=torch.bfloat16))
+
     packed = loader.get_layer_moe_routed_pack(0)
-    assert torch.equal(packed.routed_w1_t, torch.full((2, 4, 3), 1.0, dtype=torch.bfloat16))
-    assert torch.equal(packed.routed_w2_t, torch.full((2, 3, 4), 2.0, dtype=torch.bfloat16))
-    assert torch.equal(packed.routed_w3_t, torch.full((2, 4, 3), 3.0, dtype=torch.bfloat16))
+    assert torch.equal(packed.routed_w1_t[0], torch.full((4, 3), 1.0, dtype=torch.bfloat16))
+    assert torch.equal(packed.routed_w1_t[1], torch.full((4, 3), 4.0, dtype=torch.bfloat16))
+    assert torch.equal(packed.routed_w2_t[0], torch.full((3, 4), 2.0, dtype=torch.bfloat16))
+    assert torch.equal(packed.routed_w2_t[1], torch.full((3, 4), 5.0, dtype=torch.bfloat16))
+    assert torch.equal(packed.routed_w3_t[0], torch.full((4, 3), 3.0, dtype=torch.bfloat16))
+    assert torch.equal(packed.routed_w3_t[1], torch.full((4, 3), 6.0, dtype=torch.bfloat16))
 
 
 def test_official_lowvram_weight_index_smoke_loads_representative_weights():
@@ -311,6 +361,12 @@ def test_official_lowvram_weight_index_smoke_loads_representative_weights():
     assert expert.w2_t.shape == (FLASH_CONFIG.moe_inter_dim, FLASH_CONFIG.dim)
     assert expert.w3_t.shape == (FLASH_CONFIG.dim, FLASH_CONFIG.moe_inter_dim)
     assert expert.w1_t.dtype is torch.bfloat16
+
+    selected = loader.get_layer_moe_selected_experts(0, torch.arange(FLASH_CONFIG.n_activated_experts, dtype=torch.int32))
+    assert selected.selected_w1_t.shape == (FLASH_CONFIG.n_activated_experts, FLASH_CONFIG.dim, FLASH_CONFIG.moe_inter_dim)
+    assert selected.selected_w2_t.shape == (FLASH_CONFIG.n_activated_experts, FLASH_CONFIG.moe_inter_dim, FLASH_CONFIG.dim)
+    assert selected.selected_w3_t.shape == (FLASH_CONFIG.n_activated_experts, FLASH_CONFIG.dim, FLASH_CONFIG.moe_inter_dim)
+    assert selected.selected_w1_t.dtype is torch.bfloat16
 
 
 def test_official_raw_safetensors_index_infers_quantized_weight_kind():

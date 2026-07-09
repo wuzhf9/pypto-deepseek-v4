@@ -342,38 +342,41 @@ for e in range(N_EXPERTS):
     routed_w3_t[e].copy_(get_linear_weight(f"layers.{N}.ffn.experts.{e}.w3.weight").t().contiguous())
 ```
 
-打包时要避免长时间同时保留原始官方布局权重和 packed 权重。后续如果 packed-expert
-显存不可接受，切换到 selected-expert 时复用 per-expert 加载接口。
+打包时要避免长时间同时保留原始官方布局权重和 packed 权重。当前 decode 已切换到
+selected-expert；prefill 仍需要 full routed pack，但 full pack 由 per-layer expert cache
+逐专家组装，不再维护单独的 routed pack cache 路径。
 
-## Routed Pack Offline Cache
+## Expert Offline Cache
 
-在线打包 routed experts 的主要耗时来自 fp4 -> bf16 反量化、转置和 packed tensor 写入。
-为了优化 prefill 和 decode 的启动成本，可以离线生成每层最终 kernel 布局的 bf16 cache。
+在线读取 routed experts 的主要耗时来自 fp4 -> bf16 反量化和转置。为了同时支持 prefill
+full routed pack 和 decode selected-expert，离线 cache 采用每层一个 safetensors 文件、
+每个 expert 独立存储的 bf16 布局。
 
 cache 目录结构：
 
 ```text
-bf16_routed_pack_cache/
+bf16_expert_cache/
 ├── manifest.json
-├── layer_000_routed_pack.safetensors
-├── layer_001_routed_pack.safetensors
+├── layer_000_experts.safetensors
+├── layer_001_experts.safetensors
 └── ...
 ```
 
-每个 `layer_NNN_routed_pack.safetensors` 包含：
+每个 `layer_NNN_experts.safetensors` 包含：
 
 ```text
-routed_w1_t [N_EXPERTS, 4096, 2048] bf16
-routed_w2_t [N_EXPERTS, 2048, 4096] bf16
-routed_w3_t [N_EXPERTS, 4096, 2048] bf16
+expert_000.w1_t [4096, 2048] bf16
+expert_000.w2_t [2048, 4096] bf16
+expert_000.w3_t [4096, 2048] bf16
+...
 ```
 
 生成命令：
 
 ```bash
-python serving/convert_routed_pack_cache.py \
+python serving/convert_expert_cache.py \
   --checkpoint ~/dsv4_ckpt \
-  --output ~/dsv4_bf16_routed_pack_cache \
+  --output ~/dsv4_bf16_expert_cache \
   --layers 0 \
   --overwrite \
   --profile
@@ -384,13 +387,14 @@ runner 使用命令：
 ```bash
 python serving/runner.py \
   --checkpoint ~/dsv4_ckpt \
-  --routed-pack-cache-dir ~/dsv4_bf16_routed_pack_cache \
+  --expert-cache-dir ~/dsv4_bf16_expert_cache \
   -p a2a3 -d {} -s 13 --max-layers 1 --no-head --profile
 ```
 
-`DeepSeekV4WeightLoader.get_layer_moe_routed_pack()` 会优先读取 cache 文件；如果对应层 cache
-不存在，则回退到官方 checkpoint 在线 fp4 反量化和打包。`release_prefix(...)` 不删除 cache
-文件，只清理内存中的 tensor cache。
+`DeepSeekV4WeightLoader.get_moe_routed_expert()` 会优先读取 expert cache；如果对应层或
+expert 缺失，则回退到官方 checkpoint 在线 fp4 反量化和转置。
+`get_layer_moe_routed_pack()` 和 `get_layer_moe_selected_experts()` 都复用同一条
+per-expert 加载路径。`release_prefix(...)` 不删除 cache 文件，只清理内存中的 tensor cache。
 
 ## MoE Routed Experts: Per-Expert 备选接口
 

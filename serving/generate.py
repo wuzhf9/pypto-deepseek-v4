@@ -213,7 +213,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--weight-index", type=str, default=None)
     parser.add_argument("--tokenizer-path", type=str, default=None)
     parser.add_argument("--encoding-path", type=str, default=None)
-    parser.add_argument("--routed-pack-cache-dir", type=str, default=None)
+    parser.add_argument("--expert-cache-dir", type=str, default=None)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--thinking-mode", choices=["chat", "thinking"], default="chat")
     parser.add_argument("--max-new-tokens", type=int, default=10)
@@ -305,7 +305,7 @@ def _create_runner(args: argparse.Namespace) -> Any:
         run_head=True,
         profile=args.profile,
         verbose_layer_log=args.verbose_layer_log,
-        routed_pack_cache_dir=args.routed_pack_cache_dir,
+        expert_cache_dir=args.expert_cache_dir,
     )
 
 
