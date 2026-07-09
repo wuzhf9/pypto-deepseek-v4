@@ -73,15 +73,14 @@ def hc_head_fwd(
     token_blocks = padded_tokens // T_TILE
     scale = pl.read(hc_scale, [0])
 
-    for t in pl.range(padded_tokens):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="head_hc_pad_x"):
-            for kb in pl.range(X_PAD_BLOCKS):
-                k0 = kb * X_PAD_CHUNK
-                if t < tokens:
-                    x_row = x_src_flat[t : t + 1, k0 : k0 + X_PAD_CHUNK]
-                else:
-                    x_row = pl.full([1, X_PAD_CHUNK], dtype=pl.BF16, value=0.0)
-                x_flat[t : t + 1, k0 : k0 + X_PAD_CHUNK] = x_row
+    for t in pl.spmd(padded_tokens, name_hint="head_hc_pad_x"):
+        for kb in pl.range(X_PAD_BLOCKS):
+            k0 = kb * X_PAD_CHUNK
+            if t < tokens:
+                x_row = x_src_flat[t : t + 1, k0 : k0 + X_PAD_CHUNK]
+            else:
+                x_row = pl.full([1, X_PAD_CHUNK], dtype=pl.BF16, value=0.0)
+            x_flat[t : t + 1, k0 : k0 + X_PAD_CHUNK] = x_row
 
     for tb in pl.range(token_blocks):
         t0 = tb * T_TILE
@@ -125,33 +124,35 @@ def hc_head_fwd(
                 pre_row = pl.slice(pre_tile, [1, HC_PAD], [row, 0])
                 pre_flat = pl.assemble(pre_flat, pre_row, [t0 + row, 0])
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="head_hc_reduce"):
-            pre_tile = pl.slice(pre_flat, [T_TILE, HC_PAD], [t0, 0])
-            pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
-            pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
-            pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
-            pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
-            pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
-            for db in pl.range(D_BLOCKS):
-                d0 = db * D_CHUNK
-                x_h0 = pl.cast(pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 0 * HIDDEN + d0]), target_type=pl.FP32)
-                x_h1 = pl.cast(pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 1 * HIDDEN + d0]), target_type=pl.FP32)
-                x_h2 = pl.cast(pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 2 * HIDDEN + d0]), target_type=pl.FP32)
-                x_h3 = pl.cast(pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 3 * HIDDEN + d0]), target_type=pl.FP32)
-                y_tile = pl.add(
-                    pl.add(pl.row_expand_mul(x_h0, pre0), pl.row_expand_mul(x_h1, pre1)),
-                    pl.add(pl.row_expand_mul(x_h2, pre2), pl.row_expand_mul(x_h3, pre3)),
-                )
-                y_out = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-                for row in pl.range(T_TILE):
-                    y_row = pl.slice(y_out, [1, D_CHUNK], [row, 0])
-                    out_pad_flat = pl.assemble(out_pad_flat, y_row, [t0 + row, d0])
+    for task in pl.spmd(token_blocks * D_BLOCKS, name_hint="head_hc_reduce"):
+        tb = task // D_BLOCKS
+        db = task % D_BLOCKS
+        t0 = tb * T_TILE
+        d0 = db * D_CHUNK
+        pre_tile = pl.slice(pre_flat, [T_TILE, HC_PAD], [t0, 0])
+        pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
+        pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
+        pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
+        pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
+        pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
+        x_h0 = pl.cast(pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 0 * HIDDEN + d0]), target_type=pl.FP32)
+        x_h1 = pl.cast(pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 1 * HIDDEN + d0]), target_type=pl.FP32)
+        x_h2 = pl.cast(pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 2 * HIDDEN + d0]), target_type=pl.FP32)
+        x_h3 = pl.cast(pl.slice(x_flat, [T_TILE, D_CHUNK], [t0, 3 * HIDDEN + d0]), target_type=pl.FP32)
+        y_tile = pl.add(
+            pl.add(pl.row_expand_mul(x_h0, pre0), pl.row_expand_mul(x_h1, pre1)),
+            pl.add(pl.row_expand_mul(x_h2, pre2), pl.row_expand_mul(x_h3, pre3)),
+        )
+        y_out = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+        for row in pl.range(T_TILE):
+            y_row = pl.slice(y_out, [1, D_CHUNK], [row, 0])
+            out_pad_flat = pl.assemble(out_pad_flat, y_row, [t0 + row, d0])
 
-    for t in pl.range(tokens):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="head_hc_copy_out"):
-            for db in pl.range(D_BLOCKS):
-                d0 = db * D_CHUNK
-                out_flat[t : t + 1, d0 : d0 + D_CHUNK] = out_pad_flat[t : t + 1, d0 : d0 + D_CHUNK]
+    for task in pl.spmd(tokens * D_BLOCKS, name_hint="head_hc_copy_out"):
+        t = task // D_BLOCKS
+        db = task % D_BLOCKS
+        d0 = db * D_CHUNK
+        out_flat[t : t + 1, d0 : d0 + D_CHUNK] = out_pad_flat[t : t + 1, d0 : d0 + D_CHUNK]
 
     return pl.reshape(out_flat, [B, tokens, HIDDEN])
 
@@ -160,7 +161,6 @@ def hc_head_fwd(
 def lm_head_fwd(
     normed: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
     head_w: pl.Tensor[[VOCAB, HIDDEN], pl.FP32],
-    logits_pad: pl.Tensor[[T_TILE, VOCAB], pl.FP32],
     logits: pl.Tensor[[B, VOCAB], pl.FP32],
 ):
     """Run official ``head.get_logits`` for the last token only."""
@@ -190,12 +190,7 @@ def lm_head_fwd(
                 xk = pl.cast(pl.slice(last_hidden, [T_TILE, K_TILE], [0, k0]), target_type=pl.FP32)
                 wk = pl.slice(head_w, [VOCAB_TILE, K_TILE], [v0, k0])
                 acc = pl.matmul_acc(acc, xk, wk, b_trans=True)
-            logits_pad = pl.assemble(logits_pad, acc, [0, v0])
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="head_lm_store"):
-        for vb in pl.range(VOCAB_BLOCKS):
-            v0 = vb * VOCAB_TILE
-            logits_tile = pl.slice(logits_pad, [1, VOCAB_TILE], [0, v0])
+            logits_tile = pl.set_validshape(acc, 1, VOCAB_TILE)
             logits = pl.assemble(logits, logits_tile, [0, v0])
 
     return logits
@@ -223,10 +218,9 @@ def head_fwd(
     tokens = pl.tensor.dim(x, 1)
     hc_out = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
     normed = pl.create_tensor([B, tokens, HIDDEN], dtype=pl.BF16)
-    logits_pad = pl.create_tensor([T_TILE, VOCAB], dtype=pl.FP32)
     hc_out = hc_head_fwd(x, x_pad, hc_fn_t, hc_scale, hc_base, pre, hc_out_pad, hc_out)
     normed = rmsnorm_4096(hc_out, norm_w, normed)
-    logits = lm_head_fwd(normed, head_w, logits_pad, logits)
+    logits = lm_head_fwd(normed, head_w, logits)
     return logits
 
 
