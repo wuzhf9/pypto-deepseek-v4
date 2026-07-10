@@ -42,12 +42,13 @@ def test_golden_embedding_matches_official_parallel_embedding(tiny_embedding, se
     input_ids = _input_ids(seq_len)
 
     with torch.no_grad():
-        expected = tiny_embedding(input_ids)
+        h = tiny_embedding(input_ids)
+        expected = h.unsqueeze(2).repeat(1, 1, embedding.HC_MULT, 1)
 
     tensors = {
         "input_ids": input_ids.clone(),
         "weight": tiny_embedding.weight.detach().clone(),
-        "out": torch.zeros(1, seq_len, HIDDEN, dtype=torch.bfloat16),
+        "out": torch.zeros(1, seq_len, embedding.HC_MULT, HIDDEN, dtype=torch.bfloat16),
     }
     embedding.golden_embedding(tensors)
 
@@ -66,5 +67,5 @@ def test_build_embedding_specs_shapes_and_dtypes(monkeypatch) -> None:
     assert tensors["input_ids"].dtype == torch.int64
     assert tensors["weight"].shape == (VOCAB, HIDDEN)
     assert tensors["weight"].dtype == torch.bfloat16
-    assert tensors["out"].shape == (1, seq_len, HIDDEN)
+    assert tensors["out"].shape == (1, seq_len, embedding.HC_MULT, HIDDEN)
     assert tensors["out"].dtype == torch.bfloat16

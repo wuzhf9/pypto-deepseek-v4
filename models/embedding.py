@@ -10,6 +10,7 @@ B = 1
 S_DYN = pl.dynamic("S_DYN")
 VOCAB = M.vocab_size
 HIDDEN = M.dim
+HC_MULT = M.hc_mult
 DEFAULT_SEQ_LEN = 8
 
 D_TILE = 128
@@ -21,31 +22,35 @@ H_BLOCKS = HIDDEN // D_TILE
 def embedding_fwd(
     input_ids: pl.Tensor[[B, S_DYN], pl.INT64],
     weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    out: pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16],
+    out: pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16],
 ):
-    """Run official single-card ``ParallelEmbedding.forward``."""
+    """Embed tokens and repeat each hidden row across the HC lanes."""
     input_ids.bind_dynamic(1, S_DYN)
     out.bind_dynamic(1, S_DYN)
 
     tokens = pl.tensor.dim(input_ids, 1)
     input_flat = pl.reshape(input_ids, [tokens])
-    out_flat = pl.reshape(out, [tokens, HIDDEN])
+    out_flat = pl.reshape(out, [tokens * HC_MULT, HIDDEN])
 
     for work in pl.spmd(tokens * H_BLOCKS, name_hint="embedding"):
         t = work // H_BLOCKS
         hb = work - t * H_BLOCKS
         token_id = pl.cast(pl.read(input_flat, [t]), pl.INDEX)
         h0 = hb * D_TILE
-        out_flat[t : t + 1, h0 : h0 + D_TILE] = weight[token_id : token_id + 1, h0 : h0 + D_TILE]
+        for hc in pl.range(HC_MULT):
+            dst = t * HC_MULT + hc
+            out_flat[dst : dst + 1, h0 : h0 + D_TILE] = weight[
+                token_id : token_id + 1, h0 : h0 + D_TILE
+            ]
 
-    return pl.reshape(out_flat, [B, tokens, HIDDEN])
+    return pl.reshape(out_flat, [B, tokens, HC_MULT, HIDDEN])
 
 
 @pl.jit
 def embedding_test(
     input_ids: pl.Tensor[[B, S_DYN], pl.INT64],
     weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    out: pl.Out[pl.Tensor[[B, S_DYN, HIDDEN], pl.BF16]],
+    out: pl.Out[pl.Tensor[[B, S_DYN, HC_MULT, HIDDEN], pl.BF16]],
 ):
     out = embedding_fwd(input_ids, weight, out)
     return out
@@ -56,7 +61,8 @@ def golden_embedding(tensors):
 
     input_ids = tensors["input_ids"].long()
     weight = tensors["weight"]
-    tensors["out"][:] = F.embedding(input_ids, weight)
+    h = F.embedding(input_ids, weight)
+    tensors["out"][:] = h.unsqueeze(2).repeat(1, 1, HC_MULT, 1)
 
 
 def build_embedding_specs(seq_len: int = DEFAULT_SEQ_LEN):
@@ -73,7 +79,7 @@ def build_embedding_specs(seq_len: int = DEFAULT_SEQ_LEN):
     return [
         TensorSpec("input_ids", [B, seq_len], torch.int64, init_value=init_input_ids),
         TensorSpec("weight", [VOCAB, HIDDEN], torch.bfloat16, init_value=init_weight),
-        TensorSpec("out", [B, seq_len, HIDDEN], torch.bfloat16, is_output=True),
+        TensorSpec("out", [B, seq_len, HC_MULT, HIDDEN], torch.bfloat16, is_output=True),
     ]
 
 
@@ -122,6 +128,7 @@ __all__ = [
     "S_DYN",
     "VOCAB",
     "HIDDEN",
+    "HC_MULT",
     "DEFAULT_SEQ_LEN",
     "D_TILE",
     "H_BLOCKS",

@@ -146,8 +146,7 @@ class DeepSeekV4Runner:
         input_ids = self._validate_prefill_input_ids(input_ids)
         seq_len = int(input_ids.shape[1])
         with self.profiler.timer("prefill.total", seq_len=seq_len, max_layers=self.max_layers, run_head=self.run_head):
-            hidden_3d = self._run_embedding(input_ids)
-            hidden = hidden_3d.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+            hidden = self._run_embedding(input_ids)
 
             for layer_id in range(self.max_layers):
                 hidden = self._run_prefill_block(layer_id, hidden, input_ids=input_ids)
@@ -159,8 +158,7 @@ class DeepSeekV4Runner:
     def decode(self, input_ids: torch.Tensor, *, start_pos: int) -> torch.Tensor:
         input_ids = self._validate_decode_input_ids(input_ids, start_pos=start_pos)
         with self.profiler.timer("decode.total", start_pos=start_pos, max_layers=self.max_layers, run_head=self.run_head):
-            hidden_3d = self._run_embedding(input_ids)
-            hidden = hidden_3d.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
+            hidden = self._run_embedding(input_ids)
 
             for layer_id in range(self.max_layers):
                 hidden = self._run_decode_block(layer_id, hidden, input_ids=input_ids, start_pos=start_pos)
