@@ -708,7 +708,7 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
     from models.golden import TensorSpec
 
     freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(
-        compress_ratio=COMPRESS_RATIO,
+        compress=True,
         max_seq_len=start_pos + seq_len,
     )
     local_cos, local_sin = materialize_rope_range(freqs_cos, freqs_sin, start_pos, seq_len)

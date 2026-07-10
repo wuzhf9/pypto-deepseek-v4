@@ -23,9 +23,9 @@ ROPE_PREFIX_TILE = 64
 DEFAULT_SEQ_LEN = 8
 
 
-def rope_profile_for_compress_ratio(config: Any, compress_ratio: int) -> tuple[float, int]:
+def rope_profile_for_compress(config: Any, compress: bool) -> tuple[float, int]:
     """Return ``(base_theta, original_seq_len)`` for an attention RoPE profile."""
-    if compress_ratio:
+    if compress:
         return float(config.compress_rope_theta), int(config.original_seq_len)
     return float(config.rope_theta), 0
 
@@ -101,14 +101,14 @@ def precompute_freqs_cos_sin(
 
 def build_deepseek_v4_rope_tables(
     config: Any = FLASH_CONFIG,
-    compress_ratio: int = 0,
+    compress: bool = False,
     *,
     max_seq_len: int | None = None,
     rope_dim: int | None = None,
     device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(cos, sin)`` shaped ``[max_seq_len, rope_dim // 2]`` in FP32."""
-    base, original_seq_len = rope_profile_for_compress_ratio(config, compress_ratio)
+    base, original_seq_len = rope_profile_for_compress(config, compress)
     seq_len = int(max_seq_len if max_seq_len is not None else config.max_position_embeddings)
     dim = int(rope_dim if rope_dim is not None else config.rope_head_dim)
 
@@ -684,7 +684,7 @@ __all__ = [
     "ROPE_T_TILE",
     "ROPE_PREFIX_TILE",
     "DEFAULT_SEQ_LEN",
-    "rope_profile_for_compress_ratio",
+    "rope_profile_for_compress",
     "precompute_freqs_cos_sin",
     "build_deepseek_v4_rope_tables",
     "materialize_rope_range",

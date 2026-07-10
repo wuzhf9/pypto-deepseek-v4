@@ -535,7 +535,7 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
     from models.golden import TensorSpec
 
     attn_cos_all, attn_sin_all = build_deepseek_v4_rope_tables(
-        compress_ratio=COMPRESS_RATIO,
+        compress=True,
         max_seq_len=start_pos + seq_len,
     )
     local_cos, local_sin = materialize_rope_range(attn_cos_all, attn_sin_all, start_pos, seq_len)
@@ -544,7 +544,7 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
         if comp_should:
             comp_rope_pos = start_pos + 1 - COMPRESS_RATIO
             comp_cos_all, comp_sin_all = build_deepseek_v4_rope_tables(
-                compress_ratio=COMPRESS_RATIO,
+                compress=True,
                 max_seq_len=max(start_pos + seq_len, comp_rope_pos + 1),
             )
             comp_cos = comp_cos_all[comp_rope_pos : comp_rope_pos + 1].contiguous()
@@ -558,7 +558,7 @@ def _common_specs(seq_len: int, start_pos: int, *, decode: bool):
         blocks = seq_len // COMPRESS_RATIO
         compressed_len = max(1, blocks)
         comp_cos_all, comp_sin_all = build_deepseek_v4_rope_tables(
-            compress_ratio=COMPRESS_RATIO,
+            compress=True,
             max_seq_len=seq_len,
         )
         comp_cos, comp_sin = materialize_compressor_rope(comp_cos_all, comp_sin_all, seq_len, COMPRESS_RATIO)

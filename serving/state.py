@@ -120,8 +120,8 @@ def build_compress_topk_idxs(
     return topk
 
 
-def rope_profile_for_compress_ratio(config: Any, compress_ratio: int) -> tuple[float, int]:
-    if compress_ratio:
+def rope_profile_for_compress(config: Any, compress: bool) -> tuple[float, int]:
+    if compress:
         return float(config.compress_rope_theta), int(config.original_seq_len)
     return float(config.rope_theta), 0
 
@@ -174,13 +174,13 @@ def precompute_freqs_cos_sin(
 
 def build_deepseek_v4_rope_tables(
     config: Any = FLASH_CONFIG,
-    compress_ratio: int = 0,
+    compress: bool = False,
     *,
     max_seq_len: int,
     rope_dim: int | None = None,
     device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    base, original_seq_len = rope_profile_for_compress_ratio(config, compress_ratio)
+    base, original_seq_len = rope_profile_for_compress(config, compress)
     dim = int(rope_dim if rope_dim is not None else config.rope_head_dim)
     return precompute_freqs_cos_sin(
         dim,
@@ -270,22 +270,25 @@ class DeepSeekV4State:
         self.layers = [self._init_layer_state(layer_id) for layer_id in range(config.n_layers)]
         self._normal_rope = build_deepseek_v4_rope_tables(
             config,
-            compress_ratio=0,
+            compress=False,
             max_seq_len=max_seq_len,
             device=self.device,
         )
-        self._compress4_rope = build_deepseek_v4_rope_tables(
+        self._compressed_rope = build_deepseek_v4_rope_tables(
             config,
-            compress_ratio=COMPRESS_RATIO4,
+            compress=True,
             max_seq_len=max_seq_len,
             device=self.device,
         )
-        self._compress128_rope = build_deepseek_v4_rope_tables(
-            config,
-            compress_ratio=COMPRESS_RATIO128,
-            max_seq_len=max_seq_len,
-            device=self.device,
+        rope_width = self._compressed_rope[0].shape[-1]
+        self._zero_compressor_rope = (
+            torch.zeros(1, rope_width, dtype=torch.float32, device=self.device),
+            torch.zeros(1, rope_width, dtype=torch.float32, device=self.device),
         )
+        self._prefill_cache_seq_len: int | None = None
+        self._prefill_aux_cache: dict[object, Any] = {}
+        self._decode_cache_start_pos: int | None = None
+        self._decode_aux_cache: dict[object, Any] = {}
 
     def layer_spec(self, layer_id: int) -> LayerSpec:
         return self.layer_state(layer_id).spec
@@ -297,58 +300,7 @@ class DeepSeekV4State:
     def build_prefill_inputs(self, layer_id: int, seq_len: int) -> dict[str, torch.Tensor]:
         self._validate_seq_len(seq_len)
         spec = self.layer_spec(layer_id)
-        cos, sin = self._main_rope_for_layer(spec, 0, seq_len)
-
-        if spec.ratio == 0:
-            return {
-                "topk_idxs": build_window_topk_idxs(seq_len, start_pos=0, topk_max=self.config.window_size),
-                "cos": cos,
-                "sin": sin,
-            }
-        if spec.ratio == COMPRESS_RATIO128:
-            window_topk = build_window_topk_idxs(seq_len, start_pos=0, topk_max=self.config.window_size)
-            compress_topk = build_compress_topk_idxs(
-                COMPRESS_RATIO128,
-                seq_len,
-                start_pos=0,
-                offset=seq_len,
-                topk_max=self.topk_hca,
-            )
-            comp_cos, comp_sin = materialize_compressor_rope(
-                self._compress128_rope[0],
-                self._compress128_rope[1],
-                seq_len,
-                COMPRESS_RATIO128,
-            )
-            return {
-                "topk_idxs": torch.cat([window_topk, compress_topk], dim=-1),
-                "cos": cos,
-                "sin": sin,
-                "comp_cos": comp_cos,
-                "comp_sin": comp_sin,
-                "comp_block_count": self._scalar_int(seq_len // COMPRESS_RATIO128),
-            }
-        if spec.ratio == COMPRESS_RATIO4:
-            comp_cos, comp_sin = materialize_compressor_rope(
-                self._compress4_rope[0],
-                self._compress4_rope[1],
-                seq_len,
-                COMPRESS_RATIO4,
-            )
-            block_count = seq_len // COMPRESS_RATIO4
-            return {
-                "window_topk_idxs": build_window_topk_idxs(seq_len, start_pos=0, topk_max=self.config.window_size),
-                "cos": cos,
-                "sin": sin,
-                "attn_comp_cos": comp_cos,
-                "attn_comp_sin": comp_sin,
-                "attn_comp_block_count": self._scalar_int(block_count),
-                "idx_offset": self._scalar_int(seq_len),
-                "idx_comp_cos": comp_cos.clone(),
-                "idx_comp_sin": comp_sin.clone(),
-                "idx_comp_block_count": self._scalar_int(block_count),
-            }
-        raise ValueError(f"Unsupported compress ratio: {spec.ratio}")
+        return dict(self._get_prefill_aux(spec.ratio, seq_len))
 
     def build_decode_inputs(self, layer_id: int, start_pos: int) -> dict[str, torch.Tensor]:
         if start_pos <= 0:
@@ -356,55 +308,23 @@ class DeepSeekV4State:
         self._validate_start_pos(start_pos)
         state = self.layer_state(layer_id)
         spec = state.spec
-        cos, sin = self._main_rope_for_layer(spec, start_pos, 1)
-        inputs = {
-            "kv_cache": state.kv_cache,
-            "cache_pos": self._scalar_int(start_pos % self.config.window_size),
-            "cos": cos,
-            "sin": sin,
-        }
+        inputs = dict(self._get_decode_aux(spec.ratio, start_pos))
+        inputs["kv_cache"] = state.kv_cache
 
         if spec.ratio == 0:
-            inputs["topk_idxs"] = build_window_topk_idxs(1, start_pos=start_pos, topk_max=self.config.window_size)
             return inputs
 
         if spec.ratio == COMPRESS_RATIO128:
-            window_topk = build_window_topk_idxs(1, start_pos=start_pos, topk_max=self.config.window_size)
-            compress_topk = build_compress_topk_idxs(
-                COMPRESS_RATIO128,
-                1,
-                start_pos=start_pos,
-                offset=self.config.window_size,
-                topk_max=self.topk_hca,
-            )
-            comp_cos, comp_sin = materialize_decode_compressor_rope(
-                self._compress128_rope[0],
-                self._compress128_rope[1],
-                start_pos,
-                COMPRESS_RATIO128,
-            )
             inputs.update(
                 {
                     "comp_kv_state": self._required(state.comp_kv_state, "comp_kv_state"),
                     "comp_score_state": self._required(state.comp_score_state, "comp_score_state"),
                     "comp_cache": self._required(state.comp_cache, "comp_cache"),
-                    "topk_idxs": torch.cat([window_topk, compress_topk], dim=-1),
-                    "comp_slot": self._scalar_int(start_pos % COMPRESS_RATIO128),
-                    "comp_cache_slot": self._scalar_int(start_pos // COMPRESS_RATIO128),
-                    "comp_should_compress": self._scalar_int(int((start_pos + 1) % COMPRESS_RATIO128 == 0)),
-                    "comp_cos": comp_cos,
-                    "comp_sin": comp_sin,
                 }
             )
             return inputs
 
         if spec.ratio == COMPRESS_RATIO4:
-            comp_cos, comp_sin = materialize_decode_compressor_rope(
-                self._compress4_rope[0],
-                self._compress4_rope[1],
-                start_pos,
-                COMPRESS_RATIO4,
-            )
             inputs.update(
                 {
                     "attn_comp_kv_state": self._required(state.attn_comp_kv_state, "attn_comp_kv_state"),
@@ -413,20 +333,223 @@ class DeepSeekV4State:
                     "idx_kv_cache_in": self._required(state.idx_kv_cache, "idx_kv_cache"),
                     "idx_comp_kv_state": self._required(state.idx_comp_kv_state, "idx_comp_kv_state"),
                     "idx_comp_score_state": self._required(state.idx_comp_score_state, "idx_comp_score_state"),
-                    "window_topk_idxs": build_window_topk_idxs(1, start_pos=start_pos, topk_max=self.config.window_size),
-                    "comp_slot": self._scalar_int(start_pos % COMPRESS_RATIO4),
-                    "comp_cache_slot": self._scalar_int(start_pos // COMPRESS_RATIO4),
-                    "comp_should_compress": self._scalar_int(int((start_pos + 1) % COMPRESS_RATIO4 == 0)),
-                    "idx_offset": self._scalar_int(self.config.window_size),
-                    "attn_comp_cos": comp_cos,
-                    "attn_comp_sin": comp_sin,
-                    "idx_comp_cos": comp_cos.clone(),
-                    "idx_comp_sin": comp_sin.clone(),
                 }
             )
             return inputs
 
         raise ValueError(f"Unsupported compress ratio: {spec.ratio}")
+
+    def _get_prefill_aux(self, ratio: int, seq_len: int) -> dict[str, torch.Tensor]:
+        """Return immutable prefill inputs shared by layers of one ratio."""
+        if self._prefill_cache_seq_len != seq_len:
+            self._prefill_cache_seq_len = seq_len
+            self._prefill_aux_cache.clear()
+
+        cache = self._prefill_aux_cache
+        bundle_key = ("bundle", ratio)
+        cached = cache.get(bundle_key)
+        if cached is not None:
+            return cached
+
+        window_topk = cache.get("window_topk")
+        if window_topk is None:
+            window_topk = build_window_topk_idxs(
+                seq_len,
+                start_pos=0,
+                topk_max=self.config.window_size,
+            )
+            cache["window_topk"] = window_topk
+
+        cos, sin = self._cached_main_rope(cache, ratio, start_pos=0, seq_len=seq_len)
+        if ratio == 0:
+            aux = {
+                "topk_idxs": window_topk,
+                "cos": cos,
+                "sin": sin,
+            }
+        elif ratio == COMPRESS_RATIO4:
+            comp_cos, comp_sin = self._cached_prefill_compressor_rope(cache, seq_len, ratio)
+            block_count = self._cached_scalar(cache, ("block_count", ratio), seq_len // ratio)
+            aux = {
+                "window_topk_idxs": window_topk,
+                "cos": cos,
+                "sin": sin,
+                "attn_comp_cos": comp_cos,
+                "attn_comp_sin": comp_sin,
+                "attn_comp_block_count": block_count,
+                "idx_offset": self._cached_scalar(cache, "idx_offset", seq_len),
+                "idx_comp_cos": comp_cos,
+                "idx_comp_sin": comp_sin,
+                "idx_comp_block_count": block_count,
+            }
+        elif ratio == COMPRESS_RATIO128:
+            compress_topk = build_compress_topk_idxs(
+                ratio,
+                seq_len,
+                start_pos=0,
+                offset=seq_len,
+                topk_max=self.topk_hca,
+            )
+            comp_cos, comp_sin = self._cached_prefill_compressor_rope(cache, seq_len, ratio)
+            aux = {
+                "topk_idxs": torch.cat([window_topk, compress_topk], dim=-1),
+                "cos": cos,
+                "sin": sin,
+                "comp_cos": comp_cos,
+                "comp_sin": comp_sin,
+                "comp_block_count": self._cached_scalar(cache, ("block_count", ratio), seq_len // ratio),
+            }
+        else:
+            raise ValueError(f"Unsupported compress ratio: {ratio}")
+
+        cache[bundle_key] = aux
+        return aux
+
+    def _get_decode_aux(self, ratio: int, start_pos: int) -> dict[str, torch.Tensor]:
+        """Return immutable decode inputs shared for the active token position."""
+        if self._decode_cache_start_pos != start_pos:
+            self._decode_cache_start_pos = start_pos
+            self._decode_aux_cache.clear()
+
+        cache = self._decode_aux_cache
+        bundle_key = ("bundle", ratio)
+        cached = cache.get(bundle_key)
+        if cached is not None:
+            return cached
+
+        window_topk = cache.get("window_topk")
+        if window_topk is None:
+            window_topk = build_window_topk_idxs(
+                1,
+                start_pos=start_pos,
+                topk_max=self.config.window_size,
+            )
+            cache["window_topk"] = window_topk
+
+        cos, sin = self._cached_main_rope(cache, ratio, start_pos=start_pos, seq_len=1)
+        common = {
+            "cache_pos": self._cached_scalar(
+                cache,
+                "cache_pos",
+                start_pos % self.config.window_size,
+            ),
+            "cos": cos,
+            "sin": sin,
+        }
+        if ratio == 0:
+            aux = {
+                **common,
+                "topk_idxs": window_topk,
+            }
+        elif ratio == COMPRESS_RATIO4:
+            comp_cos, comp_sin = self._cached_decode_compressor_rope(cache, start_pos, ratio)
+            aux = {
+                **common,
+                "window_topk_idxs": window_topk,
+                "comp_slot": self._cached_scalar(cache, ("comp_slot", ratio), start_pos % ratio),
+                "comp_cache_slot": self._cached_scalar(cache, ("comp_cache_slot", ratio), start_pos // ratio),
+                "comp_should_compress": self._cached_scalar(
+                    cache,
+                    ("comp_should_compress", ratio),
+                    int((start_pos + 1) % ratio == 0),
+                ),
+                "idx_offset": self._cached_scalar(cache, "idx_offset", self.config.window_size),
+                "attn_comp_cos": comp_cos,
+                "attn_comp_sin": comp_sin,
+                "idx_comp_cos": comp_cos,
+                "idx_comp_sin": comp_sin,
+            }
+        elif ratio == COMPRESS_RATIO128:
+            compress_topk = build_compress_topk_idxs(
+                ratio,
+                1,
+                start_pos=start_pos,
+                offset=self.config.window_size,
+                topk_max=self.topk_hca,
+            )
+            comp_cos, comp_sin = self._cached_decode_compressor_rope(cache, start_pos, ratio)
+            aux = {
+                **common,
+                "topk_idxs": torch.cat([window_topk, compress_topk], dim=-1),
+                "comp_slot": self._cached_scalar(cache, ("comp_slot", ratio), start_pos % ratio),
+                "comp_cache_slot": self._cached_scalar(cache, ("comp_cache_slot", ratio), start_pos // ratio),
+                "comp_should_compress": self._cached_scalar(
+                    cache,
+                    ("comp_should_compress", ratio),
+                    int((start_pos + 1) % ratio == 0),
+                ),
+                "comp_cos": comp_cos,
+                "comp_sin": comp_sin,
+            }
+        else:
+            raise ValueError(f"Unsupported compress ratio: {ratio}")
+
+        cache[bundle_key] = aux
+        return aux
+
+    def _cached_main_rope(
+        self,
+        cache: dict[object, Any],
+        ratio: int,
+        *,
+        start_pos: int,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        profile = "normal" if ratio == 0 else "compressed"
+        key = ("main_rope", profile)
+        rope = cache.get(key)
+        if rope is None:
+            table = self._normal_rope if ratio == 0 else self._compressed_rope
+            rope = materialize_rope_range(table[0], table[1], start_pos, seq_len)
+            cache[key] = rope
+        return rope
+
+    def _cached_prefill_compressor_rope(
+        self,
+        cache: dict[object, Any],
+        seq_len: int,
+        ratio: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = ("compressor_rope", ratio)
+        rope = cache.get(key)
+        if rope is None:
+            rope = materialize_compressor_rope(
+                self._compressed_rope[0],
+                self._compressed_rope[1],
+                seq_len,
+                ratio,
+            )
+            cache[key] = rope
+        return rope
+
+    def _cached_decode_compressor_rope(
+        self,
+        cache: dict[object, Any],
+        start_pos: int,
+        ratio: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = ("compressor_rope", ratio)
+        rope = cache.get(key)
+        if rope is None:
+            if (start_pos + 1) % ratio == 0:
+                rope = materialize_decode_compressor_rope(
+                    self._compressed_rope[0],
+                    self._compressed_rope[1],
+                    start_pos,
+                    ratio,
+                )
+            else:
+                rope = self._zero_compressor_rope
+            cache[key] = rope
+        return rope
+
+    def _cached_scalar(self, cache: dict[object, Any], key: object, value: int) -> torch.Tensor:
+        scalar_key = ("scalar", key)
+        tensor = cache.get(scalar_key)
+        if tensor is None:
+            tensor = self._scalar_int(value)
+            cache[scalar_key] = tensor
+        return tensor
 
     def update_layer_state(self, layer_id: int, outputs: dict[str, torch.Tensor]) -> None:
         state = self.layer_state(layer_id)
@@ -542,15 +665,6 @@ class DeepSeekV4State:
             raise ValueError(f"Unsupported compress ratio at layer {layer_id}: {ratio}")
         return state
 
-    def _main_rope_for_layer(self, spec: LayerSpec, start_pos: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if spec.ratio == 0:
-            rope = self._normal_rope
-        elif spec.ratio == COMPRESS_RATIO128:
-            rope = self._compress128_rope
-        else:
-            rope = self._compress4_rope
-        return materialize_rope_range(rope[0], rope[1], start_pos, seq_len)
-
     def _validate_layer_id(self, layer_id: int) -> None:
         if not 0 <= layer_id < self.config.n_layers:
             raise ValueError(f"layer_id must be in [0, {self.config.n_layers}), got {layer_id}")
@@ -601,5 +715,5 @@ __all__ = [
     "materialize_decode_compressor_rope",
     "materialize_rope_range",
     "precompute_freqs_cos_sin",
-    "rope_profile_for_compress_ratio",
+    "rope_profile_for_compress",
 ]

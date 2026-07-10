@@ -1781,7 +1781,7 @@ def _build_csa_specs(seq_len: int, start_pos: int, *, decode: bool, hash_route: 
 
     seq_pad = ceil_div(seq_len, HC_T_TILE) * HC_T_TILE
     freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(
-        compress_ratio=COMPRESS_RATIO4,
+        compress=True,
         max_seq_len=start_pos + seq_len,
     )
     local_cos, local_sin = materialize_rope_range(freqs_cos, freqs_sin, start_pos, seq_len)
@@ -2082,7 +2082,7 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
 
     seq_pad = ceil_div(seq_len, HC_T_TILE) * HC_T_TILE
     attn_cos_all, attn_sin_all = build_deepseek_v4_rope_tables(
-        compress_ratio=COMPRESS_RATIO128,
+        compress=True,
         max_seq_len=start_pos + seq_len,
     )
     local_cos, local_sin = materialize_rope_range(attn_cos_all, attn_sin_all, start_pos, seq_len)
@@ -2091,7 +2091,7 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
         if comp_should_compress:
             comp_rope_pos = start_pos + 1 - COMPRESS_RATIO128
             comp_cos_all, comp_sin_all = build_deepseek_v4_rope_tables(
-                compress_ratio=COMPRESS_RATIO128,
+                compress=True,
                 max_seq_len=max(start_pos + seq_len, comp_rope_pos + 1),
             )
             comp_cos = comp_cos_all[comp_rope_pos : comp_rope_pos + 1].contiguous()
@@ -2106,7 +2106,7 @@ def _build_hca_topk_specs(seq_len: int, start_pos: int, *, decode: bool):
         block_count = seq_len // COMPRESS_RATIO128
         compressed_len = max(1, block_count)
         comp_cos_all, comp_sin_all = build_deepseek_v4_rope_tables(
-            compress_ratio=COMPRESS_RATIO128,
+            compress=True,
             max_seq_len=seq_len,
         )
         comp_cos, comp_sin = materialize_compressor_rope(comp_cos_all, comp_sin_all, seq_len, COMPRESS_RATIO128)

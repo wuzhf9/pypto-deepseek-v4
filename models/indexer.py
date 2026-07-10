@@ -521,7 +521,7 @@ def build_indexer_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
     blocks = seq_len // COMPRESS_RATIO
     compressed_len = max(1, blocks)
     freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(
-        compress_ratio=COMPRESS_RATIO,
+        compress=True,
         max_seq_len=max(seq_len, 1),
     )
     cos, sin = materialize_rope_range(freqs_cos, freqs_sin, 0, seq_len)
@@ -587,7 +587,7 @@ def build_indexer_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
     should_compress = int((start_pos + 1) % COMPRESS_RATIO == 0)
     max_seq_len = max(start_pos + seq_len, 1)
     freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(
-        compress_ratio=COMPRESS_RATIO,
+        compress=True,
         max_seq_len=max_seq_len,
     )
     cos, sin = materialize_rope_range(freqs_cos, freqs_sin, start_pos, seq_len)

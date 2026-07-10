@@ -1413,7 +1413,7 @@ def build_indexer_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
 
     actual_compressed_len = seq_len // COMPRESS_RATIO
     compressed_len = max(1, actual_compressed_len)
-    freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(compress_ratio=COMPRESS_RATIO, max_seq_len=seq_len)
+    freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(compress=True, max_seq_len=seq_len)
     local_cos, local_sin = materialize_compressor_rope(freqs_cos, freqs_sin, seq_len, COMPRESS_RATIO)
     if actual_compressed_len == 0:
         local_cos = freqs_cos[:1].contiguous()
@@ -1473,7 +1473,7 @@ def build_indexer_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
         rope_pos = start_pos + 1 - COMPRESS_RATIO
         max_seq_len = max(start_pos + seq_len, rope_pos + 1)
         freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(
-            compress_ratio=COMPRESS_RATIO,
+            compress=True,
             max_seq_len=max_seq_len,
         )
         local_cos = freqs_cos[rope_pos : rope_pos + 1].contiguous()
@@ -1546,7 +1546,7 @@ def build_attention_prefill_specs(seq_len: int = DEFAULT_SEQ_LEN):
 
     actual_compressed_len = seq_len // COMPRESS_RATIO
     compressed_len = max(1, actual_compressed_len)
-    freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(compress_ratio=COMPRESS_RATIO, max_seq_len=seq_len)
+    freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(compress=True, max_seq_len=seq_len)
     local_cos, local_sin = materialize_compressor_rope(freqs_cos, freqs_sin, seq_len, COMPRESS_RATIO)
     if actual_compressed_len == 0:
         local_cos = freqs_cos[:1].contiguous()
@@ -1606,7 +1606,7 @@ def build_attention_decode_specs(start_pos: int = DEFAULT_DECODE_START_POS):
         rope_pos = start_pos + 1 - COMPRESS_RATIO
         max_seq_len = max(start_pos + seq_len, rope_pos + 1)
         freqs_cos, freqs_sin = build_deepseek_v4_rope_tables(
-            compress_ratio=COMPRESS_RATIO,
+            compress=True,
             max_seq_len=max_seq_len,
         )
         local_cos = freqs_cos[rope_pos : rope_pos + 1].contiguous()

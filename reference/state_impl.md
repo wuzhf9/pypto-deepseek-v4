@@ -195,7 +195,7 @@ class DeepSeekV4State:
 ```python
 build_window_topk_idxs(seq_len, start_pos=0, topk_max=128, batch_size=1)
 build_compress_topk_idxs(ratio, seq_len, start_pos, offset, topk_max, batch_size=1)
-build_deepseek_v4_rope_tables(config, compress_ratio, max_seq_len, rope_dim, device)
+build_deepseek_v4_rope_tables(config, compress, max_seq_len, rope_dim, device)
 materialize_rope_range(freqs_cos, freqs_sin, start_pos, seq_len)
 materialize_compressor_rope(freqs_cos, freqs_sin, seq_len, ratio)
 materialize_decode_compressor_rope(freqs_cos, freqs_sin, start_pos, ratio)
