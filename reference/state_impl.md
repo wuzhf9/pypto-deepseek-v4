@@ -69,7 +69,7 @@ idx_comp_kv_state     [1, 8, 256] fp32
 idx_comp_score_state  [1, 8, 256] fp32
 ```
 
-这些 tensor 由 `DeepSeekV4State` 初始化，并在每次 block kernel 返回后通过
+这些 tensor 由 `DeepSeekV4StatePlan` 初始化，并在每次 block kernel 返回后通过
 `update_layer_state()` 替换为对应 `*_out`。
 
 ## Prefill 输入
@@ -181,7 +181,7 @@ ratio=4 的 `attn_comp_cos/sin` 和 `idx_comp_cos/sin` 使用同一份计算结�
 建议实现：
 
 ```python
-class DeepSeekV4State:
+class DeepSeekV4StatePlan:
     def __init__(config=FLASH_CONFIG, max_seq_len=4096, batch_size=1, device="cpu")
     def layer_spec(layer_id) -> LayerSpec
     def layer_state(layer_id) -> LayerState

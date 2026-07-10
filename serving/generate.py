@@ -13,6 +13,7 @@ from typing import Any, Callable, Literal
 import torch
 
 from models.config import FLASH_CONFIG
+from serving.backends.factory import create_backend
 from serving.state import DEFAULT_MAX_SEQ_LEN
 
 
@@ -291,19 +292,26 @@ def _create_runner(args: argparse.Namespace) -> Any:
         from serving.runner import DeepSeekV4Runner as _DeepSeekV4Runner
 
         DeepSeekV4Runner = _DeepSeekV4Runner
-    return DeepSeekV4Runner(
-        args.checkpoint,
-        weight_index=args.weight_index,
+    backend = create_backend(
+        args.backend,
         platform=args.platform,
         device_id=args.device,
-        backend=args.backend,
-        max_seq_len=args.max_seq_len,
-        max_layers=args.max_layers,
-        run_head=True,
-        profile=args.profile,
-        verbose_layer_log=args.verbose_layer_log,
-        expert_cache_dir=args.expert_cache_dir,
     )
+    try:
+        return DeepSeekV4Runner(
+            args.checkpoint,
+            backend=backend,
+            weight_index=args.weight_index,
+            max_seq_len=args.max_seq_len,
+            max_layers=args.max_layers,
+            run_head=True,
+            profile=args.profile,
+            verbose_layer_log=args.verbose_layer_log,
+            expert_cache_dir=args.expert_cache_dir,
+        )
+    except BaseException:
+        backend.close()
+        raise
 
 
 def _as_input_ids(prompt_ids: list[int] | torch.Tensor) -> torch.Tensor:

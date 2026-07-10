@@ -170,6 +170,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
             [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0]],
         ]
     )
+    fake_backend = object()
     captured = {}
 
     class FakeAutoTokenizer:
@@ -192,8 +193,13 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         def close(self):
             fake_runner.close()
 
+    def fake_create_backend(name, *, platform, device_id):
+        captured["backend_factory"] = (name, platform, device_id)
+        return fake_backend
+
     monkeypatch.setattr(generate, "AutoTokenizer", FakeAutoTokenizer)
     monkeypatch.setattr(generate, "DeepSeekV4Runner", FakeRunnerClass)
+    monkeypatch.setattr(generate, "create_backend", fake_create_backend)
     monkeypatch.setattr(generate, "load_encoding_helpers", lambda *_args, **_kwargs: _helpers())
 
     args = SimpleNamespace(
@@ -224,6 +230,10 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
 
     assert captured["tokenizer_path"] == checkpoint
     assert captured["runner_args"] == (str(checkpoint),)
+    assert captured["backend_factory"] == ("direct", "a2a3", 0)
+    assert captured["runner_kwargs"]["backend"] is fake_backend
+    assert "platform" not in captured["runner_kwargs"]
+    assert "device_id" not in captured["runner_kwargs"]
     assert captured["runner_kwargs"]["expert_cache_dir"] == "cache"
     assert captured["runner_kwargs"]["verbose_layer_log"] is False
     assert result.text == "4"
@@ -231,3 +241,38 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
     assert result.generated_tokens == 1
     assert fake_tokenizer.skip_special_tokens is True
     assert fake_runner.closed is True
+
+
+def test_create_runner_closes_backend_when_runner_initialization_fails(monkeypatch):
+    class FakeBackend:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    backend = FakeBackend()
+
+    class FailingRunner:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("runner init failed")
+
+    monkeypatch.setattr(generate, "create_backend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(generate, "DeepSeekV4Runner", FailingRunner)
+    args = SimpleNamespace(
+        checkpoint="checkpoint",
+        weight_index=None,
+        expert_cache_dir=None,
+        max_seq_len=16,
+        max_layers=1,
+        backend="direct",
+        platform="a2a3",
+        device=0,
+        profile=False,
+        verbose_layer_log=False,
+    )
+
+    with pytest.raises(RuntimeError, match="runner init failed"):
+        generate._create_runner(args)
+
+    assert backend.closed is True

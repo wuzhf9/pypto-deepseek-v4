@@ -190,7 +190,7 @@ prefill 流程：
 8. return logits
 ```
 
-prefill 后，`DeepSeekV4State` 内保存每层 decode 需要的 SWA/HCA/CSA cache 和 compressor/indexer
+prefill 后，`DeepSeekV4StatePlan` 内保存每层 decode 需要的 SWA/HCA/CSA cache 和 compressor/indexer
 state。runner 不从输出 tensor 名称中推断语义，只调用 `state.update_layer_state(...)`。
 
 ## Decode 调度
@@ -385,7 +385,7 @@ runner 实现后按以下顺序验证：
 - 参数组装
   - 复用各 block 的 `build_*_specs(...)` 作为参数顺序来源。
   - 通过 `DeepSeekV4WeightLoader` 加载当前层权重。
-  - 通过 `DeepSeekV4State` 构造 topk、RoPE、cache slot、compressor 边界等辅助输入。
+  - 通过 `DeepSeekV4StatePlan` 构造 topk、RoPE、cache slot、compressor 边界等辅助输入。
   - block 输出按语义 key 传给 `state.update_layer_state(...)`。
 - CLI smoke 入口
   - `python serving/runner.py ...`
@@ -399,7 +399,7 @@ runner 实现后按以下顺序验证：
   - 按 `../deepseek_v4_flash` 的流程调用官方 `encode_messages(...)`，再调用 tokenizer `encode(...)`。
   - 支持 prefill、greedy decode、temperature sampling、EOS 停止和 `--max-new-tokens`。
   - `--verbose-layer-log` 可透传到 runner，用于定位某一层的 shape、dtype 和 finite 状态。
-  - 复用 `DeepSeekV4Runner` 和 `DeepSeekV4State`，不维护第二套模型执行逻辑。
+  - 复用 `DeepSeekV4Runner` 和 `DeepSeekV4StatePlan`，不维护第二套模型执行逻辑。
 
 当前未启用 `worker` backend。state/cache 与 hidden 常驻 NPU 的实验路径已经回退，原因是
 profile 显示 block kernel runtime 占每层耗时约 90%，worker 路径确定性优化空间不足以作为

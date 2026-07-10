@@ -8,7 +8,7 @@ from serving.state import (
     COMPRESS_RATIO4,
     COMPRESS_RATIO128,
     DEFAULT_MAX_SEQ_LEN,
-    DeepSeekV4State,
+    DeepSeekV4StatePlan,
     build_compress_topk_idxs,
     build_deepseek_v4_rope_tables,
     build_window_topk_idxs,
@@ -61,8 +61,12 @@ def _tensor_from_spec(specs, name: str) -> torch.Tensor:
     raise AssertionError(f"missing TensorSpec: {name}")
 
 
+def _state_specs(state: DeepSeekV4StatePlan, layer_id: int):
+    return {spec.name: spec for spec in state.layer_state_schema(layer_id).tensors}
+
+
 def test_layer_specs_follow_official_config():
-    state = DeepSeekV4State()
+    state = DeepSeekV4StatePlan()
     assert len(state.layers) == FLASH_CONFIG.n_layers
     for layer_id in range(FLASH_CONFIG.n_layers):
         spec = state.layer_spec(layer_id)
@@ -76,28 +80,43 @@ def test_layer_specs_follow_official_config():
     assert state.layer_spec(4).ratio == COMPRESS_RATIO4
 
 
-def test_layer_state_shapes_and_dtypes():
-    state = DeepSeekV4State()
+def test_layer_state_schema_shapes_dtypes_and_initial_values():
+    state = DeepSeekV4StatePlan()
 
-    swa = state.layer_state(0)
-    assert swa.kv_cache.shape == (1, FLASH_CONFIG.window_size, FLASH_CONFIG.head_dim)
-    assert swa.kv_cache.dtype is torch.bfloat16
-    assert swa.comp_cache is None
-    assert swa.idx_kv_cache is None
+    swa = _state_specs(state, 0)
+    assert set(swa) == {"kv_cache"}
+    assert swa["kv_cache"].shape == (1, FLASH_CONFIG.window_size, FLASH_CONFIG.head_dim)
+    assert swa["kv_cache"].dtype is torch.bfloat16
 
-    hca = state.layer_state(3)
-    assert hca.comp_cache.shape == (1, DEFAULT_MAX_SEQ_LEN // COMPRESS_RATIO128, FLASH_CONFIG.head_dim)
-    assert hca.comp_cache.dtype is torch.bfloat16
-    assert hca.comp_kv_state.shape == (1, COMPRESS_RATIO128, FLASH_CONFIG.head_dim)
-    assert hca.comp_kv_state.dtype is torch.float32
-    assert torch.all(hca.comp_score_state == -torch.finfo(torch.float32).max)
+    hca = _state_specs(state, 3)
+    assert hca["comp_cache"].shape == (1, DEFAULT_MAX_SEQ_LEN // COMPRESS_RATIO128, FLASH_CONFIG.head_dim)
+    assert hca["comp_cache"].dtype is torch.bfloat16
+    assert hca["comp_kv_state"].shape == (1, COMPRESS_RATIO128, FLASH_CONFIG.head_dim)
+    assert hca["comp_kv_state"].dtype is torch.float32
+    assert hca["comp_score_state"].init_value == -torch.finfo(torch.float32).max
 
-    csa = state.layer_state(2)
-    assert csa.attn_comp_cache.shape == (1, DEFAULT_MAX_SEQ_LEN // COMPRESS_RATIO4, FLASH_CONFIG.head_dim)
-    assert csa.attn_comp_kv_state.shape == (1, 2 * COMPRESS_RATIO4, 2 * FLASH_CONFIG.head_dim)
-    assert csa.idx_kv_cache.shape == (1, DEFAULT_MAX_SEQ_LEN // COMPRESS_RATIO4, FLASH_CONFIG.index_head_dim)
-    assert csa.idx_comp_kv_state.shape == (1, 2 * COMPRESS_RATIO4, 2 * FLASH_CONFIG.index_head_dim)
-    assert torch.all(csa.idx_comp_score_state == -torch.finfo(torch.float32).max)
+    csa = _state_specs(state, 2)
+    assert csa["attn_comp_cache"].shape == (1, DEFAULT_MAX_SEQ_LEN // COMPRESS_RATIO4, FLASH_CONFIG.head_dim)
+    assert csa["attn_comp_kv_state"].shape == (1, 2 * COMPRESS_RATIO4, 2 * FLASH_CONFIG.head_dim)
+    assert csa["idx_kv_cache"].shape == (1, DEFAULT_MAX_SEQ_LEN // COMPRESS_RATIO4, FLASH_CONFIG.index_head_dim)
+    assert csa["idx_comp_kv_state"].shape == (1, 2 * COMPRESS_RATIO4, 2 * FLASH_CONFIG.index_head_dim)
+    assert csa["idx_comp_score_state"].init_value == -torch.finfo(torch.float32).max
+
+
+def test_layer_state_schema_maps_kernel_input_and_output_names():
+    state = DeepSeekV4StatePlan()
+
+    swa = _state_specs(state, 0)
+    assert (swa["kv_cache"].input_name, swa["kv_cache"].output_name) == ("kv_cache", "kv_cache_out")
+
+    hca = _state_specs(state, 3)
+    assert (hca["comp_cache"].input_name, hca["comp_cache"].output_name) == ("comp_cache", "comp_cache_out")
+
+    csa = _state_specs(state, 2)
+    assert (csa["idx_kv_cache"].input_name, csa["idx_kv_cache"].output_name) == (
+        "idx_kv_cache_in",
+        "idx_kv_cache_out",
+    )
 
 
 def test_topk_helpers_match_kernel_helpers():
@@ -120,10 +139,10 @@ def test_topk_helpers_match_kernel_helpers():
 
 
 def test_state_topk_inputs_match_official_model_helpers():
-    state = DeepSeekV4State()
+    state = DeepSeekV4StatePlan()
 
     for seq_len in (1, 13, 127, 128, 129):
-        swa = state.build_prefill_inputs(0, seq_len)
+        swa = state.build_prefill_aux(0, seq_len)
         expected_window = official_model.get_window_topk_idxs(
             FLASH_CONFIG.window_size,
             1,
@@ -132,7 +151,7 @@ def test_state_topk_inputs_match_official_model_helpers():
         ).int()
         _assert_matches_official_with_padding(swa["topk_idxs"], expected_window)
 
-        hca = state.build_prefill_inputs(3, seq_len)
+        hca = state.build_prefill_aux(3, seq_len)
         expected_compress = official_model.get_compress_topk_idxs(
             COMPRESS_RATIO128,
             1,
@@ -143,7 +162,7 @@ def test_state_topk_inputs_match_official_model_helpers():
         _assert_matches_official_with_padding(hca["topk_idxs"][:, :, : FLASH_CONFIG.window_size], expected_window)
         _assert_matches_official_with_padding(hca["topk_idxs"][:, :, FLASH_CONFIG.window_size :], expected_compress)
 
-        csa = state.build_prefill_inputs(2, seq_len)
+        csa = state.build_prefill_aux(2, seq_len)
         _assert_matches_official_with_padding(csa["window_topk_idxs"], expected_window)
 
     for start_pos in (1, 13, 126, 127, 128, 129, 255):
@@ -153,10 +172,10 @@ def test_state_topk_inputs_match_official_model_helpers():
             1,
             start_pos,
         ).int()
-        swa = state.build_decode_inputs(0, start_pos)
+        swa = state.build_decode_aux(0, start_pos)
         _assert_matches_official_with_padding(swa["topk_idxs"], expected_window)
 
-        hca = state.build_decode_inputs(3, start_pos)
+        hca = state.build_decode_aux(3, start_pos)
         expected_compress = official_model.get_compress_topk_idxs(
             COMPRESS_RATIO128,
             1,
@@ -167,7 +186,7 @@ def test_state_topk_inputs_match_official_model_helpers():
         _assert_matches_official_with_padding(hca["topk_idxs"][:, :, : FLASH_CONFIG.window_size], expected_window)
         _assert_matches_official_with_padding(hca["topk_idxs"][:, :, FLASH_CONFIG.window_size :], expected_compress)
 
-        csa = state.build_decode_inputs(2, start_pos)
+        csa = state.build_decode_aux(2, start_pos)
         _assert_matches_official_with_padding(csa["window_topk_idxs"], expected_window)
 
 
@@ -190,22 +209,22 @@ def test_rope_helpers_match_kernel_helpers():
 
 
 def test_state_rope_inputs_match_official_model_profiles():
-    state = DeepSeekV4State()
+    state = DeepSeekV4StatePlan()
     normal_cos, normal_sin = _official_cos_sin(0, DEFAULT_MAX_SEQ_LEN)
     compress4_cos, compress4_sin = _official_cos_sin(COMPRESS_RATIO4, DEFAULT_MAX_SEQ_LEN)
     compress128_cos, compress128_sin = _official_cos_sin(COMPRESS_RATIO128, DEFAULT_MAX_SEQ_LEN)
 
-    swa = state.build_decode_inputs(0, 13)
+    swa = state.build_decode_aux(0, 13)
     torch.testing.assert_close(swa["cos"], normal_cos[13:14], rtol=0, atol=0)
     torch.testing.assert_close(swa["sin"], normal_sin[13:14], rtol=0, atol=0)
 
-    csa = state.build_prefill_inputs(2, 13)
+    csa = state.build_prefill_aux(2, 13)
     torch.testing.assert_close(csa["cos"], compress4_cos[:13], rtol=0, atol=0)
     torch.testing.assert_close(csa["sin"], compress4_sin[:13], rtol=0, atol=0)
     torch.testing.assert_close(csa["attn_comp_cos"], compress4_cos[:12:COMPRESS_RATIO4], rtol=0, atol=0)
     torch.testing.assert_close(csa["attn_comp_sin"], compress4_sin[:12:COMPRESS_RATIO4], rtol=0, atol=0)
 
-    hca = state.build_prefill_inputs(3, 129)
+    hca = state.build_prefill_aux(3, 129)
     torch.testing.assert_close(hca["cos"], compress128_cos[:129], rtol=0, atol=0)
     torch.testing.assert_close(hca["sin"], compress128_sin[:129], rtol=0, atol=0)
     torch.testing.assert_close(hca["comp_cos"], compress128_cos[:128:COMPRESS_RATIO128], rtol=0, atol=0)
@@ -213,26 +232,26 @@ def test_state_rope_inputs_match_official_model_profiles():
 
 
 def test_state_decode_compressor_boundaries_match_official_model_formulas():
-    state = DeepSeekV4State()
+    state = DeepSeekV4StatePlan()
     compress4_cos, compress4_sin = _official_cos_sin(COMPRESS_RATIO4, DEFAULT_MAX_SEQ_LEN)
     compress128_cos, compress128_sin = _official_cos_sin(COMPRESS_RATIO128, DEFAULT_MAX_SEQ_LEN)
 
-    csa_compress = state.build_decode_inputs(2, 3)
+    csa_compress = state.build_decode_aux(2, 3)
     assert csa_compress["comp_should_compress"].item() == 1
     torch.testing.assert_close(csa_compress["attn_comp_cos"], compress4_cos[0:1], rtol=0, atol=0)
     torch.testing.assert_close(csa_compress["attn_comp_sin"], compress4_sin[0:1], rtol=0, atol=0)
 
-    csa_no_compress = state.build_decode_inputs(2, 4)
+    csa_no_compress = state.build_decode_aux(2, 4)
     assert csa_no_compress["comp_should_compress"].item() == 0
     assert torch.count_nonzero(csa_no_compress["attn_comp_cos"]) == 0
     assert torch.count_nonzero(csa_no_compress["attn_comp_sin"]) == 0
 
-    hca_compress = state.build_decode_inputs(3, 127)
+    hca_compress = state.build_decode_aux(3, 127)
     assert hca_compress["comp_should_compress"].item() == 1
     torch.testing.assert_close(hca_compress["comp_cos"], compress128_cos[0:1], rtol=0, atol=0)
     torch.testing.assert_close(hca_compress["comp_sin"], compress128_sin[0:1], rtol=0, atol=0)
 
-    hca_no_compress = state.build_decode_inputs(3, 128)
+    hca_no_compress = state.build_decode_aux(3, 128)
     assert hca_no_compress["comp_should_compress"].item() == 0
     assert torch.count_nonzero(hca_no_compress["comp_cos"]) == 0
     assert torch.count_nonzero(hca_no_compress["comp_sin"]) == 0
@@ -240,20 +259,20 @@ def test_state_decode_compressor_boundaries_match_official_model_formulas():
 
 @pytest.mark.parametrize("seq_len", [1, 3, 4, 127, 128, 129])
 def test_prefill_inputs_for_layer_types(seq_len):
-    state = DeepSeekV4State()
+    state = DeepSeekV4StatePlan()
 
-    swa = state.build_prefill_inputs(0, seq_len)
+    swa = state.build_prefill_aux(0, seq_len)
     assert swa["topk_idxs"].shape == (1, seq_len, FLASH_CONFIG.window_size)
     assert swa["cos"].shape == (seq_len, FLASH_CONFIG.rope_head_dim // 2)
     assert swa["sin"].shape == (seq_len, FLASH_CONFIG.rope_head_dim // 2)
 
-    hca = state.build_prefill_inputs(3, seq_len)
+    hca = state.build_prefill_aux(3, seq_len)
     assert hca["topk_idxs"].shape == (1, seq_len, FLASH_CONFIG.window_size + DEFAULT_MAX_SEQ_LEN // COMPRESS_RATIO128)
     assert hca["comp_block_count"].item() == seq_len // COMPRESS_RATIO128
     assert hca["comp_cos"].shape[0] == max(1, seq_len // COMPRESS_RATIO128)
     assert hca["comp_sin"].shape == hca["comp_cos"].shape
 
-    csa = state.build_prefill_inputs(2, seq_len)
+    csa = state.build_prefill_aux(2, seq_len)
     assert csa["window_topk_idxs"].shape == (1, seq_len, FLASH_CONFIG.window_size)
     assert csa["attn_comp_block_count"].item() == seq_len // COMPRESS_RATIO4
     assert csa["idx_comp_block_count"].item() == seq_len // COMPRESS_RATIO4
@@ -264,14 +283,14 @@ def test_prefill_inputs_for_layer_types(seq_len):
 
 @pytest.mark.parametrize("start_pos", [1, 3, 4, 127, 128, 129])
 def test_decode_inputs_for_layer_types(start_pos):
-    state = DeepSeekV4State()
+    state = DeepSeekV4StatePlan()
 
-    swa = state.build_decode_inputs(0, start_pos)
-    assert swa["kv_cache"].shape == (1, FLASH_CONFIG.window_size, FLASH_CONFIG.head_dim)
+    swa = state.build_decode_aux(0, start_pos)
     assert swa["cache_pos"].item() == start_pos % FLASH_CONFIG.window_size
     assert swa["topk_idxs"].shape == (1, 1, FLASH_CONFIG.window_size)
+    assert "kv_cache" not in swa
 
-    hca = state.build_decode_inputs(3, start_pos)
+    hca = state.build_decode_aux(3, start_pos)
     assert hca["topk_idxs"].shape == (1, 1, FLASH_CONFIG.window_size + DEFAULT_MAX_SEQ_LEN // COMPRESS_RATIO128)
     assert hca["comp_slot"].item() == start_pos % COMPRESS_RATIO128
     assert hca["comp_cache_slot"].item() == start_pos // COMPRESS_RATIO128
@@ -279,19 +298,21 @@ def test_decode_inputs_for_layer_types(start_pos):
     assert hca["comp_cos"].shape == (1, FLASH_CONFIG.rope_head_dim // 2)
     if hca["comp_should_compress"].item() == 0:
         assert torch.count_nonzero(hca["comp_cos"]) == 0
+    assert "comp_cache" not in hca
 
-    csa = state.build_decode_inputs(2, start_pos)
+    csa = state.build_decode_aux(2, start_pos)
     assert csa["window_topk_idxs"].shape == (1, 1, FLASH_CONFIG.window_size)
     assert csa["idx_offset"].item() == FLASH_CONFIG.window_size
     assert csa["comp_slot"].item() == start_pos % COMPRESS_RATIO4
     assert csa["comp_cache_slot"].item() == start_pos // COMPRESS_RATIO4
     assert csa["comp_should_compress"].item() == int((start_pos + 1) % COMPRESS_RATIO4 == 0)
     assert torch.equal(csa["idx_comp_cos"], csa["attn_comp_cos"])
+    assert "idx_kv_cache_in" not in csa
 
 
 def test_ratio4_main_rope_uses_compress_profile():
-    state = DeepSeekV4State()
-    csa = state.build_prefill_inputs(2, 8)
+    state = DeepSeekV4StatePlan()
+    csa = state.build_prefill_aux(2, 8)
     normal_cos, _ = build_deepseek_v4_rope_tables(compress=False, max_seq_len=8)
     compress_cos, _ = build_deepseek_v4_rope_tables(compress=True, max_seq_len=8)
     assert torch.equal(csa["cos"], compress_cos)
@@ -299,9 +320,9 @@ def test_ratio4_main_rope_uses_compress_profile():
 
 
 def test_ratio128_main_rope_uses_compress_profile():
-    state = DeepSeekV4State()
-    hca_prefill = state.build_prefill_inputs(3, 8)
-    hca_decode = state.build_decode_inputs(3, 7)
+    state = DeepSeekV4StatePlan()
+    hca_prefill = state.build_prefill_aux(3, 8)
+    hca_decode = state.build_decode_aux(3, 7)
     normal_cos, _ = build_deepseek_v4_rope_tables(compress=False, max_seq_len=8)
     compress_cos, _ = build_deepseek_v4_rope_tables(compress=True, max_seq_len=8)
     assert torch.equal(hca_prefill["cos"], compress_cos)
@@ -332,7 +353,7 @@ def test_ratio128_standalone_specs_use_compress_profile():
 
 
 def test_prefill_aux_cache_reuses_immutable_inputs_across_layers():
-    state = DeepSeekV4State()
+    state = DeepSeekV4StatePlan()
     layers_by_ratio = {
         ratio: [
             layer_id
@@ -342,11 +363,11 @@ def test_prefill_aux_cache_reuses_immutable_inputs_across_layers():
         for ratio in (0, COMPRESS_RATIO4, COMPRESS_RATIO128)
     }
 
-    swa = state.build_prefill_inputs(layers_by_ratio[0][0], 129)
-    csa_a = state.build_prefill_inputs(layers_by_ratio[COMPRESS_RATIO4][0], 129)
-    csa_b = state.build_prefill_inputs(layers_by_ratio[COMPRESS_RATIO4][1], 129)
-    hca_a = state.build_prefill_inputs(layers_by_ratio[COMPRESS_RATIO128][0], 129)
-    hca_b = state.build_prefill_inputs(layers_by_ratio[COMPRESS_RATIO128][1], 129)
+    swa = state.build_prefill_aux(layers_by_ratio[0][0], 129)
+    csa_a = state.build_prefill_aux(layers_by_ratio[COMPRESS_RATIO4][0], 129)
+    csa_b = state.build_prefill_aux(layers_by_ratio[COMPRESS_RATIO4][1], 129)
+    hca_a = state.build_prefill_aux(layers_by_ratio[COMPRESS_RATIO128][0], 129)
+    hca_b = state.build_prefill_aux(layers_by_ratio[COMPRESS_RATIO128][1], 129)
 
     assert swa["topk_idxs"] is csa_a["window_topk_idxs"]
     assert csa_b["window_topk_idxs"] is csa_a["window_topk_idxs"]
@@ -358,13 +379,13 @@ def test_prefill_aux_cache_reuses_immutable_inputs_across_layers():
     assert hca_b["comp_cos"] is hca_a["comp_cos"]
     assert hca_a["cos"] is csa_a["cos"]
 
-    next_csa = state.build_prefill_inputs(layers_by_ratio[COMPRESS_RATIO4][0], 130)
+    next_csa = state.build_prefill_aux(layers_by_ratio[COMPRESS_RATIO4][0], 130)
     assert next_csa["window_topk_idxs"] is not csa_a["window_topk_idxs"]
     assert next_csa["attn_comp_cos"] is not csa_a["attn_comp_cos"]
 
 
-def test_decode_aux_cache_reuses_inputs_but_not_layer_state():
-    state = DeepSeekV4State()
+def test_decode_aux_cache_reuses_immutable_inputs_across_layers():
+    state = DeepSeekV4StatePlan()
     layers_by_ratio = {
         ratio: [
             layer_id
@@ -375,11 +396,11 @@ def test_decode_aux_cache_reuses_inputs_but_not_layer_state():
     }
     start_pos = 129
 
-    swa = state.build_decode_inputs(layers_by_ratio[0][0], start_pos)
-    csa_a = state.build_decode_inputs(layers_by_ratio[COMPRESS_RATIO4][0], start_pos)
-    csa_b = state.build_decode_inputs(layers_by_ratio[COMPRESS_RATIO4][1], start_pos)
-    hca_a = state.build_decode_inputs(layers_by_ratio[COMPRESS_RATIO128][0], start_pos)
-    hca_b = state.build_decode_inputs(layers_by_ratio[COMPRESS_RATIO128][1], start_pos)
+    swa = state.build_decode_aux(layers_by_ratio[0][0], start_pos)
+    csa_a = state.build_decode_aux(layers_by_ratio[COMPRESS_RATIO4][0], start_pos)
+    csa_b = state.build_decode_aux(layers_by_ratio[COMPRESS_RATIO4][1], start_pos)
+    hca_a = state.build_decode_aux(layers_by_ratio[COMPRESS_RATIO128][0], start_pos)
+    hca_b = state.build_decode_aux(layers_by_ratio[COMPRESS_RATIO128][1], start_pos)
 
     assert swa["topk_idxs"] is csa_a["window_topk_idxs"]
     assert csa_b["window_topk_idxs"] is csa_a["window_topk_idxs"]
@@ -389,52 +410,21 @@ def test_decode_aux_cache_reuses_inputs_but_not_layer_state():
     assert csa_a["attn_comp_cos"] is hca_a["comp_cos"]
     assert csa_a["idx_comp_cos"] is csa_a["attn_comp_cos"]
     assert hca_b["topk_idxs"] is hca_a["topk_idxs"]
-    assert csa_b["kv_cache"] is not csa_a["kv_cache"]
-    assert hca_b["comp_cache"] is not hca_a["comp_cache"]
+    assert "kv_cache" not in csa_a
+    assert "comp_cache" not in hca_a
 
-    next_csa = state.build_decode_inputs(layers_by_ratio[COMPRESS_RATIO4][0], start_pos + 1)
+    next_csa = state.build_decode_aux(layers_by_ratio[COMPRESS_RATIO4][0], start_pos + 1)
     assert next_csa["window_topk_idxs"] is not csa_a["window_topk_idxs"]
     assert next_csa["cache_pos"] is not csa_a["cache_pos"]
 
 
-def test_update_layer_state_replaces_expected_tensors():
-    state = DeepSeekV4State()
-
-    new_swa_cache = torch.ones_like(state.layer_state(0).kv_cache)
-    state.update_layer_state(0, {"kv_cache_out": new_swa_cache})
-    assert state.layer_state(0).kv_cache is new_swa_cache
-
-    hca = state.layer_state(3)
-    hca_outputs = {
-        "kv_cache_out": torch.ones_like(hca.kv_cache),
-        "comp_kv_state_out": torch.ones_like(hca.comp_kv_state),
-        "comp_score_state_out": torch.ones_like(hca.comp_score_state),
-        "comp_cache_out": torch.ones_like(hca.comp_cache),
-    }
-    state.update_layer_state(3, hca_outputs)
-    assert state.layer_state(3).comp_cache is hca_outputs["comp_cache_out"]
-
-    csa = state.layer_state(2)
-    csa_outputs = {
-        "kv_cache_out": torch.ones_like(csa.kv_cache),
-        "attn_comp_kv_state_out": torch.ones_like(csa.attn_comp_kv_state),
-        "attn_comp_score_state_out": torch.ones_like(csa.attn_comp_score_state),
-        "attn_comp_cache_out": torch.ones_like(csa.attn_comp_cache),
-        "idx_kv_cache_out": torch.ones_like(csa.idx_kv_cache),
-        "idx_comp_kv_state_out": torch.ones_like(csa.idx_comp_kv_state),
-        "idx_comp_score_state_out": torch.ones_like(csa.idx_comp_score_state),
-    }
-    state.update_layer_state(2, csa_outputs)
-    assert state.layer_state(2).idx_kv_cache is csa_outputs["idx_kv_cache_out"]
-
-
 def test_state_validates_fixed_runtime_shape_contract():
     with pytest.raises(ValueError, match="batch_size"):
-        DeepSeekV4State(batch_size=2)
+        DeepSeekV4StatePlan(batch_size=2)
     with pytest.raises(ValueError, match="max_seq_len"):
-        DeepSeekV4State(max_seq_len=8192)
-    state = DeepSeekV4State()
+        DeepSeekV4StatePlan(max_seq_len=8192)
+    state = DeepSeekV4StatePlan()
     with pytest.raises(ValueError, match="decode start_pos"):
-        state.build_decode_inputs(0, 0)
+        state.build_decode_aux(0, 0)
     with pytest.raises(ValueError, match="exceeds"):
-        state.build_decode_inputs(0, DEFAULT_MAX_SEQ_LEN)
+        state.build_decode_aux(0, DEFAULT_MAX_SEQ_LEN)

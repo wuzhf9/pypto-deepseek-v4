@@ -48,7 +48,7 @@ tensor 管理，因此它们准确反映了现有调用边界暴露的数据规�
 `DeepSeekV4Runner` 使用：
 
 - `DeepSeekV4WeightLoader(default_device="cpu")`
-- `DeepSeekV4State(device="cpu")`
+- `DeepSeekV4StatePlan(device="cpu")`
 - `_DirectBackend`
 
 direct backend 将 runner 组装的 host tensor 直接作为 compiled kernel 参数。当前 weight loader 已
@@ -192,7 +192,7 @@ ratio=4/CSA 路径会输入和输出：
 - window KV cache。
 - 两套 compressor state。
 
-这些 state 由 host `DeepSeekV4State` 持有，kernel 完成后又整体返回 host 并替换旧 tensor。
+这些 state 由 host `DeepSeekV4StatePlan` 持有，kernel 完成后又整体返回 host 并替换旧 tensor。
 
 ### 优化方案
 

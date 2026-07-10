@@ -23,19 +23,23 @@ class LayerSpec:
     hash_route: bool
 
 
-@dataclass
-class LayerState:
+@dataclass(frozen=True)
+class StateTensorSpec:
+    name: str
+    input_name: str
+    output_name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    init_value: int | float = 0
+
+    def create_tensor(self, *, device: str | torch.device = "cpu") -> torch.Tensor:
+        return torch.full(self.shape, self.init_value, dtype=self.dtype, device=device)
+
+
+@dataclass(frozen=True)
+class LayerStateSchema:
     spec: LayerSpec
-    kv_cache: torch.Tensor
-    comp_cache: torch.Tensor | None = None
-    comp_kv_state: torch.Tensor | None = None
-    comp_score_state: torch.Tensor | None = None
-    attn_comp_cache: torch.Tensor | None = None
-    attn_comp_kv_state: torch.Tensor | None = None
-    attn_comp_score_state: torch.Tensor | None = None
-    idx_kv_cache: torch.Tensor | None = None
-    idx_comp_kv_state: torch.Tensor | None = None
-    idx_comp_score_state: torch.Tensor | None = None
+    tensors: tuple[StateTensorSpec, ...]
 
 
 def build_window_topk_idxs(
@@ -243,8 +247,8 @@ def materialize_decode_compressor_rope(
     return freqs_cos[rope_pos : rope_pos + 1].contiguous(), freqs_sin[rope_pos : rope_pos + 1].contiguous()
 
 
-class DeepSeekV4State:
-    """Own layer persistent states and build per-step host inputs."""
+class DeepSeekV4StatePlan:
+    """Describe mutable layer state and cache immutable per-step host inputs."""
 
     def __init__(
         self,
@@ -267,7 +271,7 @@ class DeepSeekV4State:
         self.device = torch.device(device)
         self.topk_hca = max_seq_len // COMPRESS_RATIO128
         self.index_score_len = max_seq_len // COMPRESS_RATIO4
-        self.layers = [self._init_layer_state(layer_id) for layer_id in range(config.n_layers)]
+        self.layers = tuple(self._build_layer_state_schema(layer_id) for layer_id in range(config.n_layers))
         self._normal_rope = build_deepseek_v4_rope_tables(
             config,
             compress=False,
@@ -291,53 +295,26 @@ class DeepSeekV4State:
         self._decode_aux_cache: dict[object, Any] = {}
 
     def layer_spec(self, layer_id: int) -> LayerSpec:
-        return self.layer_state(layer_id).spec
+        return self.layer_state_schema(layer_id).spec
 
-    def layer_state(self, layer_id: int) -> LayerState:
+    def layer_state_schema(self, layer_id: int) -> LayerStateSchema:
         self._validate_layer_id(layer_id)
         return self.layers[layer_id]
 
-    def build_prefill_inputs(self, layer_id: int, seq_len: int) -> dict[str, torch.Tensor]:
+    def layer_state_schemas(self) -> tuple[LayerStateSchema, ...]:
+        return self.layers
+
+    def build_prefill_aux(self, layer_id: int, seq_len: int) -> dict[str, torch.Tensor]:
         self._validate_seq_len(seq_len)
         spec = self.layer_spec(layer_id)
         return dict(self._get_prefill_aux(spec.ratio, seq_len))
 
-    def build_decode_inputs(self, layer_id: int, start_pos: int) -> dict[str, torch.Tensor]:
+    def build_decode_aux(self, layer_id: int, start_pos: int) -> dict[str, torch.Tensor]:
         if start_pos <= 0:
             raise ValueError(f"decode start_pos must be positive, got {start_pos}")
         self._validate_start_pos(start_pos)
-        state = self.layer_state(layer_id)
-        spec = state.spec
-        inputs = dict(self._get_decode_aux(spec.ratio, start_pos))
-        inputs["kv_cache"] = state.kv_cache
-
-        if spec.ratio == 0:
-            return inputs
-
-        if spec.ratio == COMPRESS_RATIO128:
-            inputs.update(
-                {
-                    "comp_kv_state": self._required(state.comp_kv_state, "comp_kv_state"),
-                    "comp_score_state": self._required(state.comp_score_state, "comp_score_state"),
-                    "comp_cache": self._required(state.comp_cache, "comp_cache"),
-                }
-            )
-            return inputs
-
-        if spec.ratio == COMPRESS_RATIO4:
-            inputs.update(
-                {
-                    "attn_comp_kv_state": self._required(state.attn_comp_kv_state, "attn_comp_kv_state"),
-                    "attn_comp_score_state": self._required(state.attn_comp_score_state, "attn_comp_score_state"),
-                    "attn_comp_cache": self._required(state.attn_comp_cache, "attn_comp_cache"),
-                    "idx_kv_cache_in": self._required(state.idx_kv_cache, "idx_kv_cache"),
-                    "idx_comp_kv_state": self._required(state.idx_comp_kv_state, "idx_comp_kv_state"),
-                    "idx_comp_score_state": self._required(state.idx_comp_score_state, "idx_comp_score_state"),
-                }
-            )
-            return inputs
-
-        raise ValueError(f"Unsupported compress ratio: {spec.ratio}")
+        spec = self.layer_spec(layer_id)
+        return dict(self._get_decode_aux(spec.ratio, start_pos))
 
     def _get_prefill_aux(self, ratio: int, seq_len: int) -> dict[str, torch.Tensor]:
         """Return immutable prefill inputs shared by layers of one ratio."""
@@ -551,119 +528,102 @@ class DeepSeekV4State:
             cache[scalar_key] = tensor
         return tensor
 
-    def update_layer_state(self, layer_id: int, outputs: dict[str, torch.Tensor]) -> None:
-        state = self.layer_state(layer_id)
-        state.kv_cache = self._take_output(outputs, "kv_cache_out", state.kv_cache)
-        if state.spec.ratio == COMPRESS_RATIO128:
-            state.comp_kv_state = self._take_output(outputs, "comp_kv_state_out", self._required(state.comp_kv_state, "comp_kv_state"))
-            state.comp_score_state = self._take_output(
-                outputs,
-                "comp_score_state_out",
-                self._required(state.comp_score_state, "comp_score_state"),
-            )
-            state.comp_cache = self._take_output(outputs, "comp_cache_out", self._required(state.comp_cache, "comp_cache"))
-        elif state.spec.ratio == COMPRESS_RATIO4:
-            state.attn_comp_kv_state = self._take_output(
-                outputs,
-                "attn_comp_kv_state_out",
-                self._required(state.attn_comp_kv_state, "attn_comp_kv_state"),
-            )
-            state.attn_comp_score_state = self._take_output(
-                outputs,
-                "attn_comp_score_state_out",
-                self._required(state.attn_comp_score_state, "attn_comp_score_state"),
-            )
-            state.attn_comp_cache = self._take_output(
-                outputs,
-                "attn_comp_cache_out",
-                self._required(state.attn_comp_cache, "attn_comp_cache"),
-            )
-            state.idx_kv_cache = self._take_output(outputs, "idx_kv_cache_out", self._required(state.idx_kv_cache, "idx_kv_cache"))
-            state.idx_comp_kv_state = self._take_output(
-                outputs,
-                "idx_comp_kv_state_out",
-                self._required(state.idx_comp_kv_state, "idx_comp_kv_state"),
-            )
-            state.idx_comp_score_state = self._take_output(
-                outputs,
-                "idx_comp_score_state_out",
-                self._required(state.idx_comp_score_state, "idx_comp_score_state"),
-            )
-
-    def _init_layer_state(self, layer_id: int) -> LayerState:
+    def _build_layer_state_schema(self, layer_id: int) -> LayerStateSchema:
         ratio = int(self.config.compress_ratios[layer_id])
-        spec = LayerSpec(layer_id=layer_id, ratio=ratio, hash_route=layer_id < self.config.n_hash_layers)
-        state = LayerState(
-            spec=spec,
-            kv_cache=torch.zeros(
-                self.batch_size,
-                self.config.window_size,
-                self.config.head_dim,
+        layer_spec = LayerSpec(layer_id=layer_id, ratio=ratio, hash_route=layer_id < self.config.n_hash_layers)
+        tensors = [
+            StateTensorSpec(
+                name="kv_cache",
+                input_name="kv_cache",
+                output_name="kv_cache_out",
+                shape=(self.batch_size, self.config.window_size, self.config.head_dim),
                 dtype=torch.bfloat16,
-                device=self.device,
-            ),
-        )
-        if ratio == COMPRESS_RATIO128:
-            state.comp_cache = torch.zeros(self.batch_size, self.topk_hca, self.config.head_dim, dtype=torch.bfloat16, device=self.device)
-            state.comp_kv_state = torch.zeros(
-                self.batch_size,
-                COMPRESS_RATIO128,
-                self.config.head_dim,
-                dtype=torch.float32,
-                device=self.device,
             )
-            state.comp_score_state = torch.full(
-                (self.batch_size, COMPRESS_RATIO128, self.config.head_dim),
-                -torch.finfo(torch.float32).max,
-                dtype=torch.float32,
-                device=self.device,
+        ]
+        if ratio == COMPRESS_RATIO128:
+            tensors.extend(
+                [
+                    StateTensorSpec(
+                        name="comp_kv_state",
+                        input_name="comp_kv_state",
+                        output_name="comp_kv_state_out",
+                        shape=(self.batch_size, COMPRESS_RATIO128, self.config.head_dim),
+                        dtype=torch.float32,
+                    ),
+                    StateTensorSpec(
+                        name="comp_score_state",
+                        input_name="comp_score_state",
+                        output_name="comp_score_state_out",
+                        shape=(self.batch_size, COMPRESS_RATIO128, self.config.head_dim),
+                        dtype=torch.float32,
+                        init_value=-torch.finfo(torch.float32).max,
+                    ),
+                    StateTensorSpec(
+                        name="comp_cache",
+                        input_name="comp_cache",
+                        output_name="comp_cache_out",
+                        shape=(self.batch_size, self.topk_hca, self.config.head_dim),
+                        dtype=torch.bfloat16,
+                    ),
+                ]
             )
         elif ratio == COMPRESS_RATIO4:
             attn_proj_dim = 2 * self.config.head_dim
             index_proj_dim = 2 * self.config.index_head_dim
-            state.attn_comp_cache = torch.zeros(
-                self.batch_size,
-                self.index_score_len,
-                self.config.head_dim,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            state.attn_comp_kv_state = torch.zeros(
-                self.batch_size,
-                RATIO4_STATE_ROWS,
-                attn_proj_dim,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            state.attn_comp_score_state = torch.full(
-                (self.batch_size, RATIO4_STATE_ROWS, attn_proj_dim),
-                -torch.finfo(torch.float32).max,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            state.idx_kv_cache = torch.zeros(
-                self.batch_size,
-                self.index_score_len,
-                self.config.index_head_dim,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            state.idx_comp_kv_state = torch.zeros(
-                self.batch_size,
-                RATIO4_STATE_ROWS,
-                index_proj_dim,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            state.idx_comp_score_state = torch.full(
-                (self.batch_size, RATIO4_STATE_ROWS, index_proj_dim),
-                -torch.finfo(torch.float32).max,
-                dtype=torch.float32,
-                device=self.device,
+            tensors.extend(
+                [
+                    StateTensorSpec(
+                        name="attn_comp_kv_state",
+                        input_name="attn_comp_kv_state",
+                        output_name="attn_comp_kv_state_out",
+                        shape=(self.batch_size, RATIO4_STATE_ROWS, attn_proj_dim),
+                        dtype=torch.float32,
+                    ),
+                    StateTensorSpec(
+                        name="attn_comp_score_state",
+                        input_name="attn_comp_score_state",
+                        output_name="attn_comp_score_state_out",
+                        shape=(self.batch_size, RATIO4_STATE_ROWS, attn_proj_dim),
+                        dtype=torch.float32,
+                        init_value=-torch.finfo(torch.float32).max,
+                    ),
+                    StateTensorSpec(
+                        name="attn_comp_cache",
+                        input_name="attn_comp_cache",
+                        output_name="attn_comp_cache_out",
+                        shape=(self.batch_size, self.index_score_len, self.config.head_dim),
+                        dtype=torch.bfloat16,
+                    ),
+                    StateTensorSpec(
+                        name="idx_kv_cache",
+                        input_name="idx_kv_cache_in",
+                        output_name="idx_kv_cache_out",
+                        shape=(self.batch_size, self.index_score_len, self.config.index_head_dim),
+                        dtype=torch.bfloat16,
+                    ),
+                    StateTensorSpec(
+                        name="idx_comp_kv_state",
+                        input_name="idx_comp_kv_state",
+                        output_name="idx_comp_kv_state_out",
+                        shape=(self.batch_size, RATIO4_STATE_ROWS, index_proj_dim),
+                        dtype=torch.float32,
+                    ),
+                    StateTensorSpec(
+                        name="idx_comp_score_state",
+                        input_name="idx_comp_score_state",
+                        output_name="idx_comp_score_state_out",
+                        shape=(self.batch_size, RATIO4_STATE_ROWS, index_proj_dim),
+                        dtype=torch.float32,
+                        init_value=-torch.finfo(torch.float32).max,
+                    ),
+                ]
             )
         elif ratio != 0:
             raise ValueError(f"Unsupported compress ratio at layer {layer_id}: {ratio}")
-        return state
+        return LayerStateSchema(
+            spec=layer_spec,
+            tensors=tuple(tensors),
+        )
 
     def _validate_layer_id(self, layer_id: int) -> None:
         if not 0 <= layer_id < self.config.n_layers:
@@ -682,32 +642,16 @@ class DeepSeekV4State:
     def _scalar_int(self, value: int) -> torch.Tensor:
         return torch.tensor([int(value)], dtype=torch.int32, device=self.device)
 
-    @staticmethod
-    def _required(tensor: torch.Tensor | None, name: str) -> torch.Tensor:
-        if tensor is None:
-            raise ValueError(f"Layer state is missing required tensor: {name}")
-        return tensor
-
-    @staticmethod
-    def _take_output(outputs: dict[str, torch.Tensor], name: str, current: torch.Tensor) -> torch.Tensor:
-        if name not in outputs:
-            raise KeyError(f"Missing state output tensor: {name}")
-        tensor = outputs[name]
-        if tuple(tensor.shape) != tuple(current.shape):
-            raise ValueError(f"{name} shape mismatch: expected {tuple(current.shape)}, got {tuple(tensor.shape)}")
-        if tensor.dtype != current.dtype:
-            raise TypeError(f"{name} dtype mismatch: expected {current.dtype}, got {tensor.dtype}")
-        return tensor.contiguous()
-
 
 __all__ = [
     "COMPRESS_RATIO4",
     "COMPRESS_RATIO128",
     "DEFAULT_MAX_SEQ_LEN",
-    "DeepSeekV4State",
+    "DeepSeekV4StatePlan",
+    "LayerStateSchema",
     "LayerSpec",
-    "LayerState",
     "RATIO4_STATE_ROWS",
+    "StateTensorSpec",
     "build_compress_topk_idxs",
     "build_deepseek_v4_rope_tables",
     "build_window_topk_idxs",
