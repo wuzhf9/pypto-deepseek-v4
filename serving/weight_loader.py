@@ -9,12 +9,13 @@ materialized as the layouts expected by ``models/moe.py`` and
 """
 
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from safetensors.torch import safe_open
@@ -70,6 +71,17 @@ KEY_MAPPING = {
 }
 
 HC_HEAD_PAD = 16
+
+
+@dataclass(frozen=True)
+class _RuntimeWeightKey:
+    """Stable identity for a tensor in its final kernel-facing layout."""
+
+    name: str
+    dtype: torch.dtype
+    layout: str
+    layout_version: int = 1
+    padding_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -231,7 +243,6 @@ class DeepSeekV4WeightLoader:
         *,
         config: DeepSeekV4FlashConfig = FLASH_CONFIG,
         default_device: str | torch.device = "cpu",
-        max_cache_bytes: int = 0,
         profile: bool = False,
         expert_cache_dir: str | os.PathLike[str] | None = None,
     ) -> None:
@@ -239,17 +250,16 @@ class DeepSeekV4WeightLoader:
         self.index = self._load_index(weight_index)
         self.config = config
         self.default_device = torch.device(default_device)
-        self.max_cache_bytes = max_cache_bytes
         self.profile = bool(profile)
         self.expert_cache_dir = Path(expert_cache_dir) if expert_cache_dir is not None else None
-        self._cache: OrderedDict[tuple[str, str, bool, str | None], torch.Tensor] = OrderedDict()
-        self._cache_bytes = 0
+        self._layout_cache: dict[tuple[_RuntimeWeightKey, str], torch.Tensor] = {}
+        self._layout_cache_bytes = 0
         self._file_handles: dict[Path, Any] = {}
         self._profile_stats: OrderedDict[str, dict[str, float | int]] = OrderedDict()
 
     @property
-    def cache_bytes(self) -> int:
-        return self._cache_bytes
+    def layout_cache_bytes(self) -> int:
+        return self._layout_cache_bytes
 
     def has_tensor(self, name: str) -> bool:
         return name in self.index
@@ -260,93 +270,147 @@ class DeepSeekV4WeightLoader:
         except KeyError as exc:
             raise KeyError(f"Unknown checkpoint tensor: {name}") from exc
 
-    def get_tensor(
+    def _load_tensor(
         self,
         name: str,
         *,
         dtype: torch.dtype | None = None,
         device: str | torch.device | None = None,
         dequantize: bool = True,
-        cache: bool = True,
     ) -> torch.Tensor:
         target = torch.device(device) if device is not None else self.default_device
-        key = (name, str(target), dequantize, str(dtype) if dtype is not None else None)
-        if key in self._cache:
-            tensor = self._cache.pop(key)
-            self._cache[key] = tensor
-            return tensor
-
         tensor = self._load_indexed_tensor(name, device=target, dequantize=dequantize)
         if dtype is not None:
             start = time.perf_counter()
             tensor = tensor.to(dtype=dtype)
             self._record_profile(f"dtype_cast.{dtype}", start)
+        return tensor.contiguous()
+
+    def _get_runtime_weight(
+        self,
+        name: str,
+        *,
+        dtype: torch.dtype,
+        layout: str = "identity",
+        device: str | torch.device | None = None,
+        cache: bool = True,
+        layout_version: int = 1,
+        padding_profile: str | None = None,
+        build: Callable[[], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Return a checkpoint tensor in its final kernel-facing layout.
+
+        Identity layouts are loaded directly from the checkpoint.  Non-identity
+        layouts must provide a builder so a raw tensor cannot be cached under a
+        transformed-layout key by mistake.
+        """
+        target = torch.device(device) if device is not None else self.default_device
+        if build is None and layout != "identity":
+            raise ValueError(f"Runtime layout {layout!r} for {name} requires an explicit builder")
+        key = _RuntimeWeightKey(
+            name,
+            dtype,
+            layout,
+            layout_version=layout_version,
+            padding_profile=padding_profile,
+        )
+        cache_key = (key, str(target))
+        lookup_start = time.perf_counter()
+        if cache and cache_key in self._layout_cache:
+            self._record_profile("cache.layout.hit", lookup_start)
+            return self._layout_cache[cache_key]
+        self._record_profile("cache.layout.miss", lookup_start)
+
+        if build is None:
+            build = lambda: self._load_tensor(
+                name,
+                dtype=dtype,
+                device=target,
+                dequantize=True,
+            )
+        tensor = build()
+        if tensor.dtype != key.dtype:
+            raise TypeError(
+                f"Runtime layout {key.layout!r} for {key.name} expected dtype {key.dtype}, got {tensor.dtype}"
+            )
+        if tensor.device != target:
+            raise ValueError(
+                f"Runtime layout {key.layout!r} for {key.name} expected device {target}, got {tensor.device}"
+            )
         tensor = tensor.contiguous()
         if cache:
-            self._insert_cache(key, tensor)
+            self._insert_layout_cache(cache_key, tensor)
         return tensor
 
-    def get_linear_weight(
+    def _load_linear_weight(
         self,
         name: str,
         *,
         dtype: torch.dtype = torch.bfloat16,
         device: str | torch.device | None = None,
-        cache: bool = True,
     ) -> torch.Tensor:
-        tensor = self.get_tensor(name, dtype=dtype, device=device, dequantize=True, cache=cache)
+        tensor = self._load_tensor(name, dtype=dtype, device=device, dequantize=True)
         if not tensor.is_floating_point():
             raise TypeError(f"Expected floating point linear weight for {name}, got {tensor.dtype}")
         return tensor
 
-    def get_linear_t(
-        self,
-        name: str,
-        *,
-        dtype: torch.dtype = torch.bfloat16,
-        device: str | torch.device | None = None,
-        cache: bool = True,
-    ) -> torch.Tensor:
-        tensor = self.get_linear_weight(name, dtype=dtype, device=device, cache=cache)
-        start = time.perf_counter()
-        out = tensor.t().contiguous()
-        self._record_profile("transpose.linear_t", start)
-        return out
-
     def get_embedding_weight(self, *, device: str | torch.device | None = None) -> torch.Tensor:
-        return self.get_tensor("embed.weight", dtype=torch.bfloat16, device=device)
+        return self._get_runtime_weight("embed.weight", dtype=torch.bfloat16, device=device)
 
     def get_head_weights(self, *, device: str | torch.device | None = None) -> HeadWeights:
-        hc_fn = self.get_tensor("hc_head_fn", dtype=torch.float32, device=device)
-        if hc_fn.ndim != 2 or hc_fn.shape[0] != self.config.hc_mult:
-            raise ValueError(f"Expected hc_head_fn shape [{self.config.hc_mult}, HC_DIM], got {tuple(hc_fn.shape)}")
-        if hc_fn.shape[0] > HC_HEAD_PAD:
-            raise ValueError(f"hc_mult={hc_fn.shape[0]} exceeds HC head pad width {HC_HEAD_PAD}")
-
-        hc_fn_t = torch.zeros(hc_fn.shape[1], HC_HEAD_PAD, dtype=torch.float32, device=hc_fn.device)
-        hc_fn_t[:, : hc_fn.shape[0]] = hc_fn.t().contiguous()
-
-        hc_base_raw = self.get_tensor("hc_head_base", dtype=torch.float32, device=device)
-        hc_base = torch.zeros(HC_HEAD_PAD, dtype=torch.float32, device=hc_base_raw.device)
-        hc_base[: hc_base_raw.numel()] = hc_base_raw.reshape(-1)
+        target = torch.device(device) if device is not None else self.default_device
+        padding_profile = f"width={HC_HEAD_PAD}"
+        hc_fn_t = self._get_runtime_weight(
+            "hc_head_fn",
+            dtype=torch.float32,
+            layout="hc_head_padded_t",
+            padding_profile=padding_profile,
+            build=lambda: self._build_head_hc_fn_t(device=target),
+            device=target,
+        )
+        hc_base = self._get_runtime_weight(
+            "hc_head_base",
+            dtype=torch.float32,
+            layout="hc_head_base_padded",
+            padding_profile=padding_profile,
+            build=lambda: self._build_head_hc_base(device=target),
+            device=target,
+        )
 
         return HeadWeights(
-            hc_fn_t=hc_fn_t.contiguous(),
-            hc_scale=self.get_tensor("hc_head_scale", dtype=torch.float32, device=device),
-            hc_base=hc_base.contiguous(),
-            norm_w=self.get_tensor("norm.weight", dtype=torch.bfloat16, device=device),
-            head_w=self.get_tensor("head.weight", dtype=torch.float32, device=device),
+            hc_fn_t=hc_fn_t,
+            hc_scale=self._get_runtime_weight("hc_head_scale", dtype=torch.float32, device=device),
+            hc_base=hc_base,
+            norm_w=self._get_runtime_weight("norm.weight", dtype=torch.bfloat16, device=device),
+            head_w=self._get_runtime_weight("head.weight", dtype=torch.float32, device=device),
         )
 
     def get_layer_hc(self, layer_id: int, *, device: str | torch.device | None = None) -> LayerHCWeights:
         prefix = self._layer_prefix(layer_id)
         return LayerHCWeights(
-            attn_hc_fn_t=self.get_tensor(f"{prefix}.hc_attn_fn", dtype=torch.float32, device=device).t().contiguous(),
-            attn_hc_scale=self.get_tensor(f"{prefix}.hc_attn_scale", dtype=torch.float32, device=device),
-            attn_hc_base=self.get_tensor(f"{prefix}.hc_attn_base", dtype=torch.float32, device=device),
-            ffn_hc_fn_t=self.get_tensor(f"{prefix}.hc_ffn_fn", dtype=torch.float32, device=device).t().contiguous(),
-            ffn_hc_scale=self.get_tensor(f"{prefix}.hc_ffn_scale", dtype=torch.float32, device=device),
-            ffn_hc_base=self.get_tensor(f"{prefix}.hc_ffn_base", dtype=torch.float32, device=device),
+            attn_hc_fn_t=self._get_transposed_weight(
+                f"{prefix}.hc_attn_fn",
+                dtype=torch.float32,
+                device=device,
+                layout="hc_t",
+            ),
+            attn_hc_scale=self._get_runtime_weight(f"{prefix}.hc_attn_scale", dtype=torch.float32, device=device),
+            attn_hc_base=self._get_runtime_weight(f"{prefix}.hc_attn_base", dtype=torch.float32, device=device),
+            ffn_hc_fn_t=self._get_transposed_weight(
+                f"{prefix}.hc_ffn_fn",
+                dtype=torch.float32,
+                device=device,
+                layout="hc_t",
+            ),
+            ffn_hc_scale=self._get_runtime_weight(f"{prefix}.hc_ffn_scale", dtype=torch.float32, device=device),
+            ffn_hc_base=self._get_runtime_weight(f"{prefix}.hc_ffn_base", dtype=torch.float32, device=device),
+        )
+
+    def get_layer_ffn_norm(self, layer_id: int, *, device: str | torch.device | None = None) -> torch.Tensor:
+        return self._get_runtime_weight(
+            f"{self._layer_prefix(layer_id)}.ffn_norm.weight",
+            dtype=torch.bfloat16,
+            device=device,
         )
 
     def get_layer_attention_common(
@@ -357,15 +421,19 @@ class DeepSeekV4WeightLoader:
     ) -> LayerAttentionWeights:
         prefix = f"{self._layer_prefix(layer_id)}.attn"
         return LayerAttentionWeights(
-            attn_norm_w=self.get_tensor(f"{self._layer_prefix(layer_id)}.attn_norm.weight", dtype=torch.bfloat16, device=device),
-            wq_a_t=self.get_linear_t(f"{prefix}.wq_a.weight", device=device),
-            q_norm_w=self.get_tensor(f"{prefix}.q_norm.weight", dtype=torch.bfloat16, device=device),
-            wq_b_t=self.get_linear_t(f"{prefix}.wq_b.weight", device=device),
-            wkv_t=self.get_linear_t(f"{prefix}.wkv.weight", device=device),
-            kv_norm_w=self.get_tensor(f"{prefix}.kv_norm.weight", dtype=torch.bfloat16, device=device),
-            attn_sink=self.get_tensor(f"{prefix}.attn_sink", dtype=torch.float32, device=device),
-            wo_a_t=self.get_linear_t(f"{prefix}.wo_a.weight", device=device),
-            wo_b_t=self.get_linear_t(f"{prefix}.wo_b.weight", device=device),
+            attn_norm_w=self._get_runtime_weight(
+                f"{self._layer_prefix(layer_id)}.attn_norm.weight",
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            wq_a_t=self._get_transposed_weight(f"{prefix}.wq_a.weight", device=device),
+            q_norm_w=self._get_runtime_weight(f"{prefix}.q_norm.weight", dtype=torch.bfloat16, device=device),
+            wq_b_t=self._get_transposed_weight(f"{prefix}.wq_b.weight", device=device),
+            wkv_t=self._get_transposed_weight(f"{prefix}.wkv.weight", device=device),
+            kv_norm_w=self._get_runtime_weight(f"{prefix}.kv_norm.weight", dtype=torch.bfloat16, device=device),
+            attn_sink=self._get_runtime_weight(f"{prefix}.attn_sink", dtype=torch.float32, device=device),
+            wo_a_t=self._get_transposed_weight(f"{prefix}.wo_a.weight", device=device),
+            wo_b_t=self._get_transposed_weight(f"{prefix}.wo_b.weight", device=device),
         )
 
     def get_layer_compressor_ratio128(
@@ -388,12 +456,16 @@ class DeepSeekV4WeightLoader:
         prefix = f"{self._layer_prefix(layer_id)}.attn.indexer"
         comp_prefix = f"{prefix}.compressor"
         return IndexerWeights(
-            idx_wq_b_t=self.get_linear_t(f"{prefix}.wq_b.weight", device=device),
-            idx_weights_proj_t=self.get_linear_t(f"{prefix}.weights_proj.weight", device=device),
-            idx_comp_wkv_t=self.get_linear_t(f"{comp_prefix}.wkv.weight", device=device),
-            idx_comp_wgate_t=self.get_linear_t(f"{comp_prefix}.wgate.weight", device=device),
-            idx_comp_ape=self.get_tensor(f"{comp_prefix}.ape", dtype=torch.float32, device=device),
-            idx_comp_norm_w=self.get_tensor(f"{comp_prefix}.norm.weight", dtype=torch.bfloat16, device=device),
+            idx_wq_b_t=self._get_transposed_weight(f"{prefix}.wq_b.weight", device=device),
+            idx_weights_proj_t=self._get_transposed_weight(f"{prefix}.weights_proj.weight", device=device),
+            idx_comp_wkv_t=self._get_transposed_weight(f"{comp_prefix}.wkv.weight", device=device),
+            idx_comp_wgate_t=self._get_transposed_weight(f"{comp_prefix}.wgate.weight", device=device),
+            idx_comp_ape=self._get_runtime_weight(f"{comp_prefix}.ape", dtype=torch.float32, device=device),
+            idx_comp_norm_w=self._get_runtime_weight(
+                f"{comp_prefix}.norm.weight",
+                dtype=torch.bfloat16,
+                device=device,
+            ),
         )
 
     def get_layer_moe_gate(
@@ -404,26 +476,26 @@ class DeepSeekV4WeightLoader:
         device: str | torch.device | None = None,
     ) -> MoEGateWeights:
         prefix = f"{self._layer_prefix(layer_id)}.ffn.gate"
-        gate_w_t = self.get_linear_t(f"{prefix}.weight", device=device)
+        gate_w_t = self._get_transposed_weight(f"{prefix}.weight", device=device)
         if hash_route:
             tid_name = f"{prefix}.tid2eid"
             if not self.has_tensor(tid_name):
                 tid_name = f"{prefix}.tie2eid"
             return MoEGateWeights(
                 gate_w_t=gate_w_t,
-                tid2eid=self.get_tensor(tid_name, dtype=torch.int32, device=device),
+                tid2eid=self._get_runtime_weight(tid_name, dtype=torch.int32, device=device),
             )
         return MoEGateWeights(
             gate_w_t=gate_w_t,
-            gate_bias=self.get_tensor(f"{prefix}.bias", dtype=torch.float32, device=device),
+            gate_bias=self._get_runtime_weight(f"{prefix}.bias", dtype=torch.float32, device=device),
         )
 
     def get_layer_moe_shared(self, layer_id: int, *, device: str | torch.device | None = None) -> MoESharedWeights:
         prefix = f"{self._layer_prefix(layer_id)}.ffn.shared_experts"
         return MoESharedWeights(
-            shared_w1_t=self.get_linear_t(f"{prefix}.w1.weight", device=device),
-            shared_w2_t=self.get_linear_t(f"{prefix}.w2.weight", device=device),
-            shared_w3_t=self.get_linear_t(f"{prefix}.w3.weight", device=device),
+            shared_w1_t=self._get_transposed_weight(f"{prefix}.w1.weight", device=device),
+            shared_w2_t=self._get_transposed_weight(f"{prefix}.w2.weight", device=device),
+            shared_w3_t=self._get_transposed_weight(f"{prefix}.w3.weight", device=device),
         )
 
     def get_moe_routed_expert(
@@ -442,9 +514,9 @@ class DeepSeekV4WeightLoader:
 
         prefix = f"{self._layer_prefix(layer_id)}.ffn.experts.{expert_id}"
         return MoERoutedExpertWeights(
-            w1_t=self.get_linear_t(f"{prefix}.w1.weight", device=target, cache=False),
-            w2_t=self.get_linear_t(f"{prefix}.w2.weight", device=target, cache=False),
-            w3_t=self.get_linear_t(f"{prefix}.w3.weight", device=target, cache=False),
+            w1_t=self._get_transposed_weight(f"{prefix}.w1.weight", device=target, cache=False),
+            w2_t=self._get_transposed_weight(f"{prefix}.w2.weight", device=target, cache=False),
+            w3_t=self._get_transposed_weight(f"{prefix}.w3.weight", device=target, cache=False),
         )
 
     def get_layer_moe_selected_experts(
@@ -535,32 +607,77 @@ class DeepSeekV4WeightLoader:
         )
 
     def release(self, name: str | None = None) -> None:
+        """Release fixed runtime layouts for one parameter or for the whole loader."""
         if name is None:
-            self._cache.clear()
-            self._cache_bytes = 0
+            self._layout_cache.clear()
+            self._layout_cache_bytes = 0
             self._close_file_handles()
             return
-
-        removed = [key for key in self._cache if key[0] == name]
-        for key in removed:
-            tensor = self._cache.pop(key)
-            self._cache_bytes -= tensor_nbytes(tensor)
+        self._release_layout_keys(key for key in self._layout_cache if key[0].name == name)
 
     def close(self) -> None:
         self.release()
 
     def release_prefix(self, prefix: str) -> None:
-        removed = [key for key in self._cache if key[0].startswith(prefix)]
-        for key in removed:
-            tensor = self._cache.pop(key)
-            self._cache_bytes -= tensor_nbytes(tensor)
+        """Release fixed runtime layouts whose parameter names match ``prefix``."""
+        self._release_layout_keys(key for key in self._layout_cache if key[0].name.startswith(prefix))
+
+    def _get_transposed_weight(
+        self,
+        name: str,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device | None = None,
+        cache: bool = True,
+        layout: str = "linear_t",
+    ) -> torch.Tensor:
+        target = torch.device(device) if device is not None else self.default_device
+
+        def build() -> torch.Tensor:
+            tensor = self._load_linear_weight(name, dtype=dtype, device=target)
+            start = time.perf_counter()
+            out = tensor.t().contiguous()
+            self._record_profile(f"transpose.{layout}", start)
+            return out
+
+        return self._get_runtime_weight(
+            name,
+            dtype=dtype,
+            layout=layout,
+            build=build,
+            device=target,
+            cache=cache,
+        )
+
+    def _build_head_hc_fn_t(self, *, device: torch.device) -> torch.Tensor:
+        hc_fn = self._load_tensor("hc_head_fn", dtype=torch.float32, device=device)
+        if hc_fn.ndim != 2 or hc_fn.shape[0] != self.config.hc_mult:
+            raise ValueError(f"Expected hc_head_fn shape [{self.config.hc_mult}, HC_DIM], got {tuple(hc_fn.shape)}")
+        if hc_fn.shape[0] > HC_HEAD_PAD:
+            raise ValueError(f"hc_mult={hc_fn.shape[0]} exceeds HC head pad width {HC_HEAD_PAD}")
+        out = torch.zeros(hc_fn.shape[1], HC_HEAD_PAD, dtype=torch.float32, device=hc_fn.device)
+        out[:, : hc_fn.shape[0]] = hc_fn.t()
+        return out.contiguous()
+
+    def _build_head_hc_base(self, *, device: torch.device) -> torch.Tensor:
+        hc_base_raw = self._load_tensor("hc_head_base", dtype=torch.float32, device=device)
+        if hc_base_raw.numel() > HC_HEAD_PAD:
+            raise ValueError(f"hc_head_base has {hc_base_raw.numel()} entries, exceeds pad width {HC_HEAD_PAD}")
+        out = torch.zeros(HC_HEAD_PAD, dtype=torch.float32, device=hc_base_raw.device)
+        out[: hc_base_raw.numel()] = hc_base_raw.reshape(-1)
+        return out.contiguous()
+
+    def _release_layout_keys(self, keys: Iterable[tuple[_RuntimeWeightKey, str]]) -> None:
+        for key in list(keys):
+            tensor = self._layout_cache.pop(key)
+            self._layout_cache_bytes -= tensor_nbytes(tensor)
 
     def _get_compressor(self, prefix: str, *, device: str | torch.device | None = None) -> CompressorWeights:
         return CompressorWeights(
-            wkv_t=self.get_linear_t(f"{prefix}.wkv.weight", device=device),
-            wgate_t=self.get_linear_t(f"{prefix}.wgate.weight", device=device),
-            ape=self.get_tensor(f"{prefix}.ape", dtype=torch.float32, device=device),
-            norm_w=self.get_tensor(f"{prefix}.norm.weight", dtype=torch.bfloat16, device=device),
+            wkv_t=self._get_transposed_weight(f"{prefix}.wkv.weight", device=device),
+            wgate_t=self._get_transposed_weight(f"{prefix}.wgate.weight", device=device),
+            ape=self._get_runtime_weight(f"{prefix}.ape", dtype=torch.float32, device=device),
+            norm_w=self._get_runtime_weight(f"{prefix}.norm.weight", dtype=torch.bfloat16, device=device),
         )
 
     def _layer_prefix(self, layer_id: int) -> str:
@@ -581,7 +698,7 @@ class DeepSeekV4WeightLoader:
         return ids
 
     def _copy_linear_t_into(self, out: torch.Tensor, name: str, *, device: torch.device) -> None:
-        tensor = self.get_linear_t(name, device=device, cache=False)
+        tensor = self._get_transposed_weight(name, device=device, cache=False)
         if tuple(tensor.shape) != tuple(out.shape):
             raise ValueError(f"{name} transposed shape mismatch: expected {tuple(out.shape)}, got {tuple(tensor.shape)}")
         start = time.perf_counter()
@@ -768,20 +885,12 @@ class DeepSeekV4WeightLoader:
             return "integer_tensor"
         return "unknown"
 
-    def _insert_cache(self, key: tuple[str, str, bool, str | None], tensor: torch.Tensor) -> None:
-        if key in self._cache:
-            old = self._cache.pop(key)
-            self._cache_bytes -= tensor_nbytes(old)
-        self._cache[key] = tensor
-        self._cache_bytes += tensor_nbytes(tensor)
-        self._evict_if_needed()
-
-    def _evict_if_needed(self) -> None:
-        if self.max_cache_bytes <= 0:
-            return
-        while self._cache and self._cache_bytes > self.max_cache_bytes:
-            _, tensor = self._cache.popitem(last=False)
-            self._cache_bytes -= tensor_nbytes(tensor)
+    def _insert_layout_cache(self, key: tuple[_RuntimeWeightKey, str], tensor: torch.Tensor) -> None:
+        if key in self._layout_cache:
+            old = self._layout_cache[key]
+            self._layout_cache_bytes -= tensor_nbytes(old)
+        self._layout_cache[key] = tensor
+        self._layout_cache_bytes += tensor_nbytes(tensor)
 
     def reset_profile_stats(self) -> None:
         self._profile_stats.clear()
@@ -804,13 +913,11 @@ def load_weight_loader_from_checkpoint(
     checkpoint_path: str | os.PathLike[str],
     *,
     default_device: str | torch.device = "cpu",
-    max_cache_bytes: int = 0,
     expert_cache_dir: str | os.PathLike[str] | None = None,
 ) -> DeepSeekV4WeightLoader:
     return DeepSeekV4WeightLoader(
         checkpoint_path,
         default_device=default_device,
-        max_cache_bytes=max_cache_bytes,
         expert_cache_dir=expert_cache_dir,
     )
 

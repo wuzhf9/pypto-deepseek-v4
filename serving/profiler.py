@@ -63,6 +63,7 @@ class ProfileRecorder:
         if not self.enabled:
             return
         parts = [f"{key}={value}" for key, value in fields.items()]
+        parts.append(f"layout_cache_bytes={getattr(weight_loader, 'layout_cache_bytes', 0)}")
         for stat_name, count, elapsed_ms in weight_loader.profile_summary():
             parts.append(f"{stat_name}={elapsed_ms:.3f}ms/{count}")
         print(f"[PROFILE] {name}: {' '.join(parts)}", flush=True)

@@ -101,10 +101,17 @@ def test_loader_global_and_layer_layouts(tmp_path):
     assert torch.equal(head.hc_base[:2], tensors["model.hc_head_base"])
     assert torch.count_nonzero(head.hc_base[2:]) == 0
     assert torch.equal(head.head_w, tensors["lm_head.weight"])
+    head_again = loader.get_head_weights()
+    assert head_again.hc_fn_t is head.hc_fn_t
+    assert head_again.hc_base is head.hc_base
+    assert head_again.head_w is head.head_w
 
     hc = loader.get_layer_hc(0)
     assert torch.equal(hc.attn_hc_fn_t, tensors["model.layers.0.hc_attn_fn"].t())
     assert torch.equal(hc.ffn_hc_fn_t, tensors["model.layers.0.hc_ffn_fn"].t())
+    hc_again = loader.get_layer_hc(0)
+    assert hc_again.attn_hc_fn_t is hc.attn_hc_fn_t
+    assert hc_again.ffn_hc_fn_t is hc.ffn_hc_fn_t
 
     attn = loader.get_layer_attention_common(0)
     assert torch.equal(attn.wq_a_t, tensors["model.layers.0.self_attn.q_a_proj.weight"].t())
@@ -112,6 +119,9 @@ def test_loader_global_and_layer_layouts(tmp_path):
     assert torch.equal(attn.wkv_t, tensors["model.layers.0.self_attn.kv_a_proj_with_mqa.weight"].t())
     assert torch.equal(attn.wo_a_t, tensors["model.layers.0.self_attn.wo_a.weight"].t())
     assert torch.equal(attn.wo_b_t, tensors["model.layers.0.self_attn.wo_b.weight"].t())
+    attn_again = loader.get_layer_attention_common(0)
+    assert attn_again.attn_norm_w is attn.attn_norm_w
+    assert attn_again.attn_sink is attn.attn_sink
 
 
 def test_loader_compressor_indexer_and_moe_layouts(tmp_path):
@@ -161,13 +171,21 @@ def test_loader_compressor_indexer_and_moe_layouts(tmp_path):
     shared = loader.get_layer_moe_shared(0)
     assert torch.equal(shared.shared_w1_t, tensors["model.layers.0.mlp.shared_experts.gate_proj.weight"].t())
     assert torch.equal(shared.shared_w2_t, tensors["model.layers.0.mlp.shared_experts.down_proj.weight"].t())
+    shared_cache_bytes = loader.layout_cache_bytes
+    shared_again = loader.get_layer_moe_shared(0)
+    assert shared_again.shared_w1_t is shared.shared_w1_t
+    assert shared_again.shared_w2_t is shared.shared_w2_t
+    assert shared_again.shared_w3_t is shared.shared_w3_t
+    assert loader.layout_cache_bytes == shared_cache_bytes
 
     expert = loader.get_moe_routed_expert(0, 1)
     assert torch.equal(expert.w1_t, tensors["model.layers.0.mlp.experts.1.gate_proj.weight"].t())
+    assert loader.layout_cache_bytes == shared_cache_bytes
     packed = loader.get_layer_moe_routed_pack(0)
     assert packed.routed_w1_t.shape == (2, 4, 3)
     assert packed.routed_w2_t.shape == (2, 3, 4)
     assert torch.equal(packed.routed_w3_t[0], tensors["model.layers.0.mlp.experts.0.up_proj.weight"].t())
+    assert loader.layout_cache_bytes == shared_cache_bytes
 
     selected = loader.get_layer_moe_selected_experts(0, torch.tensor([[1, 0]], dtype=torch.int32))
     assert selected.selected_w1_t.shape == (2, 4, 3)
@@ -179,6 +197,7 @@ def test_loader_compressor_indexer_and_moe_layouts(tmp_path):
     assert torch.equal(selected.selected_w1_t[1], tensors["model.layers.0.mlp.experts.0.gate_proj.weight"].t())
     assert torch.equal(selected.selected_w2_t[1], tensors["model.layers.0.mlp.experts.0.down_proj.weight"].t())
     assert torch.equal(selected.selected_w3_t[1], tensors["model.layers.0.mlp.experts.0.up_proj.weight"].t())
+    assert loader.layout_cache_bytes == shared_cache_bytes
 
 
 def test_loader_selected_experts_validate_ids(tmp_path):
@@ -213,33 +232,145 @@ def test_loader_dequantizes_quantized_weight_from_weight_map(tmp_path):
     index = _save_checkpoint(tmp_path, tensors)
     loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config())
 
-    fp8 = loader.get_linear_weight("layers.0.attn.wq_a.weight")
+    fp8 = loader._get_transposed_weight("layers.0.attn.wq_a.weight")
     assert fp8.dtype is torch.bfloat16
     assert torch.equal(fp8, torch.full((128, 128), 2.0, dtype=torch.bfloat16))
 
-    fp4 = loader.get_linear_weight("layers.0.ffn.experts.0.w1.weight")
-    assert fp4.shape == (1, 32)
+    fp4 = loader._get_transposed_weight("layers.0.ffn.experts.0.w1.weight", cache=False)
+    assert fp4.shape == (32, 1)
     assert fp4.dtype is torch.bfloat16
     assert torch.count_nonzero(fp4) == 0
 
 
-def test_cache_release_and_release_prefix(tmp_path):
+def test_layout_cache_release_and_release_prefix(tmp_path):
     tensors = {
         "model.embed_tokens.weight": torch.ones(2, 2, dtype=torch.bfloat16),
-        "model.layers.0.input_layernorm.weight": torch.ones(2, dtype=torch.bfloat16),
+        "model.layers.0.post_attention_layernorm.weight": torch.ones(2, dtype=torch.bfloat16),
+        "model.layers.0.self_attn.q_a_proj.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3).bfloat16(),
     }
     index = _save_checkpoint(tmp_path, tensors)
     loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config())
 
-    embed = loader.get_tensor("embed.weight")
-    assert loader.cache_bytes >= embed.numel() * embed.element_size()
+    embed = loader.get_embedding_weight()
+    assert loader.layout_cache_bytes == embed.numel() * embed.element_size()
     loader.release("embed.weight")
-    assert ("embed.weight" not in {key[0] for key in loader._cache})
+    assert "embed.weight" not in {key[0].name for key in loader._layout_cache}
 
-    loader.get_tensor("layers.0.attn_norm.weight")
-    assert loader.cache_bytes > 0
+    loader.get_layer_ffn_norm(0)
+    loader._get_transposed_weight("layers.0.attn.wq_a.weight")
+    assert loader.layout_cache_bytes > 0
     loader.release_prefix("layers.0.")
-    assert loader.cache_bytes == 0
+    assert loader.layout_cache_bytes == 0
+
+
+def test_runtime_layout_cache_reuses_final_tensor_until_release(tmp_path):
+    tensors = {
+        "model.layers.0.self_attn.q_a_proj.weight": torch.arange(12, dtype=torch.float32).reshape(3, 4).bfloat16(),
+    }
+    index = _save_checkpoint(tmp_path, tensors)
+    loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config(), profile=True)
+
+    first = loader._get_transposed_weight("layers.0.attn.wq_a.weight")
+    second = loader._get_transposed_weight("layers.0.attn.wq_a.weight")
+    assert second is first
+    assert loader.layout_cache_bytes == first.numel() * first.element_size()
+
+    stats = {name: count for name, count, _ in loader.profile_summary()}
+    assert stats["transpose.linear_t"] == 1
+    assert stats["cache.layout.miss"] == 1
+    assert stats["cache.layout.hit"] == 1
+
+    loader.release_prefix("layers.0.")
+    assert loader.layout_cache_bytes == 0
+    loader._get_transposed_weight("layers.0.attn.wq_a.weight")
+    stats = {name: count for name, count, _ in loader.profile_summary()}
+    assert stats["transpose.linear_t"] == 2
+    assert stats["cache.layout.miss"] == 2
+
+
+def test_identity_runtime_layout_uses_fixed_cache(tmp_path):
+    tensors = {
+        "model.layers.0.post_attention_layernorm.weight": torch.arange(4, dtype=torch.float32).bfloat16(),
+    }
+    index = _save_checkpoint(tmp_path, tensors)
+    loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config(), profile=True)
+
+    first = loader.get_layer_ffn_norm(0)
+    second = loader.get_layer_ffn_norm(0)
+    assert second is first
+    assert loader.layout_cache_bytes == first.numel() * first.element_size()
+
+    stats = {name: count for name, count, _ in loader.profile_summary()}
+    assert stats["cache.layout.miss"] == 1
+    assert stats["cache.layout.hit"] == 1
+
+
+def test_non_identity_runtime_layout_requires_builder(tmp_path):
+    index = _save_checkpoint(tmp_path, {"model.norm.weight": torch.ones(2, dtype=torch.bfloat16)})
+    loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config())
+
+    with pytest.raises(ValueError, match="requires an explicit builder"):
+        loader._get_runtime_weight("norm.weight", dtype=torch.bfloat16, layout="linear_t")
+
+
+def test_runtime_layout_cache_key_separates_dtype_layout_and_padding(tmp_path):
+    tensors = {
+        "model.layers.0.self_attn.q_a_proj.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3).bfloat16(),
+    }
+    index = _save_checkpoint(tmp_path, tensors)
+    loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config())
+
+    bf16 = loader._get_transposed_weight("layers.0.attn.wq_a.weight")
+    fp32 = loader._get_transposed_weight("layers.0.attn.wq_a.weight", dtype=torch.float32)
+    assert bf16.dtype is torch.bfloat16
+    assert fp32.dtype is torch.float32
+    assert bf16 is not fp32
+
+    padded_a = loader._get_runtime_weight(
+        "synthetic",
+        dtype=torch.float32,
+        layout="padded",
+        padding_profile="width=8",
+        build=lambda: torch.ones(8, dtype=torch.float32),
+    )
+    padded_b = loader._get_runtime_weight(
+        "synthetic",
+        dtype=torch.float32,
+        layout="padded",
+        padding_profile="width=16",
+        build=lambda: torch.ones(16, dtype=torch.float32),
+    )
+    assert padded_a.shape == (8,)
+    assert padded_b.shape == (16,)
+
+
+def test_runtime_layout_cache_keeps_all_entries_and_honors_cache_false(tmp_path):
+    tensors = {
+        "model.layers.0.self_attn.q_a_proj.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2).bfloat16(),
+        "model.layers.0.self_attn.q_b_proj.weight": torch.arange(4, 8, dtype=torch.float32).reshape(2, 2).bfloat16(),
+    }
+    index = _save_checkpoint(tmp_path, tensors)
+    layout_nbytes = 4 * torch.tensor([], dtype=torch.bfloat16).element_size()
+    loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config(), profile=True)
+
+    first = loader._get_transposed_weight("layers.0.attn.wq_a.weight")
+    loader._get_transposed_weight("layers.0.attn.wq_b.weight")
+    assert loader.layout_cache_bytes == 2 * layout_nbytes
+    assert {key[0].name for key in loader._layout_cache} == {
+        "layers.0.attn.wq_a.weight",
+        "layers.0.attn.wq_b.weight",
+    }
+
+    reused = loader._get_transposed_weight("layers.0.attn.wq_a.weight")
+    assert reused is first
+
+    loader.release()
+    uncached = loader._get_transposed_weight("layers.0.attn.wq_a.weight", cache=False)
+    assert torch.equal(uncached, tensors["model.layers.0.self_attn.q_a_proj.weight"].t())
+    assert loader.layout_cache_bytes == 0
+
+    stats = {name: count for name, count, _ in loader.profile_summary()}
+    assert "cache.layout.evict" not in stats
 
 
 def test_loader_reuses_safetensors_file_handle(tmp_path):
@@ -250,8 +381,8 @@ def test_loader_reuses_safetensors_file_handle(tmp_path):
     index = _save_checkpoint(tmp_path, tensors)
     loader = DeepSeekV4WeightLoader(tmp_path, index, config=_small_config())
 
-    loader.get_tensor("embed.weight", cache=False)
-    loader.get_tensor("norm.weight", cache=False)
+    loader._get_runtime_weight("embed.weight", dtype=torch.bfloat16, cache=False)
+    loader._get_runtime_weight("norm.weight", dtype=torch.bfloat16, cache=False)
     assert len(loader._file_handles) == 1
 
     loader.release("embed.weight")
@@ -325,12 +456,12 @@ def test_official_lowvram_weight_index_smoke_loads_representative_weights():
     assert hc.attn_hc_fn_t.dtype is torch.float32
     assert hc.ffn_hc_fn_t.is_contiguous()
 
-    q_a_t = loader.get_linear_t("layers.0.attn.wq_a.weight", cache=False)
+    q_a_t = loader._get_transposed_weight("layers.0.attn.wq_a.weight", cache=False)
     assert q_a_t.shape == (FLASH_CONFIG.dim, FLASH_CONFIG.q_lora_rank)
     assert q_a_t.dtype is torch.bfloat16
     assert q_a_t.is_contiguous()
 
-    wkv_t = loader.get_linear_t("layers.0.attn.wkv.weight", cache=False)
+    wkv_t = loader._get_transposed_weight("layers.0.attn.wkv.weight", cache=False)
     assert wkv_t.shape == (FLASH_CONFIG.dim, FLASH_CONFIG.head_dim)
     assert wkv_t.dtype is torch.bfloat16
 
@@ -373,10 +504,10 @@ def test_official_raw_safetensors_index_infers_quantized_weight_kind():
     checkpoint = _official_checkpoint_path()
     loader = DeepSeekV4WeightLoader(checkpoint, checkpoint / "model.safetensors.index.json")
 
-    q_a_t = loader.get_linear_t("layers.0.attn.wq_a.weight", cache=False)
+    q_a_t = loader._get_transposed_weight("layers.0.attn.wq_a.weight", cache=False)
     assert q_a_t.shape == (FLASH_CONFIG.dim, FLASH_CONFIG.q_lora_rank)
     assert q_a_t.dtype is torch.bfloat16
 
-    expert_w1_t = loader.get_linear_t("layers.0.ffn.experts.0.w1.weight", cache=False)
+    expert_w1_t = loader._get_transposed_weight("layers.0.ffn.experts.0.w1.weight", cache=False)
     assert expert_w1_t.shape == (FLASH_CONFIG.dim, FLASH_CONFIG.moe_inter_dim)
     assert expert_w1_t.dtype is torch.bfloat16

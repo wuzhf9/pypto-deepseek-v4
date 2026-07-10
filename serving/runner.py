@@ -151,8 +151,6 @@ class DeepSeekV4Runner:
 
             for layer_id in range(self.max_layers):
                 hidden = self._run_prefill_block(layer_id, hidden, input_ids=input_ids)
-                with self.profiler.timer("layer.release", layer=layer_id, mode="prefill"):
-                    self._release_layer_weights(layer_id)
 
             if not self.run_head:
                 return hidden
@@ -166,8 +164,6 @@ class DeepSeekV4Runner:
 
             for layer_id in range(self.max_layers):
                 hidden = self._run_decode_block(layer_id, hidden, input_ids=input_ids, start_pos=start_pos)
-                with self.profiler.timer("layer.release", layer=layer_id, mode="decode"):
-                    self._release_layer_weights(layer_id)
 
             if not self.run_head:
                 return hidden
@@ -437,10 +433,7 @@ class DeepSeekV4Runner:
         with self.profiler.timer("layer.values.gate", layer=layer_id, mode=mode, ratio=spec.ratio):
             gate = self.weight_loader.get_layer_moe_gate(layer_id, hash_route=spec.hash_route)
         with self.profiler.timer("layer.values.ffn_norm", layer=layer_id, mode=mode, ratio=spec.ratio):
-            ffn_norm_w = self.weight_loader.get_tensor(
-                f"layers.{layer_id}.ffn_norm.weight",
-                dtype=torch.bfloat16,
-            )
+            ffn_norm_w = self.weight_loader.get_layer_ffn_norm(layer_id)
 
         values: dict[str, torch.Tensor] = {
             "x": hidden,
@@ -594,9 +587,6 @@ class DeepSeekV4Runner:
             split_block_kernels.selected_decode_post_moe_fwd,
             split_block_kernels.build_selected_decode_post_moe_specs,
         )
-
-    def _release_layer_weights(self, layer_id: int) -> None:
-        self.weight_loader.release_prefix(f"layers.{layer_id}.")
 
     def _validate_prefill_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
