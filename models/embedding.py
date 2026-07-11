@@ -14,6 +14,7 @@ HC_MULT = M.hc_mult
 DEFAULT_SEQ_LEN = 8
 
 D_TILE = 128
+T_TILE = 16
 assert_divisible(HIDDEN, D_TILE, "embedding hidden size")
 H_BLOCKS = HIDDEN // D_TILE
 
@@ -31,17 +32,24 @@ def embedding_fwd(
     tokens = pl.tensor.dim(input_ids, 1)
     input_flat = pl.reshape(input_ids, [tokens])
     out_flat = pl.reshape(out, [tokens * HC_MULT, HIDDEN])
+    token_blocks = (tokens + T_TILE - 1) // T_TILE
 
-    for work in pl.spmd(tokens * H_BLOCKS, name_hint="embedding"):
-        t = work // H_BLOCKS
-        hb = work - t * H_BLOCKS
-        token_id = pl.cast(pl.read(input_flat, [t]), pl.INDEX)
+    # Keep the SPMD work count below the runtime's 32768-task boundary for
+    # long prompts while retaining hidden-block parallelism.
+    for work in pl.spmd(token_blocks * H_BLOCKS, name_hint="embedding"):
+        tb = work // H_BLOCKS
+        hb = work - tb * H_BLOCKS
+        t0 = tb * T_TILE
+        valid_tok = pl.min(T_TILE, tokens - t0)
         h0 = hb * D_TILE
-        for hc in pl.range(HC_MULT):
-            dst = t * HC_MULT + hc
-            out_flat[dst : dst + 1, h0 : h0 + D_TILE] = weight[
-                token_id : token_id + 1, h0 : h0 + D_TILE
-            ]
+        for row in pl.range(valid_tok):
+            t = t0 + row
+            token_id = pl.cast(pl.read(input_flat, [t]), pl.INDEX)
+            for hc in pl.range(HC_MULT):
+                dst = t * HC_MULT + hc
+                out_flat[dst : dst + 1, h0 : h0 + D_TILE] = weight[
+                    token_id : token_id + 1, h0 : h0 + D_TILE
+                ]
 
     return pl.reshape(out_flat, [B, tokens, HC_MULT, HIDDEN])
 
@@ -131,6 +139,7 @@ __all__ = [
     "HC_MULT",
     "DEFAULT_SEQ_LEN",
     "D_TILE",
+    "T_TILE",
     "H_BLOCKS",
     "embedding_fwd",
     "embedding_test",

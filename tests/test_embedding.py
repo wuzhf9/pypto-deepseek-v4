@@ -12,7 +12,7 @@ official_model = importlib.import_module("official.model")
 
 VOCAB = 32
 HIDDEN = 16
-SEQ_LENS = [1, 5, 13]
+SEQ_LENS = [1, 5, 13, 1024]
 
 
 @pytest.fixture()
