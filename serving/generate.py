@@ -6,6 +6,7 @@ import argparse
 from dataclasses import dataclass
 import importlib.util
 from pathlib import Path
+import sys
 import time
 from types import ModuleType
 from typing import Any, Callable, Literal
@@ -33,6 +34,7 @@ class EncodingHelpers:
 @dataclass(frozen=True)
 class GenerationResult:
     text: str
+    prompt: str
     prompt_text: str
     prompt_tokens: int
     generated_tokens: int
@@ -82,6 +84,15 @@ def encode_prompt(
     messages = [{"role": "user", "content": prompt}]
     prompt_text = helpers.encode_messages(messages, thinking_mode=thinking_mode)
     return tokenizer.encode(prompt_text), prompt_text
+
+
+def resolve_prompt_text(prompt: str | None, prompt_file: Path | None) -> str:
+    """Return the literal prompt or read it unchanged from a UTF-8 file."""
+    if prompt is not None:
+        return prompt
+    if prompt_file is None:
+        raise ValueError("one of prompt and prompt_file must be provided")
+    return prompt_file.read_text(encoding="utf-8")
 
 
 def format_completion(
@@ -155,9 +166,10 @@ def generate_ids(
 def run_generation(args: argparse.Namespace) -> GenerationResult:
     tokenizer = _load_tokenizer(resolve_tokenizer_path(args.checkpoint, args.tokenizer_path))
     helpers = load_encoding_helpers(args.checkpoint, encoding_path=args.encoding_path)
+    prompt = resolve_prompt_text(args.prompt, args.prompt_file)
     prompt_ids, prompt_text = encode_prompt(
         tokenizer,
-        args.prompt,
+        prompt,
         thinking_mode=args.thinking_mode,
         helpers=helpers,
     )
@@ -190,6 +202,7 @@ def run_generation(args: argparse.Namespace) -> GenerationResult:
     )
     return GenerationResult(
         text=text,
+        prompt=prompt,
         prompt_text=prompt_text,
         prompt_tokens=len(prompt_ids),
         generated_tokens=len(generated),
@@ -212,7 +225,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tokenizer-path", type=str, default=None)
     parser.add_argument("--encoding-path", type=str, default=None)
     parser.add_argument("--expert-cache-dir", type=str, default=None)
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--prompt")
+    parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--thinking-mode", choices=["chat", "thinking"], default="chat")
     parser.add_argument("--max-new-tokens", type=int, default=10)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -230,14 +244,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose-layer-log", action="store_true")
     parser.add_argument("--stats", action=argparse.BooleanOptionalAction, default=True)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.prompt is None and args.prompt_file is None:
+        parser.error("one of --prompt or --prompt-file is required")
+    if args.prompt is not None and args.prompt_file is not None:
+        print(
+            "warning: both --prompt and --prompt-file were provided; "
+            "--prompt takes precedence",
+            file=sys.stderr,
+        )
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     result = run_generation(args)
-    print(f"User: {args.prompt}")
-    print(f"AI: {result.text}")
+    print(f"User: \n{result.prompt}")
+    print(f"AI: \n{result.text}")
     if args.stats:
         print_stats(result)
     return 0

@@ -77,6 +77,41 @@ def test_encode_prompt_uses_deepseek_v4_message_encoder():
     assert prompt_text.endswith("</think>")
 
 
+def test_resolve_prompt_text_preserves_utf8_file_contents(tmp_path):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("第一行\n第二行\n", encoding="utf-8")
+
+    assert generate.resolve_prompt_text(None, prompt_file) == "第一行\n第二行\n"
+    assert generate.resolve_prompt_text("literal prompt", None) == "literal prompt"
+
+
+def test_resolve_prompt_text_reports_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        generate.resolve_prompt_text(None, tmp_path / "missing.txt")
+    with pytest.raises(ValueError, match="one of"):
+        generate.resolve_prompt_text(None, None)
+    assert generate.resolve_prompt_text("literal", tmp_path / "missing.txt") == "literal"
+
+
+def test_parse_args_requires_a_prompt_source_and_prefers_literal_prompt(tmp_path, capsys):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("from file", encoding="utf-8")
+
+    literal_args = generate.parse_args(["--prompt", "literal"])
+    file_args = generate.parse_args(["--prompt-file", str(prompt_file)])
+
+    assert literal_args.prompt == "literal"
+    assert literal_args.prompt_file is None
+    assert file_args.prompt is None
+    assert file_args.prompt_file == prompt_file
+    with pytest.raises(SystemExit):
+        generate.parse_args([])
+    both_args = generate.parse_args(["--prompt", "literal", "--prompt-file", str(prompt_file)])
+    assert both_args.prompt == "literal"
+    assert both_args.prompt_file == prompt_file
+    assert "--prompt takes precedence" in capsys.readouterr().err
+
+
 def test_format_completion_parses_eos_terminated_chat_response():
     helpers = _helpers()
 
@@ -215,6 +250,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         encoding_path=None,
         expert_cache_dir="cache",
         prompt="hello",
+        prompt_file=None,
         thinking_mode="chat",
         max_new_tokens=2,
         temperature=0.0,
@@ -249,6 +285,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
     assert captured["runner_kwargs"]["expert_cache_dir"] == "cache"
     assert captured["runner_kwargs"]["verbose_layer_log"] is False
     assert result.text == "4"
+    assert result.prompt == "hello"
     assert result.prompt_tokens == 3
     assert result.generated_tokens == 1
     assert fake_tokenizer.skip_special_tokens is True
