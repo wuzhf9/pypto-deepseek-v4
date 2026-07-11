@@ -19,6 +19,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-s", "--seq-len", type=int, default=1)
     parser.add_argument("--max-layers", type=int, default=1)
     parser.add_argument("--backend", choices=["direct", "worker"], default="direct")
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--keep-prefill-routed-staging", action="store_true", default=False)
     parser.add_argument("--no-head", action="store_true", default=False)
     parser.add_argument("--decode-steps", type=int, default=0)
     parser.add_argument("--profile", action="store_true", default=False)
@@ -44,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
         args.backend,
         platform=args.platform,
         device_id=args.device,
+        runtime_cfg={"enable_l2_swimlane": args.enable_l2_swimlane},
+        keep_prefill_routed_staging=args.keep_prefill_routed_staging,
     )
     try:
         runner = DeepSeekV4Runner(

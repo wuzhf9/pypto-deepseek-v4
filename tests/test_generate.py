@@ -193,8 +193,14 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         def close(self):
             fake_runner.close()
 
-    def fake_create_backend(name, *, platform, device_id):
-        captured["backend_factory"] = (name, platform, device_id)
+    def fake_create_backend(name, *, platform, device_id, runtime_cfg, keep_prefill_routed_staging):
+        captured["backend_factory"] = (
+            name,
+            platform,
+            device_id,
+            runtime_cfg,
+            keep_prefill_routed_staging,
+        )
         return fake_backend
 
     monkeypatch.setattr(generate, "AutoTokenizer", FakeAutoTokenizer)
@@ -230,7 +236,13 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
 
     assert captured["tokenizer_path"] == checkpoint
     assert captured["runner_args"] == (str(checkpoint),)
-    assert captured["backend_factory"] == ("direct", "a2a3", 0)
+    assert captured["backend_factory"] == (
+        "direct",
+        "a2a3",
+        0,
+        {"enable_l2_swimlane": False},
+        False,
+    )
     assert captured["runner_kwargs"]["backend"] is fake_backend
     assert "platform" not in captured["runner_kwargs"]
     assert "device_id" not in captured["runner_kwargs"]

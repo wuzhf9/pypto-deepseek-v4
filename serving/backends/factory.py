@@ -12,14 +12,19 @@ def create_backend(
     platform: str,
     device_id: int,
     runtime_cfg: dict[str, Any] | None = None,
+    keep_prefill_routed_staging: bool = False,
 ) -> Backend:
     """Create a serving backend from its CLI-facing name."""
     if name == "direct":
         return DirectBackend(platform=platform, device_id=device_id, runtime_cfg=runtime_cfg)
     if name == "worker":
-        raise NotImplementedError(
-            "worker backend was removed after profiling showed kernel runtime dominates; "
-            "use backend='direct'"
+        from serving.backends.worker_backend import WorkerBackend
+
+        return WorkerBackend(
+            platform=platform,
+            device_id=device_id,
+            runtime_cfg=runtime_cfg,
+            keep_prefill_routed_staging=keep_prefill_routed_staging,
         )
     raise ValueError(f"unsupported backend: {name!r}")
 

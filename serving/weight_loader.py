@@ -21,6 +21,7 @@ import torch
 from safetensors.torch import safe_open
 
 from models.config import DeepSeekV4FlashConfig, FLASH_CONFIG
+from serving.runtime_types import HostStagingTensor, RuntimeWeight, RuntimeWeightKey, StagingKind
 
 
 FP4_TABLE = torch.tensor(
@@ -74,78 +75,67 @@ HC_HEAD_PAD = 16
 
 
 @dataclass(frozen=True)
-class _RuntimeWeightKey:
-    """Stable identity for a tensor in its final kernel-facing layout."""
-
-    name: str
-    dtype: torch.dtype
-    layout: str
-    layout_version: int = 1
-    padding_profile: str | None = None
-
-
-@dataclass(frozen=True)
 class HeadWeights:
-    hc_fn_t: torch.Tensor
-    hc_scale: torch.Tensor
-    hc_base: torch.Tensor
-    norm_w: torch.Tensor
-    head_w: torch.Tensor
+    hc_fn_t: RuntimeWeight
+    hc_scale: RuntimeWeight
+    hc_base: RuntimeWeight
+    norm_w: RuntimeWeight
+    head_w: RuntimeWeight
 
 
 @dataclass(frozen=True)
 class LayerHCWeights:
-    attn_hc_fn_t: torch.Tensor
-    attn_hc_scale: torch.Tensor
-    attn_hc_base: torch.Tensor
-    ffn_hc_fn_t: torch.Tensor
-    ffn_hc_scale: torch.Tensor
-    ffn_hc_base: torch.Tensor
+    attn_hc_fn_t: RuntimeWeight
+    attn_hc_scale: RuntimeWeight
+    attn_hc_base: RuntimeWeight
+    ffn_hc_fn_t: RuntimeWeight
+    ffn_hc_scale: RuntimeWeight
+    ffn_hc_base: RuntimeWeight
 
 
 @dataclass(frozen=True)
 class LayerAttentionWeights:
-    attn_norm_w: torch.Tensor
-    wq_a_t: torch.Tensor
-    q_norm_w: torch.Tensor
-    wq_b_t: torch.Tensor
-    wkv_t: torch.Tensor
-    kv_norm_w: torch.Tensor
-    attn_sink: torch.Tensor
-    wo_a_t: torch.Tensor
-    wo_b_t: torch.Tensor
+    attn_norm_w: RuntimeWeight
+    wq_a_t: RuntimeWeight
+    q_norm_w: RuntimeWeight
+    wq_b_t: RuntimeWeight
+    wkv_t: RuntimeWeight
+    kv_norm_w: RuntimeWeight
+    attn_sink: RuntimeWeight
+    wo_a_t: RuntimeWeight
+    wo_b_t: RuntimeWeight
 
 
 @dataclass(frozen=True)
 class CompressorWeights:
-    wkv_t: torch.Tensor
-    wgate_t: torch.Tensor
-    ape: torch.Tensor
-    norm_w: torch.Tensor
+    wkv_t: RuntimeWeight
+    wgate_t: RuntimeWeight
+    ape: RuntimeWeight
+    norm_w: RuntimeWeight
 
 
 @dataclass(frozen=True)
 class IndexerWeights:
-    idx_wq_b_t: torch.Tensor
-    idx_weights_proj_t: torch.Tensor
-    idx_comp_wkv_t: torch.Tensor
-    idx_comp_wgate_t: torch.Tensor
-    idx_comp_ape: torch.Tensor
-    idx_comp_norm_w: torch.Tensor
+    idx_wq_b_t: RuntimeWeight
+    idx_weights_proj_t: RuntimeWeight
+    idx_comp_wkv_t: RuntimeWeight
+    idx_comp_wgate_t: RuntimeWeight
+    idx_comp_ape: RuntimeWeight
+    idx_comp_norm_w: RuntimeWeight
 
 
 @dataclass(frozen=True)
 class MoEGateWeights:
-    gate_w_t: torch.Tensor
-    tid2eid: torch.Tensor | None = None
-    gate_bias: torch.Tensor | None = None
+    gate_w_t: RuntimeWeight
+    tid2eid: RuntimeWeight | None = None
+    gate_bias: RuntimeWeight | None = None
 
 
 @dataclass(frozen=True)
 class MoESharedWeights:
-    shared_w1_t: torch.Tensor
-    shared_w2_t: torch.Tensor
-    shared_w3_t: torch.Tensor
+    shared_w1_t: RuntimeWeight
+    shared_w2_t: RuntimeWeight
+    shared_w3_t: RuntimeWeight
 
 
 @dataclass(frozen=True)
@@ -157,16 +147,16 @@ class MoERoutedExpertWeights:
 
 @dataclass(frozen=True)
 class MoERoutedPackWeights:
-    routed_w1_t: torch.Tensor
-    routed_w2_t: torch.Tensor
-    routed_w3_t: torch.Tensor
+    routed_w1_t: HostStagingTensor
+    routed_w2_t: HostStagingTensor
+    routed_w3_t: HostStagingTensor
 
 
 @dataclass(frozen=True)
 class MoESelectedExpertWeights:
-    selected_w1_t: torch.Tensor
-    selected_w2_t: torch.Tensor
-    selected_w3_t: torch.Tensor
+    selected_w1_t: HostStagingTensor
+    selected_w2_t: HostStagingTensor
+    selected_w3_t: HostStagingTensor
 
 
 def normalize_param_name(name: str) -> str:
@@ -252,7 +242,7 @@ class DeepSeekV4WeightLoader:
         self.default_device = torch.device(default_device)
         self.profile = bool(profile)
         self.expert_cache_dir = Path(expert_cache_dir) if expert_cache_dir is not None else None
-        self._layout_cache: dict[tuple[_RuntimeWeightKey, str], torch.Tensor] = {}
+        self._layout_cache: dict[tuple[RuntimeWeightKey, str], RuntimeWeight] = {}
         self._layout_cache_bytes = 0
         self._file_handles: dict[Path, Any] = {}
         self._profile_stats: OrderedDict[str, dict[str, float | int]] = OrderedDict()
@@ -297,8 +287,8 @@ class DeepSeekV4WeightLoader:
         layout_version: int = 1,
         padding_profile: str | None = None,
         build: Callable[[], torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        """Return a checkpoint tensor in its final kernel-facing layout.
+    ) -> RuntimeWeight:
+        """Return a checkpoint tensor descriptor in its final kernel-facing layout.
 
         Identity layouts are loaded directly from the checkpoint.  Non-identity
         layouts must provide a builder so a raw tensor cannot be cached under a
@@ -307,7 +297,7 @@ class DeepSeekV4WeightLoader:
         target = torch.device(device) if device is not None else self.default_device
         if build is None and layout != "identity":
             raise ValueError(f"Runtime layout {layout!r} for {name} requires an explicit builder")
-        key = _RuntimeWeightKey(
+        key = RuntimeWeightKey(
             name,
             dtype,
             layout,
@@ -337,10 +327,10 @@ class DeepSeekV4WeightLoader:
             raise ValueError(
                 f"Runtime layout {key.layout!r} for {key.name} expected device {target}, got {tensor.device}"
             )
-        tensor = tensor.contiguous()
+        weight = RuntimeWeight(key=key, host_tensor=tensor.contiguous())
         if cache:
-            self._insert_layout_cache(cache_key, tensor)
-        return tensor
+            self._insert_layout_cache(cache_key, weight)
+        return weight
 
     def _load_linear_weight(
         self,
@@ -354,7 +344,7 @@ class DeepSeekV4WeightLoader:
             raise TypeError(f"Expected floating point linear weight for {name}, got {tensor.dtype}")
         return tensor
 
-    def get_embedding_weight(self, *, device: str | torch.device | None = None) -> torch.Tensor:
+    def get_embedding_weight(self, *, device: str | torch.device | None = None) -> RuntimeWeight:
         return self._get_runtime_weight("embed.weight", dtype=torch.bfloat16, device=device)
 
     def get_head_weights(self, *, device: str | torch.device | None = None) -> HeadWeights:
@@ -406,7 +396,7 @@ class DeepSeekV4WeightLoader:
             ffn_hc_base=self._get_runtime_weight(f"{prefix}.hc_ffn_base", dtype=torch.float32, device=device),
         )
 
-    def get_layer_ffn_norm(self, layer_id: int, *, device: str | torch.device | None = None) -> torch.Tensor:
+    def get_layer_ffn_norm(self, layer_id: int, *, device: str | torch.device | None = None) -> RuntimeWeight:
         return self._get_runtime_weight(
             f"{self._layer_prefix(layer_id)}.ffn_norm.weight",
             dtype=torch.bfloat16,
@@ -514,9 +504,9 @@ class DeepSeekV4WeightLoader:
 
         prefix = f"{self._layer_prefix(layer_id)}.ffn.experts.{expert_id}"
         return MoERoutedExpertWeights(
-            w1_t=self._get_transposed_weight(f"{prefix}.w1.weight", device=target, cache=False),
-            w2_t=self._get_transposed_weight(f"{prefix}.w2.weight", device=target, cache=False),
-            w3_t=self._get_transposed_weight(f"{prefix}.w3.weight", device=target, cache=False),
+            w1_t=self._get_transposed_weight(f"{prefix}.w1.weight", device=target, cache=False).host_tensor,
+            w2_t=self._get_transposed_weight(f"{prefix}.w2.weight", device=target, cache=False).host_tensor,
+            w3_t=self._get_transposed_weight(f"{prefix}.w3.weight", device=target, cache=False).host_tensor,
         )
 
     def get_layer_moe_selected_experts(
@@ -558,9 +548,15 @@ class DeepSeekV4WeightLoader:
             selected_w3_t[slot].copy_(expert.w3_t)
         self._record_profile("selected_experts.build", start)
         return MoESelectedExpertWeights(
-            selected_w1_t=selected_w1_t.contiguous(),
-            selected_w2_t=selected_w2_t.contiguous(),
-            selected_w3_t=selected_w3_t.contiguous(),
+            selected_w1_t=HostStagingTensor(
+                selected_w1_t.contiguous(), StagingKind.DECODE_SELECTED, "w1_t"
+            ),
+            selected_w2_t=HostStagingTensor(
+                selected_w2_t.contiguous(), StagingKind.DECODE_SELECTED, "w2_t"
+            ),
+            selected_w3_t=HostStagingTensor(
+                selected_w3_t.contiguous(), StagingKind.DECODE_SELECTED, "w3_t"
+            ),
         )
 
     def get_layer_moe_routed_pack(
@@ -601,9 +597,9 @@ class DeepSeekV4WeightLoader:
             routed_w2_t[expert_id].copy_(expert.w2_t)
             routed_w3_t[expert_id].copy_(expert.w3_t)
         return MoERoutedPackWeights(
-            routed_w1_t=routed_w1_t.contiguous(),
-            routed_w2_t=routed_w2_t.contiguous(),
-            routed_w3_t=routed_w3_t.contiguous(),
+            routed_w1_t=HostStagingTensor(routed_w1_t.contiguous(), StagingKind.PREFILL_ROUTED, "w1_t"),
+            routed_w2_t=HostStagingTensor(routed_w2_t.contiguous(), StagingKind.PREFILL_ROUTED, "w2_t"),
+            routed_w3_t=HostStagingTensor(routed_w3_t.contiguous(), StagingKind.PREFILL_ROUTED, "w3_t"),
         )
 
     def release(self, name: str | None = None) -> None:
@@ -630,7 +626,7 @@ class DeepSeekV4WeightLoader:
         device: str | torch.device | None = None,
         cache: bool = True,
         layout: str = "linear_t",
-    ) -> torch.Tensor:
+    ) -> RuntimeWeight:
         target = torch.device(device) if device is not None else self.default_device
 
         def build() -> torch.Tensor:
@@ -667,10 +663,10 @@ class DeepSeekV4WeightLoader:
         out[: hc_base_raw.numel()] = hc_base_raw.reshape(-1)
         return out.contiguous()
 
-    def _release_layout_keys(self, keys: Iterable[tuple[_RuntimeWeightKey, str]]) -> None:
+    def _release_layout_keys(self, keys: Iterable[tuple[RuntimeWeightKey, str]]) -> None:
         for key in list(keys):
-            tensor = self._layout_cache.pop(key)
-            self._layout_cache_bytes -= tensor_nbytes(tensor)
+            weight = self._layout_cache.pop(key)
+            self._layout_cache_bytes -= tensor_nbytes(weight.host_tensor)
 
     def _get_compressor(self, prefix: str, *, device: str | torch.device | None = None) -> CompressorWeights:
         return CompressorWeights(
@@ -698,7 +694,7 @@ class DeepSeekV4WeightLoader:
         return ids
 
     def _copy_linear_t_into(self, out: torch.Tensor, name: str, *, device: torch.device) -> None:
-        tensor = self._get_transposed_weight(name, device=device, cache=False)
+        tensor = self._get_transposed_weight(name, device=device, cache=False).host_tensor
         if tuple(tensor.shape) != tuple(out.shape):
             raise ValueError(f"{name} transposed shape mismatch: expected {tuple(out.shape)}, got {tuple(tensor.shape)}")
         start = time.perf_counter()
@@ -885,12 +881,12 @@ class DeepSeekV4WeightLoader:
             return "integer_tensor"
         return "unknown"
 
-    def _insert_layout_cache(self, key: tuple[_RuntimeWeightKey, str], tensor: torch.Tensor) -> None:
+    def _insert_layout_cache(self, key: tuple[RuntimeWeightKey, str], weight: RuntimeWeight) -> None:
         if key in self._layout_cache:
             old = self._layout_cache[key]
-            self._layout_cache_bytes -= tensor_nbytes(old)
-        self._layout_cache[key] = tensor
-        self._layout_cache_bytes += tensor_nbytes(tensor)
+            self._layout_cache_bytes -= tensor_nbytes(old.host_tensor)
+        self._layout_cache[key] = weight
+        self._layout_cache_bytes += tensor_nbytes(weight.host_tensor)
 
     def reset_profile_stats(self) -> None:
         self._profile_stats.clear()

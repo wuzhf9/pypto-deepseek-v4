@@ -8,6 +8,7 @@ import torch
 
 from models.golden import TensorSpec
 from serving.state import LayerStateSchema
+from serving.runtime_types import StepContext
 
 
 BackendName = Literal["direct", "worker"]
@@ -22,6 +23,13 @@ class KernelCase:
     spec_builder: Any
 
 
+@dataclass
+class KernelBindings:
+    """Opaque backend bindings for one materialize/run dispatch pair."""
+
+    tensors: Mapping[str, Any]
+
+
 class Backend(Protocol):
     """Tensor materialization and execution contract for serving backends."""
 
@@ -33,14 +41,18 @@ class Backend(Protocol):
         self,
         specs: list[TensorSpec],
         values: Mapping[str, Any],
-    ) -> dict[str, Any]: ...
+    ) -> KernelBindings: ...
 
     def run(
         self,
         case: KernelCase,
         specs: list[TensorSpec],
-        tensors: Mapping[str, Any],
+        bindings: KernelBindings,
     ) -> dict[str, Any]: ...
+
+    def begin_step(self, context: StepContext) -> None: ...
+
+    def end_step(self) -> None: ...
 
     def read_control(self, tensor: Any) -> torch.Tensor: ...
 
@@ -62,5 +74,6 @@ class Backend(Protocol):
 __all__ = [
     "Backend",
     "BackendName",
+    "KernelBindings",
     "KernelCase",
 ]

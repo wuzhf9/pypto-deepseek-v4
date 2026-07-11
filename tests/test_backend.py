@@ -7,10 +7,18 @@ import pytest
 import torch
 
 from models.golden import TensorSpec
-from serving.backends.base import KernelCase
+from serving.backends.base import KernelBindings, KernelCase
 from serving.backends.direct_backend import DirectBackend
 from serving.backends.factory import create_backend
 from serving.profiler import ProfileRecorder
+from serving.runtime_types import (
+    HostStagingTensor,
+    RuntimeWeight,
+    RuntimeWeightKey,
+    StagingKind,
+    StepContext,
+    StepKind,
+)
 from serving.runner import DeepSeekV4Runner
 from serving.state import LayerSpec, LayerStateSchema, StateTensorSpec
 
@@ -67,13 +75,26 @@ class _DelegatingBackend:
         self.export_calls: list[Any] = []
         self.state_input_calls: list[int] = []
         self.state_output_calls: list[int] = []
+        self.begin_step_calls: list[StepContext] = []
+        self.end_step_calls = 0
+        self.run_bindings: list[KernelBindings] = []
+        self.fail_begin = False
 
-    def materialize(self, specs: list[TensorSpec], values: dict[str, Any]) -> dict[str, Any]:
+    def materialize(self, specs: list[TensorSpec], values: dict[str, Any]) -> KernelBindings:
         self.materialize_calls.append((specs, values))
-        return dict(values)
+        return KernelBindings(dict(values))
 
-    def run(self, _case: KernelCase, _specs: list[TensorSpec], _tensors: dict[str, Any]) -> dict[str, Any]:
+    def run(self, _case: KernelCase, _specs: list[TensorSpec], bindings: KernelBindings) -> dict[str, Any]:
+        self.run_bindings.append(bindings)
         return {"out": self.output}
+
+    def begin_step(self, context: StepContext) -> None:
+        if self.fail_begin:
+            raise RuntimeError("begin failed")
+        self.begin_step_calls.append(context)
+
+    def end_step(self) -> None:
+        self.end_step_calls += 1
 
     def export_output(self, tensor: Any) -> torch.Tensor:
         self.export_calls.append(tensor)
@@ -100,7 +121,8 @@ def test_direct_backend_runs_in_spec_order_and_reuses_compile_cache(monkeypatch)
         "x": torch.tensor([2.0, 4.0], dtype=torch.float32),
     }
 
-    outputs = backend.run(case, specs, tensors)
+    bindings = KernelBindings(tensors)
+    outputs = backend.run(case, specs, bindings)
 
     assert backend.last_compile_cache_hit is False
     assert len(fn.compile_calls) == 1
@@ -111,7 +133,7 @@ def test_direct_backend_runs_in_spec_order_and_reuses_compile_cache(monkeypatch)
     assert outputs == {"out": tensors["out"]}
     torch.testing.assert_close(outputs["out"], torch.tensor([3.0, 5.0]))
 
-    backend.run(case, specs, tensors)
+    backend.run(case, specs, bindings)
 
     assert backend.last_compile_cache_hit is True
     assert len(fn.compile_calls) == 1
@@ -129,9 +151,10 @@ def test_direct_backend_close_clears_compile_cache(monkeypatch) -> None:
         "out": torch.zeros(2, dtype=torch.float32),
     }
 
-    backend.run(case, specs, tensors)
+    bindings = KernelBindings(tensors)
+    backend.run(case, specs, bindings)
     backend.close()
-    backend.run(case, specs, tensors)
+    backend.run(case, specs, bindings)
 
     assert len(fn.compile_calls) == 2
     assert backend.last_compile_cache_hit is False
@@ -147,7 +170,7 @@ def test_direct_backend_materializes_host_values_and_allocates_buffers() -> None
         TensorSpec("out", [2], torch.float32, is_output=True),
     ]
 
-    tensors = backend.materialize(
+    bindings = backend.materialize(
         specs,
         {
             "x": x,
@@ -155,12 +178,52 @@ def test_direct_backend_materializes_host_values_and_allocates_buffers() -> None
         },
     )
 
+    tensors = bindings.tensors
     assert tensors["x"].is_contiguous()
     torch.testing.assert_close(tensors["x"], x)
     assert tensors["cast"].dtype == torch.float32
     torch.testing.assert_close(tensors["cast"], torch.tensor([1.0, 2.0]))
     torch.testing.assert_close(tensors["scratch"], torch.zeros(2))
     torch.testing.assert_close(tensors["out"], torch.zeros(2))
+
+
+def test_direct_backend_unwraps_fixed_and_staging_runtime_values() -> None:
+    backend = DirectBackend(platform="test", device_id=0)
+    fixed_tensor = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    staging_tensor = torch.tensor([3.0, 4.0], dtype=torch.float32)
+    fixed = RuntimeWeight(
+        RuntimeWeightKey(name="weight", dtype=torch.float32, layout="identity"),
+        fixed_tensor,
+    )
+    staging = HostStagingTensor(staging_tensor, StagingKind.DECODE_SELECTED, "w1_t")
+    specs = [
+        TensorSpec("fixed", [2], torch.float32, init_value=torch.ones(2)),
+        TensorSpec("staging", [2], torch.float32, init_value=torch.ones(2)),
+    ]
+
+    bindings = backend.materialize(specs, {"fixed": fixed, "staging": staging})
+    tensors = bindings.tensors
+
+    assert tensors["fixed"] is fixed_tensor
+    assert tensors["staging"] is staging_tensor
+
+
+def test_direct_backend_validates_step_lifecycle_and_close_cleans_active_step() -> None:
+    backend = DirectBackend(platform="test", device_id=0)
+    prefill = StepContext(kind=StepKind.PREFILL, seq_len=4, start_pos=0)
+
+    with pytest.raises(RuntimeError, match="not active"):
+        backend.end_step()
+
+    backend.begin_step(prefill)
+    with pytest.raises(RuntimeError, match="already active"):
+        backend.begin_step(StepContext(kind=StepKind.DECODE, seq_len=1, start_pos=4))
+    backend.end_step()
+
+    backend.begin_step(prefill)
+    backend.close()
+    backend.begin_step(prefill)
+    backend.end_step()
 
 
 def test_direct_backend_materialize_validates_required_values() -> None:
@@ -251,6 +314,8 @@ def test_runner_delegates_embedding_materialize_and_keeps_opaque_output() -> Non
     assert len(backend.materialize_calls) == 1
     _, values = backend.materialize_calls[0]
     assert values == {"input_ids": input_ids, "weight": weight}
+    assert len(backend.run_bindings) == 1
+    assert isinstance(backend.run_bindings[0], KernelBindings)
 
 
 def test_runner_exports_only_at_public_output_boundary(monkeypatch) -> None:
@@ -267,6 +332,64 @@ def test_runner_exports_only_at_public_output_boundary(monkeypatch) -> None:
 
     torch.testing.assert_close(output, torch.tensor([7.0]))
     assert backend.export_calls == [backend.output]
+    assert backend.begin_step_calls == [StepContext(kind=StepKind.PREFILL, seq_len=1, start_pos=0)]
+    assert backend.end_step_calls == 1
+
+
+def test_runner_wraps_decode_in_backend_step(monkeypatch) -> None:
+    runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
+    backend = _DelegatingBackend()
+    runner.backend = backend
+    runner.state_plan = SimpleNamespace(max_seq_len=8)
+    runner.profiler = ProfileRecorder(enabled=False)
+    runner.max_layers = 0
+    runner.run_head = False
+    monkeypatch.setattr(runner, "_run_embedding", lambda _input_ids: backend.output)
+
+    output = runner.decode(torch.tensor([[1]], dtype=torch.int64), start_pos=3)
+
+    torch.testing.assert_close(output, torch.tensor([7.0]))
+    assert backend.begin_step_calls == [StepContext(kind=StepKind.DECODE, seq_len=1, start_pos=3)]
+    assert backend.end_step_calls == 1
+
+
+def test_runner_ends_step_when_execution_fails(monkeypatch) -> None:
+    runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
+    backend = _DelegatingBackend()
+    runner.backend = backend
+    runner.state_plan = SimpleNamespace(max_seq_len=8)
+    runner.profiler = ProfileRecorder(enabled=False)
+    runner.max_layers = 0
+    runner.run_head = False
+
+    def fail_embedding(_input_ids: torch.Tensor) -> Any:
+        raise RuntimeError("embedding failed")
+
+    monkeypatch.setattr(runner, "_run_embedding", fail_embedding)
+
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        runner.prefill(torch.tensor([[1]], dtype=torch.int64))
+
+    assert len(backend.begin_step_calls) == 1
+    assert backend.end_step_calls == 1
+
+
+def test_runner_does_not_end_step_when_begin_fails(monkeypatch) -> None:
+    runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
+    backend = _DelegatingBackend()
+    backend.fail_begin = True
+    runner.backend = backend
+    runner.state_plan = SimpleNamespace(max_seq_len=8)
+    runner.profiler = ProfileRecorder(enabled=False)
+    runner.max_layers = 0
+    runner.run_head = False
+    monkeypatch.setattr(runner, "_run_embedding", lambda _input_ids: backend.output)
+
+    with pytest.raises(RuntimeError, match="begin failed"):
+        runner.prefill(torch.tensor([[1]], dtype=torch.int64))
+
+    assert backend.begin_step_calls == []
+    assert backend.end_step_calls == 0
 
 
 def test_runner_reads_selected_expert_indices_through_backend() -> None:
@@ -352,9 +475,31 @@ def test_factory_creates_direct_backend() -> None:
     assert backend._runtime_cfg == {"enable_l2_swimlane": True}
 
 
-def test_factory_preserves_unavailable_worker_error() -> None:
-    with pytest.raises(NotImplementedError, match="use backend='direct'"):
-        create_backend("worker", platform="a2a3", device_id=0)
+def test_factory_creates_worker_backend(monkeypatch) -> None:
+    import serving.backends.worker_backend as worker_backend
+
+    captured: dict[str, Any] = {}
+
+    class FakeWorkerBackend:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(worker_backend, "WorkerBackend", FakeWorkerBackend)
+
+    backend = create_backend(
+        "worker",
+        platform="a2a3",
+        device_id=1,
+        runtime_cfg={"enable_l2_swimlane": True},
+    )
+
+    assert isinstance(backend, FakeWorkerBackend)
+    assert captured == {
+        "platform": "a2a3",
+        "device_id": 1,
+        "runtime_cfg": {"enable_l2_swimlane": True},
+        "keep_prefill_routed_staging": False,
+    }
 
 
 def test_factory_rejects_unknown_backend() -> None:

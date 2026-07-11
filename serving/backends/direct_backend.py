@@ -7,8 +7,9 @@ from typing import Any
 import torch
 
 from models.golden import TensorSpec
-from serving.backends.base import KernelCase
+from serving.backends.base import KernelBindings, KernelCase
 from serving.backends.direct_state_store import DirectStateStore
+from serving.runtime_types import HostStagingTensor, RuntimeWeight, StepContext
 from serving.state import LayerStateSchema
 
 
@@ -28,12 +29,13 @@ class DirectBackend:
         self.last_run_seconds = 0.0
         self.last_compile_cache_hit = False
         self._state_store = DirectStateStore()
+        self._active_step: StepContext | None = None
 
     def materialize(
         self,
         specs: list[TensorSpec],
         values: Mapping[str, Any],
-    ) -> dict[str, torch.Tensor]:
+    ) -> KernelBindings:
         """Bind provided host values and allocate missing scratch/output tensors."""
         tensors: dict[str, torch.Tensor] = {}
         missing_required: list[str] = []
@@ -47,14 +49,15 @@ class DirectBackend:
                 missing_required.append(spec.name)
         if missing_required:
             raise KeyError(f"Missing backend tensors for required inputs: {missing_required}")
-        return tensors
+        return KernelBindings(tensors=tensors)
 
     def run(
         self,
         case: KernelCase,
         specs: list[TensorSpec],
-        tensors: Mapping[str, Any],
+        bindings: KernelBindings,
     ) -> dict[str, torch.Tensor]:
+        tensors = bindings.tensors
         start = time.perf_counter()
         compiled = self._compile(case, specs)
         self.last_compile_seconds = time.perf_counter() - start
@@ -63,6 +66,16 @@ class DirectBackend:
         compiled(*ordered_args, config=self._run_config())
         self.last_run_seconds = time.perf_counter() - start
         return {spec.name: tensors[spec.name] for spec in specs if spec.is_output}
+
+    def begin_step(self, context: StepContext) -> None:
+        if self._active_step is not None:
+            raise RuntimeError(f"backend step already active: {self._active_step.kind.value}")
+        self._active_step = context
+
+    def end_step(self) -> None:
+        if self._active_step is None:
+            raise RuntimeError("backend step is not active")
+        self._active_step = None
 
     def read_control(self, tensor: Any) -> torch.Tensor:
         """Return a host control tensor without copying on the direct path."""
@@ -89,11 +102,14 @@ class DirectBackend:
         self._state_store.commit(layer_id, outputs)
 
     def close(self) -> None:
+        self._active_step = None
         self._state_store.close()
         self._compiled.clear()
 
     @staticmethod
     def _coerce_tensor(spec: TensorSpec, tensor: Any) -> torch.Tensor:
+        if isinstance(tensor, (RuntimeWeight, HostStagingTensor)):
+            tensor = tensor.host_tensor
         tensor = DirectBackend._require_host_tensor(tensor)
         if tuple(tensor.shape) != tuple(spec.shape):
             raise ValueError(f"{spec.name} shape mismatch: expected {tuple(spec.shape)}, got {tuple(tensor.shape)}")

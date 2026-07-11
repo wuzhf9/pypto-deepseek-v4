@@ -17,6 +17,7 @@ from models import split_block as split_block_kernels
 from models.config import FLASH_CONFIG, DeepSeekV4FlashConfig
 from serving.backends.base import Backend, KernelCase
 from serving.profiler import ProfileRecorder, block_profile_fields
+from serving.runtime_types import StepContext, StepKind
 from serving.state import COMPRESS_RATIO4, COMPRESS_RATIO128, DEFAULT_MAX_SEQ_LEN, DeepSeekV4StatePlan, LayerSpec
 from serving.weight_loader import DeepSeekV4WeightLoader
 
@@ -63,24 +64,32 @@ class DeepSeekV4Runner:
         input_ids = self._validate_prefill_input_ids(input_ids)
         seq_len = int(input_ids.shape[1])
         with self.profiler.timer("prefill.total", seq_len=seq_len, max_layers=self.max_layers, run_head=self.run_head):
-            hidden = self._run_embedding(input_ids)
+            self.backend.begin_step(StepContext(kind=StepKind.PREFILL, seq_len=seq_len, start_pos=0))
+            try:
+                hidden = self._run_embedding(input_ids)
 
-            for layer_id in range(self.max_layers):
-                hidden = self._run_prefill_block(layer_id, hidden, input_ids=input_ids)
+                for layer_id in range(self.max_layers):
+                    hidden = self._run_prefill_block(layer_id, hidden, input_ids=input_ids)
 
-            output = self._run_head(hidden, seq_len=seq_len) if self.run_head else hidden
-            return self.backend.export_output(output)
+                output = self._run_head(hidden, seq_len=seq_len) if self.run_head else hidden
+                return self.backend.export_output(output)
+            finally:
+                self.backend.end_step()
 
     def decode(self, input_ids: torch.Tensor, *, start_pos: int) -> torch.Tensor:
         input_ids = self._validate_decode_input_ids(input_ids, start_pos=start_pos)
         with self.profiler.timer("decode.total", start_pos=start_pos, max_layers=self.max_layers, run_head=self.run_head):
-            hidden = self._run_embedding(input_ids)
+            self.backend.begin_step(StepContext(kind=StepKind.DECODE, seq_len=1, start_pos=start_pos))
+            try:
+                hidden = self._run_embedding(input_ids)
 
-            for layer_id in range(self.max_layers):
-                hidden = self._run_decode_block(layer_id, hidden, input_ids=input_ids, start_pos=start_pos)
+                for layer_id in range(self.max_layers):
+                    hidden = self._run_decode_block(layer_id, hidden, input_ids=input_ids, start_pos=start_pos)
 
-            output = self._run_head(hidden, seq_len=1) if self.run_head else hidden
-            return self.backend.export_output(output)
+                output = self._run_head(hidden, seq_len=1) if self.run_head else hidden
+                return self.backend.export_output(output)
+            finally:
+                self.backend.end_step()
 
     def close(self) -> None:
         self.backend.close()
@@ -93,7 +102,7 @@ class DeepSeekV4Runner:
             with self.profiler.timer("embedding.weight"):
                 weight = self.weight_loader.get_embedding_weight()
             with self.profiler.timer("embedding.materialize"):
-                tensors = self.backend.materialize(
+                bindings = self.backend.materialize(
                     specs,
                     {
                         "input_ids": input_ids,
@@ -104,7 +113,7 @@ class DeepSeekV4Runner:
                 outputs = self.backend.run(
                     KernelCase("embedding_test", embedding_kernel.embedding_test, embedding_kernel.build_embedding_specs),
                     specs,
-                    tensors,
+                    bindings,
                 )
             return outputs["out"]
 
@@ -114,7 +123,7 @@ class DeepSeekV4Runner:
             with self.profiler.timer("head.weight"):
                 weights = self.weight_loader.get_head_weights()
             with self.profiler.timer("head.materialize"):
-                tensors = self.backend.materialize(
+                bindings = self.backend.materialize(
                     specs,
                     {
                         "x": hidden,
@@ -129,7 +138,7 @@ class DeepSeekV4Runner:
                 outputs = self.backend.run(
                     KernelCase("head_test", head_kernel.head_test, head_kernel.build_head_specs),
                     specs,
-                    tensors,
+                    bindings,
                 )
             return outputs["logits"]
 
@@ -167,9 +176,9 @@ class DeepSeekV4Runner:
                 values = self._prefill_block_values(layer_id, hidden, input_ids=input_ids)
             self.profiler.record_weight_loader("layer.weight_loader", self.weight_loader, **profile_fields)
             with self.profiler.timer("layer.materialize", **profile_fields):
-                tensors = self.backend.materialize(specs, values)
+                bindings = self.backend.materialize(specs, values)
             with self.profiler.backend_timer("layer.kernel", self.backend, **profile_fields):
-                outputs = self.backend.run(case, specs, tensors)
+                outputs = self.backend.run(case, specs, bindings)
             with self.profiler.timer("layer.state_update", **profile_fields):
                 self.backend.commit_state(layer_id, outputs)
             out = outputs["out"]
@@ -229,9 +238,9 @@ class DeepSeekV4Runner:
                 )
             self.profiler.record_weight_loader("layer.selected_decode.pre_weight_loader", self.weight_loader, **profile_fields)
             with self.profiler.timer("layer.selected_decode.pre_materialize", **profile_fields):
-                pre_tensors = self.backend.materialize(pre_specs, pre_values)
+                pre_bindings = self.backend.materialize(pre_specs, pre_values)
             with self.profiler.backend_timer("layer.selected_decode.pre_kernel", self.backend, **profile_fields):
-                pre_outputs = self.backend.run(pre_case, pre_specs, pre_tensors)
+                pre_outputs = self.backend.run(pre_case, pre_specs, pre_bindings)
             with self.profiler.timer("layer.selected_decode.state_update", **profile_fields):
                 self.backend.commit_state(layer_id, pre_outputs)
 
@@ -241,9 +250,9 @@ class DeepSeekV4Runner:
                 post_values = self._decode_post_moe_values(layer_id, pre_outputs)
             self.profiler.record_weight_loader("layer.selected_decode.post_weight_loader", self.weight_loader, **post_profile_fields)
             with self.profiler.timer("layer.selected_decode.post_materialize", **post_profile_fields):
-                post_tensors = self.backend.materialize(post_specs, post_values)
+                post_bindings = self.backend.materialize(post_specs, post_values)
             with self.profiler.backend_timer("layer.selected_decode.post_kernel", self.backend, **post_profile_fields):
-                post_outputs = self.backend.run(post_case, post_specs, post_tensors)
+                post_outputs = self.backend.run(post_case, post_specs, post_bindings)
 
             out = post_outputs["out"]
             if self.verbose_layer_log:

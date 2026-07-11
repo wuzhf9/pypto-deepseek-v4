@@ -219,6 +219,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     parser.add_argument("--max-layers", type=int, default=FLASH_CONFIG.n_layers)
     parser.add_argument("--backend", choices=["direct", "worker"], default="direct")
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--keep-prefill-routed-staging", action="store_true", default=False)
     parser.add_argument("-p", "--platform", type=str, default="a2a3")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=33377335)
@@ -296,6 +298,8 @@ def _create_runner(args: argparse.Namespace) -> Any:
         args.backend,
         platform=args.platform,
         device_id=args.device,
+        runtime_cfg={"enable_l2_swimlane": getattr(args, "enable_l2_swimlane", False)},
+        keep_prefill_routed_staging=getattr(args, "keep_prefill_routed_staging", False),
     )
     try:
         return DeepSeekV4Runner(

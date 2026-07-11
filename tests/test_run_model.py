@@ -18,8 +18,8 @@ def test_run_model_creates_backend_outside_runner_and_injects_it(monkeypatch) ->
     backend = _FakeBackend()
     captured = {}
 
-    def fake_create_backend(name, *, platform, device_id):
-        captured["factory"] = (name, platform, device_id)
+    def fake_create_backend(name, *, platform, device_id, runtime_cfg, keep_prefill_routed_staging):
+        captured["factory"] = (name, platform, device_id, runtime_cfg, keep_prefill_routed_staging)
         return backend
 
     class FakeRunner:
@@ -49,11 +49,12 @@ def test_run_model_creates_backend_outside_runner_and_injects_it(monkeypatch) ->
             "--max-layers",
             "0",
             "--no-head",
+            "--enable-l2-swimlane",
         ]
     )
 
     assert result == 0
-    assert captured["factory"] == ("direct", "a2a3", 2)
+    assert captured["factory"] == ("direct", "a2a3", 2, {"enable_l2_swimlane": True}, False)
     assert captured["runner_args"] == ("checkpoint",)
     assert captured["runner_kwargs"]["backend"] is backend
     assert "platform" not in captured["runner_kwargs"]
