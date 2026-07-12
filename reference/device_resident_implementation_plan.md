@@ -1,5 +1,8 @@
 # WorkerBackend 与 Device-resident 最新实现方案
 
+> 状态：device-resident WorkerBackend 已完成并成为唯一生产 backend；`DirectBackend` 与
+> `DirectStateStore` 已删除。下文 Direct 对比和早期阶段描述仅作为历史实施/验收记录。
+
 ## 1. 结论
 
 当前代码已经完成 WorkerBackend 的架构前置工作：
@@ -7,7 +10,7 @@
 - `DeepSeekV4Runner` 只接收注入的 `Backend`，不 import 或判断具体 backend。
 - `Backend` 已覆盖 materialize、dispatch、Host 控制数据读取、最终输出导出和 state 生命周期。
 - `DeepSeekV4StatePlan` 只提供 immutable aux 与 mutable state schema。
-- `DirectStateStore` 已用 current/next 双缓冲验证 state binding 与 commit 语义。
+- current/next 双缓冲语义已由历史 Direct 基线验证，并由 `WorkerStateStore` 承担生产实现。
 - Embedding kernel 已直接输出 `[B, S, HC_MULT, HIDDEN]`，Runner 不再做 Host expand。
 - 普通 non-routed runtime layout 已固定保存在 WeightLoader Host cache 中。
 
@@ -23,7 +26,7 @@
 
 ## 2. 当前实测基线
 
-最新 DirectBackend profile 使用：
+以下是删除前采集的 DirectBackend 历史 profile：
 
 ```text
 seq_len=1
@@ -49,6 +52,17 @@ Device resident 不会消除 selected expert Host load/build 和 selected pack H
 收益为 10%–20%，乐观上限约 25%。第一版验收应以实测 H2D/D2H bytes 和 warm token latency 为准，
 不能只用理论带宽判断。
 
+首次完整 43 层、带 head、S=1 的 Direct/Worker 同设备 A/B 已完成。每个 backend 在同一 session 内执行
+prefill + 4 次 decode，step 1 用于 selected kernel 编译预热，统计 step 2–4；未开启 swimlane：
+
+| Backend | Warm mean | Median | Min–max |
+|---|---:|---:|---:|
+| Direct | 14,435.375 ms | 14,623.783 ms | 13,927.772–14,754.570 ms |
+| Worker | 4,307.312 ms | 4,338.471 ms | 4,087.032–4,496.434 ms |
+
+Worker 相对 Direct 加速 3.3514 倍，warm decode 延迟降低 70.161%。这是单次三样本 A/B，足以验证收益
+方向，但“稳定收益”仍应通过反向运行顺序或多轮独立 session 复测。
+
 ## 3. 当前代码边界
 
 ### 3.1 已完成
@@ -57,14 +71,8 @@ Device resident 不会消除 selected expert Host load/build 和 selected pack H
 serving/backends/base.py
     Backend protocol + KernelCase + KernelBindings + step lifecycle
 
-serving/backends/direct_backend.py
-    Host materialize + direct dispatch + output boundary
-
-serving/backends/direct_state_store.py
-    Host current/next state pairs
-
 serving/backends/factory.py
-    concrete backend composition root；direct/worker 均可构造
+    concrete backend composition root；只构造 WorkerBackend
 
 serving/backends/worker_backend.py
     Worker 多层 prefill/decode/head + fixed/upload/output/staging device 生命周期
@@ -85,7 +93,7 @@ serving/run_model.py / serving/generate.py
 ### 3.2 WorkerBackend 的下一实现阻塞
 
 公共 runtime value contract 已完成：固定 layout 返回 `RuntimeWeight`，full routed/selected pack 返回
-`HostStagingTensor`，DirectBackend 会在 materialize 时无损解包。因此 Worker 已可区分：
+`HostStagingTensor`；历史 Direct 实现曾在 materialize 时无损解包这些类型，当前 Worker 可区分：
 
 - 固定 non-routed 权重；
 - input IDs 与 immutable aux；
@@ -95,9 +103,9 @@ serving/run_model.py / serving/generate.py
 
 WorkerBackend 的多层 prefill、selected decode 和 head 已经完成：24-byte indices D2H、selected expert
 staging、pre-MoE→post-MoE intermediate residency、跨层 hidden 消费和连续 state swap 均已打通；
-ratio 0/4/128、hash/top-k 以及 CSA/HCA/SWA 路径已在远端覆盖。下一阻塞是完整 43 层、长 prompt、显存
-峰值及 Direct/Worker warm decode 性能 A/B 验证。完整 43 层的短序列和 S=13 已通过；S=4096 当前先被
-既有 embedding/block kernel 的 runtime work-count 边界阻塞，尚未进入 device-resident 显存峰值阶段。
+ratio 0/4/128、hash/top-k 以及 CSA/HCA/SWA 路径已在远端覆盖。完整 43 层的短序列、S=13 和 S=1024
+已通过，warm decode A/B 也已完成。embedding 的 32768-task 边界已经修复；一次 43 层 S=1024
+运行曾偶发 507018，但相同命令复测通过，未形成稳定的后续 layer 阻塞。下一项是重跑 S=4096 device peak。
 
 ## 4. 目标依赖关系
 
@@ -108,7 +116,6 @@ run_model.py / generate.py
 DeepSeekV4Runner ────────────────┐
         │ Backend protocol       │ WeightLoader / StatePlan
         ▼                        │
-DirectBackend                    │
 WorkerBackend                    │
   ├── ChipWorker                 │
   ├── DeviceBufferPool           │
@@ -146,14 +153,13 @@ worker_backend.py → runner.py
 |---|---|
 | `serving/weight_loader.py` | 固定 getter 返回 `RuntimeWeight`；routed pack 返回 `HostStagingTensor` |
 | `serving/backends/base.py` | 增加 step lifecycle 和显式 `KernelBindings` |
-| `serving/backends/direct_backend.py` | unwrap 新 value 类型；实现 step no-op；适配 `KernelBindings` |
 | `serving/backends/factory.py` | `worker` 分支创建 `WorkerBackend` |
 | `serving/runner.py` | 只增加 backend-neutral `begin_step/end_step`，不增加 worker 分支 |
 | `serving/profiler.py` | 输出 H2D/D2H、resident bytes、pool peak、cache hit/miss |
 | `serving/run_model.py` | 透传 Worker runtime 配置与 `--enable-l2-swimlane` |
 | `serving/generate.py` | 同步 Worker runtime 配置 |
 | `tests/test_weight_loader.py` | fixed/staging 类型、key、Host cache identity 测试 |
-| `tests/test_backend.py` | Direct contract 与新 KernelBindings/step contract 回归 |
+| `tests/test_backend.py` | Backend/Runner contract 与 KernelBindings/step contract 回归 |
 | `tests/test_generate.py` | Worker 参数到 factory 的透传测试 |
 | `tests/test_run_model.py` | Worker CLI composition 测试 |
 
@@ -658,21 +664,37 @@ decode、H2D/D2H bytes 和 device peak。
 - 43 层 no-head、S=13 的 prefill + `start_pos=13` decode 通过，输出 BF16、finite，任务 exit=0；
 - 以上任务 close 后均正常释放设备锁，未出现 device allocation/OOM 错误。
 
-长序列阻塞：43 层 S=4096 在 embedding 阶段报
-`aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507018`，尚未进入 block 或显存峰值。最小化验证显示：
+长序列进展：原 embedding 使用 `pl.spmd(tokens * H_BLOCKS)`，S=1024 时正好产生 32768 个 work item
+并报 `507018`。现已改为 16-token block × hidden-block SPMD，最大 S=4096 的 work count 降至 8192：
 
-- Worker 与 Direct 的 embedding-only S=4096 均复现相同错误，排除 Worker device-resident 专属问题；
-- embedding-only S=1008 通过、S=1024 失败；当前 embedding 使用
-  `pl.spmd(tokens * H_BLOCKS)`，两者分别为 32256/32768 个 work item，阈值与 32768 精确重合；
-- 单层 S=1008 的 embedding 通过，但首个 SWA block 同样报 507018，说明 block 也需要长序列任务切分；
-- 因此前不能用该失败推断 64 GB 显存不足。需先重构 embedding 和 block 的长序列 work partition，再重跑
-  S=4096 device peak。
+- standalone embedding S=1024、非 16 对齐 S=1025 和 S=4096 均通过逐元素 golden 校验；
+- Worker runner 的 embedding-only S=4096，以及单层和 5 层 S=1024 prefill 均通过，后者覆盖全部四种
+  layer variant；
+- 完整 43 层 S=1024 首轮在前 5 层之后偶发 507018；相同命令、相同配置复测完成全部 43 层，输出
+  `(1, 1024, 4, 4096)`、BF16、finite，任务 exit=0 并正常释放设备；
+- 因此该次错误暂归类为偶发 runtime/device failure，而不是已确认的后续 layer work-count 边界。下一步
+  可直接重跑 S=4096 device peak；如再次遇到 507018，再通过逐层日志和多轮复测定位。
 
-性能 A/B、H2D/D2H bytes 和实际 device peak 尚未采集。
+首次性能 A/B 与 Worker pool 指标：
 
-### Step 10：默认切换与 Direct 删除
+- warm decode step 2–4：Direct 平均 14,435.375 ms，Worker 平均 4,307.312 ms；Worker 加速
+  3.3514 倍，延迟降低 70.161%；
+- Worker 每个 warm decode H2D 约 13,074,800,600 bytes（约 12.177 GiB），来自 selected routed
+  expert staging；固定权重 warm H2D 为零；
+- Worker 每个 decode D2H 为 518,152 bytes：43 层 indices 共 1,032 bytes，加最终 FP32 logits
+  517,120 bytes；
+- Worker pool peak 为 28,732,998,944 bytes（约 26.76 GiB），current 为 16,151,471,564 bytes；
+  其中 fixed weight 为 15,753,487,500 bytes，低于 30 GiB 静态峰值目标和 64 GB 设备容量；
+- DirectBackend 没有 DeviceBufferPool copy counter，因此 A/B 日志中的 Direct H2D/D2H 零值不代表
+  runtime 没有隐式传输。
 
-Worker 满足完成标准后才改默认值。观察稳定后删除 DirectBackend；Runner 无需修改。
+该轮为单次三 warm-step 样本，未开启 swimlane；如需把“稳定收益”作为删除 Direct 的硬门槛，应在删除
+前再做至少一轮反向顺序或独立 session 复测。
+
+### Step 10：默认切换与 Direct 删除（已完成）
+
+CLI 默认值和唯一 choice 已切换为 `worker`，factory 的 Direct 分支及两个 Direct 实现文件已经删除，
+Direct-only 测试也已移除。`--backend worker` 作为显式兼容入口继续保留；Runner 无需修改。
 
 ## 17. 测试矩阵
 
@@ -680,7 +702,7 @@ Worker 满足完成标准后才改默认值。观察稳定后删除 DirectBacken
 
 - RuntimeWeight key/layout/version/padding 隔离。
 - Routed getter 永不返回 RuntimeWeight。
-- Direct unwrap 后输出与当前完全一致。
+- 历史 Direct/Worker 对齐结果继续作为数值基线。
 - FakeChipWorker 混合 Host/Device 参数顺序。
 - Pool persistent/reusable/staging 分类。
 - State failure 不 swap。
@@ -701,7 +723,8 @@ S=13 dynamic shape
 S=4096 memory peak
 ```
 
-所有用例同时比较 Direct/Worker shape、dtype、finite 和数值容忍。
+删除前的对齐用例比较 Direct/Worker shape、dtype、finite 和数值容忍；删除后的远端 smoke 直接验证
+默认 Worker 输出和资源关闭。
 
 ## 18. 风险与约束
 
@@ -721,5 +744,5 @@ S=4096 memory peak
 - 每层只发生 24-byte indices D2H，以及最终 API output D2H。
 - Prefill device peak 不超过 30 GiB 静态目标，完整 runtime 不超过 64 GB。
 - Worker close 后 owned allocation 为零。
-- 完整 43 层数值与 Direct 一致。
+- 删除前完整 43 层数值已与 Direct 对齐；删除后默认 Worker smoke 继续通过。
 - Warm decode 端到端收益稳定，目标区间 10%–20%。

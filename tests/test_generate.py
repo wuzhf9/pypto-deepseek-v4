@@ -99,13 +99,18 @@ def test_parse_args_requires_a_prompt_source_and_prefers_literal_prompt(tmp_path
 
     literal_args = generate.parse_args(["--prompt", "literal"])
     file_args = generate.parse_args(["--prompt-file", str(prompt_file)])
+    worker_args = generate.parse_args(["--prompt", "literal", "--backend", "worker"])
 
     assert literal_args.prompt == "literal"
     assert literal_args.prompt_file is None
+    assert literal_args.backend == "worker"
     assert file_args.prompt is None
     assert file_args.prompt_file == prompt_file
+    assert worker_args.backend == "worker"
     with pytest.raises(SystemExit):
         generate.parse_args([])
+    with pytest.raises(SystemExit):
+        generate.parse_args(["--prompt", "literal", "--backend", "direct"])
     both_args = generate.parse_args(["--prompt", "literal", "--prompt-file", str(prompt_file)])
     assert both_args.prompt == "literal"
     assert both_args.prompt_file == prompt_file
@@ -256,7 +261,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         temperature=0.0,
         max_seq_len=16,
         max_layers=43,
-        backend="direct",
+        backend="worker",
         platform="a2a3",
         device=0,
         seed=1,
@@ -273,7 +278,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
     assert captured["tokenizer_path"] == checkpoint
     assert captured["runner_args"] == (str(checkpoint),)
     assert captured["backend_factory"] == (
-        "direct",
+        "worker",
         "a2a3",
         0,
         {"enable_l2_swimlane": False},
@@ -314,7 +319,7 @@ def test_create_runner_closes_backend_when_runner_initialization_fails(monkeypat
         expert_cache_dir=None,
         max_seq_len=16,
         max_layers=1,
-        backend="direct",
+        backend="worker",
         platform="a2a3",
         device=0,
         profile=False,

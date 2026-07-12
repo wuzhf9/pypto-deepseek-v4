@@ -18,7 +18,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-s", "--seq-len", type=int, default=1)
     parser.add_argument("--max-layers", type=int, default=1)
-    parser.add_argument("--backend", choices=["direct", "worker"], default="direct")
+    parser.add_argument("--backend", choices=["worker"], default="worker")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--keep-prefill-routed-staging", action="store_true", default=False)
     parser.add_argument("--no-head", action="store_true", default=False)

@@ -232,7 +232,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     parser.add_argument("--max-layers", type=int, default=FLASH_CONFIG.n_layers)
-    parser.add_argument("--backend", choices=["direct", "worker"], default="direct")
+    parser.add_argument("--backend", choices=["worker"], default="worker")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--keep-prefill-routed-staging", action="store_true", default=False)
     parser.add_argument("-p", "--platform", type=str, default="a2a3")

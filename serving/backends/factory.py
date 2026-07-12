@@ -3,7 +3,6 @@
 from typing import Any
 
 from serving.backends.base import Backend, BackendName
-from serving.backends.direct_backend import DirectBackend
 
 
 def create_backend(
@@ -15,8 +14,6 @@ def create_backend(
     keep_prefill_routed_staging: bool = False,
 ) -> Backend:
     """Create a serving backend from its CLI-facing name."""
-    if name == "direct":
-        return DirectBackend(platform=platform, device_id=device_id, runtime_cfg=runtime_cfg)
     if name == "worker":
         from serving.backends.worker_backend import WorkerBackend
 

@@ -11,7 +11,7 @@ from serving.state import LayerStateSchema
 from serving.runtime_types import StepContext
 
 
-BackendName = Literal["direct", "worker"]
+BackendName = Literal["worker"]
 
 
 @dataclass(frozen=True)

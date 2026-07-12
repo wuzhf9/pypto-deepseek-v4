@@ -200,6 +200,21 @@ def test_materialize_reuses_same_raw_host_tensor_within_step() -> None:
     backend.end_step()
 
 
+def test_materialize_validates_required_host_values() -> None:
+    backend, _, _ = _backend()
+    required = TensorSpec("required", [2], torch.float32, init_value=torch.ones(2))
+    backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+    try:
+        with pytest.raises(KeyError, match="Missing backend tensors.*required"):
+            backend.materialize([required], {})
+        with pytest.raises(ValueError, match="required shape mismatch"):
+            backend.materialize([required], {"required": torch.zeros(3)})
+        with pytest.raises(TypeError, match="Host tensor or DeviceTensor-compatible"):
+            backend.materialize([required], {"required": object()})
+    finally:
+        backend.end_step()
+
+
 def test_prefill_staging_reuses_within_step_and_frees_at_step_end() -> None:
     backend, worker, _ = _backend()
     spec = TensorSpec("weight", [2], torch.float32, init_value=torch.zeros(2))

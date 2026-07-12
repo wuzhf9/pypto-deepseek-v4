@@ -1,5 +1,8 @@
 # Runtime-layout Host Cache 与 Device-resident Backend 设计
 
+> 历史设计文档：当前已完成 host layout cache 和 device-resident WorkerBackend，DirectBackend 已删除。
+> 下文 `_DirectBackend` 代码边界仅表示方案形成时的历史基线。
+
 ## 1. 目标与结论
 
 `runtime-layout host cache` 和 `device-resident backend` 在功能上可以独立实现、独立开关和独立

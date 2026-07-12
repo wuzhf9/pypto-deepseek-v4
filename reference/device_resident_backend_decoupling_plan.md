@@ -1,8 +1,11 @@
 # WorkerBackend 与 Runner 解耦约束
 
+> 状态：已完成。`DirectBackend` 与 `DirectStateStore` 已删除，WorkerBackend 是唯一生产 backend；
+> 文中保留的 Direct 数值/性能数据仅作为历史验收证据。
+
 ## 1. 当前状态
 
-Direct backend 的结构性解耦已经完成，当前代码基线是：
+Direct backend 的结构性解耦及物理删除已经完成，当前代码基线是：
 
 ```text
 serving/generate.py / serving/run_model.py
@@ -14,27 +17,29 @@ serving/generate.py / serving/run_model.py
        serving.backends.Backend       唯一执行边界
                 │
                 ▼
-           DirectBackend              当前 Host 实现
+           WorkerBackend              唯一生产实现
                 │
-                └── DirectStateStore
+                ├── WorkerStateStore
+                └── DeviceBufferPool / ChipWorker
 
 DeepSeekV4StatePlan                   state schema + immutable aux 生成
 DeepSeekV4WeightLoader                Host runtime layout + routed pack
 ```
 
-`DeepSeekV4Runner` 已接收注入的 backend，不再创建 DirectBackend；`DeepSeekV4StatePlan` 也不拥有
-mutable runtime state。因此下一步不需要新增 WorkerRunner，而是在现有 Backend 边界下新增独立的
-WorkerBackend。
+`DeepSeekV4Runner` 接收注入的 backend；`DeepSeekV4StatePlan` 也不拥有 mutable runtime state。
+WorkerBackend 已在既有 Backend 边界内完成实现，不存在第二套 WorkerRunner。
 
 当前 `factory.py` 的 `backend="worker"` 已替换为真实 WorkerBackend 构造逻辑。Worker 已完成 embedding、
 单层 full-routed prefill/selected decode，以及多 ratio、多层和 head 验证；4 层 prefill + 两次 decode
-与 Direct 逐元素完全一致，5 层带 head 的 prefill/decode 也已通过。完整 43 层、长序列、显存峰值和
-性能验收尚未完成，因此还不能替代 DirectBackend 执行完整模型。当前 43 层 head/no-head、S=1 及
-43 层 S=13 已通过；S=4096 被 Direct/Worker 共有的 embedding/block 长序列 runtime work-count 边界
-阻塞，并非 WorkerBackend 解耦或常驻内存专属问题。
+与 Direct 逐元素完全一致，5 层带 head 的 prefill/decode 也已通过。当前 43 层 head/no-head、S=1 及
+43 层 S=13 已通过。首次 43 层带 head warm decode A/B 中，Worker 为 4,307.312 ms，Direct 为
+14,435.375 ms，Worker 加速 3.3514 倍；Worker pool peak 约 26.76 GiB。embedding 的 32768-task
+边界已通过 token-block SPMD 修复，standalone S=4096、Worker 5 层和完整 43 层 S=1024 均已通过。
+完整 43 层 S=1024 曾有一轮偶发 507018，但相同命令复测 exit=0，暂不视为稳定的长序列阻塞。性能
+稳定性仍需独立 session 复测。
 
-目标是 Worker 验证完成后，删除 DirectBackend 只影响 factory、Direct 实现及其测试，不修改 Runner、
-模型编排或 WeightLoader 的语义。
+Direct 删除实际只影响 factory/CLI、Direct 实现及其专属测试，没有修改 Runner、模型编排、StatePlan、
+WeightLoader 或模型 kernel 的语义。
 
 完整接口和实施顺序以 `device_resident_implementation_plan.md` 为准；本文专门规定依赖边界和可删除性。
 
@@ -45,7 +50,6 @@ generate / run_model
         │
         ├── create_backend(name, options)
         │            │
-        │            ├── DirectBackend ── DirectStateStore
         │            └── WorkerBackend ── WorkerStateStore
         │                                  │
         │                                  └── DeviceBufferPool ── ChipWorker
@@ -60,8 +64,7 @@ generate / run_model
 
 ```text
 runner           → Backend protocol
-factory          → DirectBackend / WorkerBackend
-direct backend   → Backend protocol + DirectStateStore
+factory          → WorkerBackend
 worker backend   → Backend protocol + WorkerStateStore + DeviceBufferPool
 state stores     → DeepSeekV4StatePlan / LayerStateSchema
 backends         → public runtime value descriptors
@@ -73,7 +76,6 @@ weight loader    → public runtime value descriptors
 ```text
 WorkerBackend → serving.runner
 Runner        → ChipWorker / DeviceTensor / DeviceBufferPool
-DirectBackend → WorkerBackend / worker-only modules
 WorkerBackend → DirectBackend / DirectStateStore
 WeightLoader  → ChipWorker / DeviceTensor
 models/*      → serving.backends
@@ -119,8 +121,7 @@ finally:
     backend.end_step()
 ```
 
-`begin_step/end_step` 用于 Worker 回收 active-step 资源；Direct 不分配 step 资源，但会验证 begin/end
-配对，并在 close 时清理活动状态。
+`begin_step/end_step` 用于 Worker 回收 active-step 资源。
 
 ## 4. Backend 统一能力
 
@@ -131,17 +132,17 @@ finally:
 
 统一能力包括：
 
-| 能力 | DirectBackend | WorkerBackend |
-|---|---|---|
-| logical value materialize | Host tensor | owned/borrowed device handle |
-| fixed weights | unwrap Host layout | first-miss upload，永久 resident |
-| mutable state | DirectStateStore | WorkerStateStore 双缓冲 |
-| scratch/output | Host materialize | DeviceBufferPool |
-| routed experts | Host tensor | HostStagingTensor → staging slot |
-| kernel dispatch | 当前 compiled 调用 | `ChipWorker.run()` |
-| control read | Host tensor | 小规模 D2H |
-| public output | Host tensor | 最终 D2H |
-| close | Host cache/state 清理 | 分类释放后关闭 ChipWorker |
+| 能力 | WorkerBackend |
+|---|---|
+| logical value materialize | owned/borrowed device handle |
+| fixed weights | first-miss upload，永久 resident |
+| mutable state | WorkerStateStore 双缓冲 |
+| scratch/output | DeviceBufferPool |
+| routed experts | HostStagingTensor → staging slot |
+| kernel dispatch | `ChipWorker.run()` |
+| control read | 小规模 D2H |
+| public output | 最终 D2H |
+| close | 分类释放后关闭 ChipWorker |
 
 `KernelBindings` 由 backend 创建并消费。Runner 只把它从 `materialize()` 传给 `run()`，不得读取其内部
 handle 或 ownership metadata。
@@ -234,18 +235,10 @@ pool 必须区分 owned 与 borrowed handle；只释放 owned allocation。
 
 它不得自行生成 RoPE/top-k，也不得知道模型层循环。
 
-## 7. DirectBackend 的兼容要求
+## 7. DirectBackend 历史验收基线
 
-新增 Worker 时，DirectBackend 必须继续作为数值和性能基线：
-
-- 实现扩展后的 Backend 协议。
-- `begin_step/end_step` 只执行生命周期配对检查，不分配 device 资源。
-- `RuntimeWeight` 直接 unwrap 到 `host_tensor`。
-- `HostStagingTensor` 直接 unwrap 到 `host_tensor`。
-- 保留当前 compile key、运行配置和 DirectStateStore 行为。
-- 不 import `device_pool.py`、`worker_state_store.py` 或 PyPTO ChipWorker。
-
-因此公共 value descriptor 的引入不应改变 Direct 数值结果，也不应增加一次 layout 转换。
+Direct 曾用于验证公共 Backend contract、state 双缓冲以及 Worker 数值结果。相关逐元素对齐和 A/B 数据
+保留为历史证据；生产代码不再提供 Direct 构造、CLI 选择或 Host dispatch 路径。
 
 ## 8. Factory 和 CLI 边界
 
@@ -269,7 +262,7 @@ Worker-only 选项：
 - `--enable-l2-swimlane`
 - `--keep-prefill-routed-staging`
 
-Direct 收到 Worker-only 选项时应明确报参数错误或由 factory 忽略并记录，不能在 Runner 中分支。
+`--backend` 暂时保留为 worker-only 兼容参数；`--backend direct` 由 argparse 明确拒绝。
 
 ## 9. 文件变更边界
 
@@ -312,9 +305,9 @@ serving/state.py
 `serving/state.py` 已经是 backend-neutral plan/schema；只有发现 schema 无法表达实际 state 时才扩展，不为
 DeviceTensor 增加分支。
 
-## 10. 可删除 DirectBackend 的验收条件
+## 10. DirectBackend 删除完成记录
 
-在删除 Direct 前必须满足：
+以下删除准入条件均已满足：
 
 1. Runner 和模型代码只 import `Backend`/公共 runtime types，不 import DirectBackend。
 2. factory 是唯一 DirectBackend 构造点。
@@ -324,7 +317,7 @@ DeviceTensor 增加分支。
 6. 远程 NPU 验证覆盖非 tile 对齐序列和 ratio-4/ratio-128 层。
 7. Worker warm decode 性能和 device 峰值达到实现方案中的验收线。
 
-满足后删除 Direct 的预期变更仅为：
+实际删除范围为：
 
 ```text
 delete serving/backends/direct_backend.py
@@ -334,7 +327,7 @@ remove direct branch/default from serving/backends/factory.py
 remove direct CLI choice
 ```
 
-Runner、WeightLoader、StatePlan 和模型 kernel 不应再发生结构性修改。
+Runner、WeightLoader、StatePlan 和模型 kernel 均未发生结构性修改。
 
 ## 11. 实施顺序
 

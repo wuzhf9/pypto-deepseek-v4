@@ -40,8 +40,6 @@ def test_run_model_creates_backend_outside_runner_and_injects_it(monkeypatch) ->
         [
             "--checkpoint",
             "checkpoint",
-            "--backend",
-            "direct",
             "--platform",
             "a2a3",
             "--device",
@@ -54,7 +52,7 @@ def test_run_model_creates_backend_outside_runner_and_injects_it(monkeypatch) ->
     )
 
     assert result == 0
-    assert captured["factory"] == ("direct", "a2a3", 2, {"enable_l2_swimlane": True}, False)
+    assert captured["factory"] == ("worker", "a2a3", 2, {"enable_l2_swimlane": True}, False)
     assert captured["runner_args"] == ("checkpoint",)
     assert captured["runner_kwargs"]["backend"] is backend
     assert "platform" not in captured["runner_kwargs"]
@@ -76,3 +74,8 @@ def test_run_model_closes_backend_when_runner_initialization_fails(monkeypatch) 
         run_model.main(["--checkpoint", "checkpoint"])
 
     assert backend.close_calls == 1
+
+
+def test_run_model_rejects_removed_direct_backend() -> None:
+    with pytest.raises(SystemExit):
+        run_model.parse_args(["--backend", "direct"])

@@ -1,5 +1,8 @@
 # Performance Optimization Plan
 
+> 历史性能分析基线：文中 `_DirectBackend` 描述对应优化前代码。当前已实现 host layout cache 和
+> device-resident WorkerBackend，DirectBackend 已删除。
+
 本文只基于当前 `models/`、`serving/` 和测试代码进行静态分析，不依赖仓库内其他设计文档的结论。
 流量数字根据当前 `TensorSpec`、tensor shape 和 dtype 直接估算；具体收益仍需在 Ascend NPU
 上通过同步后的 runtime profile 验证。

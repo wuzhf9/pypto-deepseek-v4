@@ -1,5 +1,8 @@
 # DeepSeek V4 Flash Runner Implementation Plan
 
+> 历史实施文档：当前 Runner 已与具体 backend 解耦，WorkerBackend 是唯一生产 backend，DirectBackend
+> 已删除。下文 direct 相关接口和判断只表示早期方案，不代表当前代码。
+
 本文记录 `serving/runner.py` 的实现方案。runner 是 host 侧调度层，不新增模型计算逻辑，
 也不放在 `models/` 目录下。目标是在单卡 Ascend NPU 上按层加载权重、调用已经实现的
 PyPTO kernel、维护 state，并最终完成 `input_ids -> logits` 的整网推理。
@@ -39,20 +42,17 @@ PyPTO 入口；`serving/weight_loader.py` 负责权重读取和布局转换；`s
 直接实现 `DeepSeekV4Runner`。runner 内部可以保留 debug/backend 选项，但不先实现独立的
 `SmokeRunner`，避免 block kernel 选择、参数组装、输出映射和 state 更新逻辑出现两套实现。
 
-当前主路径使用 direct backend。worker-resident backend 曾用于验证 state/cache 和 hidden
-常驻 NPU 的可行性，但 profile 显示主要瓶颈仍在 block kernel runtime，worker 路径的收益
-不足以作为后续主线：
+当前主路径使用 device-resident WorkerBackend；Runner 只依赖公共 `Backend` protocol：
 
 ```text
 DeepSeekV4Runner
   - 负责整网 prefill/decode 流程
   - 负责权重加载、state 管理、kernel dispatch
-  - 使用 direct backend 做 smoke/debug 和完整推理
+  - 使用注入的 WorkerBackend 做完整推理
 ```
 
-direct backend 对齐 `models/golden.py::run_jit` 的直接 `compiled(*args, config=...)`
-调用方式，已经验证能够跑通完整推理。后续优化优先转向 PyPTO kernel 内部计算路径，而不是
-继续扩展 `--backend worker`。
+Direct backend 曾用于对齐 `models/golden.py::run_jit`，现已在 Worker 精度、完整模型和性能验证通过后
+删除。
 
 ## 对外接口
 

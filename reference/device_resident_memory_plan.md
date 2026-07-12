@@ -124,8 +124,8 @@ handle，异常时不 commit。
 = 0.088 GiB
 ```
 
-`DeepSeekV4StatePlan` 只描述 shape/dtype 和生成 Host aux，不拥有可变 runtime state；实际 state 生命周期
-分别由 `DirectStateStore` 和 `WorkerStateStore` 管理。
+`DeepSeekV4StatePlan` 只描述 shape/dtype 和生成 Host aux，不拥有可变 runtime state；实际生产 state
+生命周期只由 `WorkerStateStore` 管理。`DirectStateStore` 已随 Direct backend 删除。
 
 ## 5. Prefill 峰值
 
@@ -222,7 +222,7 @@ checkpoint
   → fixed DeviceTensor cache
 ```
 
-Host layout 保留到 `WeightLoader.close()`，既服务 DirectBackend，也作为 device 恢复来源。
+Host layout 保留到 `WeightLoader.close()`，作为 Worker fixed weight 首次上传及 device 恢复来源。
 
 ### 8.2 Routed experts
 
@@ -264,7 +264,7 @@ expert 权重，因此第一版每层允许一次小 D2H；weights、ffn interme
 
 ## 10. 性能基线和收益口径
 
-当前 DirectBackend 的最近一次 5 层、`seq_len=1`、无 head、3 decode step profile：
+以下为 DirectBackend 删除前采集的 5 层、`seq_len=1`、无 head、3 decode step 历史 profile：
 
 ```text
 warm decode average             1678 ms / 5 layers
