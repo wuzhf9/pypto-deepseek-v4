@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from official import encoding_dsv4
-from serving import generate
+import generate
 
 
 class FakeTokenizer:
@@ -106,23 +106,57 @@ def test_parse_args_requires_a_prompt_source_and_prefers_literal_prompt(tmp_path
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text("from file", encoding="utf-8")
 
-    literal_args = generate.parse_args(["--prompt", "literal"])
-    file_args = generate.parse_args(["--prompt-file", str(prompt_file)])
+    literal_args = generate.parse_args(["--checkpoint", "checkpoint", "--prompt", "literal"])
+    file_args = generate.parse_args(["--checkpoint", "checkpoint", "--prompt-file", str(prompt_file)])
 
     assert literal_args.prompt == "literal"
     assert literal_args.prompt_file is None
     assert file_args.prompt is None
     assert file_args.prompt_file == prompt_file
     with pytest.raises(SystemExit):
-        generate.parse_args([])
+        generate.parse_args(["--checkpoint", "checkpoint"])
     with pytest.raises(SystemExit):
-        generate.parse_args(["--prompt", "literal", "--weight-index", "index.json"])
+        generate.parse_args(
+            ["--checkpoint", "checkpoint", "--prompt", "literal", "--weight-index", "index.json"]
+        )
     with pytest.raises(SystemExit):
-        generate.parse_args(["--prompt", "literal", "--tokenizer-path", "tokenizer"])
-    both_args = generate.parse_args(["--prompt", "literal", "--prompt-file", str(prompt_file)])
+        generate.parse_args(
+            ["--checkpoint", "checkpoint", "--prompt", "literal", "--tokenizer-path", "tokenizer"]
+        )
+    with pytest.raises(SystemExit):
+        generate.parse_args(["--checkpoint", "checkpoint", "--prompt", "literal", "--max-layers", "1"])
+    with pytest.raises(SystemExit):
+        generate.parse_args(["--checkpoint", "checkpoint", "--prompt", "literal", "--no-stats"])
+    with pytest.raises(SystemExit):
+        generate.parse_args(["--checkpoint", "checkpoint", "--prompt", "literal", "--stats"])
+    with pytest.raises(SystemExit):
+        generate.parse_args(["--prompt", "literal"])
+    both_args = generate.parse_args(
+        ["--checkpoint", "checkpoint", "--prompt", "literal", "--prompt-file", str(prompt_file)]
+    )
     assert both_args.prompt == "literal"
     assert both_args.prompt_file == prompt_file
     assert "--prompt takes precedence" in capsys.readouterr().err
+
+
+def test_main_always_prints_generation_stats(monkeypatch, capsys) -> None:
+    result = generate.GenerationResult(
+        text="answer",
+        prompt="question",
+        prompt_text="encoded",
+        prompt_tokens=3,
+        generated_tokens=2,
+        elapsed_s=0.5,
+    )
+    monkeypatch.setattr(generate, "run_generation", lambda _args: result)
+
+    assert generate.main(["--checkpoint", "checkpoint", "--prompt", "question"]) == 0
+
+    output = capsys.readouterr().out
+    assert "[stats]" in output
+    assert "prompt_tokens: 3" in output
+    assert "generated_tokens: 2" in output
+    assert "output_tps: 4.000" in output
 
 
 def test_format_completion_parses_eos_terminated_chat_response():
@@ -265,7 +299,6 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         max_new_tokens=2,
         temperature=0.0,
         max_seq_len=16,
-        max_layers=43,
         platform="a2a3",
         device=0,
         seed=1,
@@ -288,6 +321,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         False,
     )
     assert captured["runner_kwargs"]["runtime"] is fake_runtime
+    assert captured["runner_kwargs"]["max_layers"] == generate.FLASH_CONFIG.n_layers
     assert "platform" not in captured["runner_kwargs"]
     assert "device_id" not in captured["runner_kwargs"]
     assert captured["runner_kwargs"]["expert_cache_dir"] == "cache"
@@ -322,7 +356,6 @@ def test_create_runner_closes_runtime_when_runner_initialization_fails(monkeypat
         checkpoint=str(tmp_path),
         expert_cache_dir=None,
         max_seq_len=16,
-        max_layers=1,
         platform="a2a3",
         device=0,
         profile=False,

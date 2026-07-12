@@ -1,4 +1,4 @@
-"""Tests for the packed BF16 expert-cache converter."""
+"""Tests for the packed BF16 expert-cache exporter."""
 
 from dataclasses import replace
 import json
@@ -9,7 +9,7 @@ import torch
 from safetensors.torch import safe_open, save_file
 
 from models.config import FLASH_CONFIG
-import serving.convert_expert_cache as converter
+import export_expert_cache as exporter
 from serving.expert_cache import (
     EXPERT_CACHE_FORMAT,
     EXPERT_CACHE_VERSION,
@@ -73,12 +73,12 @@ def _packed_tensors(value: float = 1.0):
 
 
 def test_parse_layer_ids_supports_ranges_and_rejects_invalid_values() -> None:
-    assert converter.parse_layer_ids(None, count=4) == [0, 1, 2, 3]
-    assert converter.parse_layer_ids("3,1-2,2", count=4) == [1, 2, 3]
+    assert exporter.parse_layer_ids(None, count=4) == [0, 1, 2, 3]
+    assert exporter.parse_layer_ids("3,1-2,2", count=4) == [1, 2, 3]
     with pytest.raises(ValueError, match="invalid layer range"):
-        converter.parse_layer_ids("2-1", count=4)
+        exporter.parse_layer_ids("2-1", count=4)
     with pytest.raises(ValueError, match="layer ids"):
-        converter.parse_layer_ids("4", count=4)
+        exporter.parse_layer_ids("4", count=4)
 
 
 def test_build_packed_layer_places_experts_on_first_dimension(tmp_path) -> None:
@@ -86,7 +86,7 @@ def test_build_packed_layer_places_experts_on_first_dimension(tmp_path) -> None:
     cfg = _config()
     loader = DeepSeekV4WeightLoader(checkpoint, index, config=cfg)
 
-    packed = converter.build_packed_layer(loader, 1, config=cfg)
+    packed = exporter.build_packed_layer(loader, 1, config=cfg)
 
     assert set(packed) == set(PACKED_KEYS)
     assert packed[PACKED_W1].shape == (2, 4, 3)
@@ -99,12 +99,12 @@ def test_build_packed_layer_places_experts_on_first_dimension(tmp_path) -> None:
     loader.close()
 
 
-def test_converter_writes_manifest_and_round_trips_one_layer(tmp_path) -> None:
+def test_exporter_writes_manifest_and_round_trips_one_layer(tmp_path) -> None:
     checkpoint, _ = _checkpoint(tmp_path)
     output = tmp_path / "packed"
     cfg = _config()
 
-    converter.convert_experts(_args(checkpoint, output), config=cfg)
+    exporter.export_experts(_args(checkpoint, output), config=cfg)
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["format"] == EXPERT_CACHE_FORMAT
@@ -120,29 +120,29 @@ def test_converter_writes_manifest_and_round_trips_one_layer(tmp_path) -> None:
         assert handle.metadata() == {"format": EXPERT_CACHE_FORMAT, "version": str(EXPERT_CACHE_VERSION)}
 
 
-def test_converter_skips_valid_existing_layer_without_overwrite(tmp_path, capsys) -> None:
+def test_exporter_skips_valid_existing_layer_without_overwrite(tmp_path, capsys) -> None:
     checkpoint, _ = _checkpoint(tmp_path)
     output = tmp_path / "packed"
     cfg = _config()
     args = _args(checkpoint, output)
-    converter.convert_experts(args, config=cfg)
+    exporter.export_experts(args, config=cfg)
     path = output / layer_expert_cache_filename(0)
     before = path.stat().st_mtime_ns
 
-    converter.convert_experts(args, config=cfg)
+    exporter.export_experts(args, config=cfg)
 
     assert path.stat().st_mtime_ns == before
     assert "skip existing" in capsys.readouterr().out
 
 
-def test_converter_rejects_nonempty_unmanifested_or_wrong_version_output(tmp_path) -> None:
+def test_exporter_rejects_nonempty_unmanifested_or_wrong_version_output(tmp_path) -> None:
     checkpoint, _ = _checkpoint(tmp_path)
     cfg = _config()
     output = tmp_path / "nonempty"
     output.mkdir()
     (output / "unknown").write_text("x", encoding="utf-8")
     with pytest.raises(ValueError, match="non-empty but has no manifest"):
-        converter.convert_experts(_args(checkpoint, output), config=cfg)
+        exporter.export_experts(_args(checkpoint, output), config=cfg)
 
     output = tmp_path / "wrong_version"
     output.mkdir()
@@ -159,7 +159,7 @@ def test_converter_rejects_nonempty_unmanifested_or_wrong_version_output(tmp_pat
     }
     (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="version mismatch"):
-        converter.convert_experts(_args(checkpoint, output), config=cfg)
+        exporter.export_experts(_args(checkpoint, output), config=cfg)
 
 
 def test_atomic_layer_write_preserves_existing_file_when_validation_fails(tmp_path, monkeypatch) -> None:
@@ -172,9 +172,9 @@ def test_atomic_layer_write_preserves_existing_file_when_validation_fails(tmp_pa
         del config
         raise RuntimeError("validation failed")
 
-    monkeypatch.setattr(converter, "_validate_packed_file", fail_validation)
+    monkeypatch.setattr(exporter, "_validate_packed_file", fail_validation)
     with pytest.raises(RuntimeError, match="validation failed"):
-        converter._write_packed_file_atomic(path, _packed_tensors(9.0), config=_config())
+        exporter._write_packed_file_atomic(path, _packed_tensors(9.0), config=_config())
 
     assert path.read_bytes() == original
     assert not list(tmp_path.glob(".*.tmp-*"))
@@ -182,7 +182,7 @@ def test_atomic_layer_write_preserves_existing_file_when_validation_fails(tmp_pa
 
 def test_cli_does_not_accept_partial_experts_argument() -> None:
     with pytest.raises(SystemExit):
-        converter.parse_args(
+        exporter.parse_args(
             [
                 "--checkpoint",
                 "checkpoint",
@@ -196,7 +196,7 @@ def test_cli_does_not_accept_partial_experts_argument() -> None:
 
 def test_cli_does_not_accept_weight_index_argument() -> None:
     with pytest.raises(SystemExit):
-        converter.parse_args(
+        exporter.parse_args(
             [
                 "--checkpoint",
                 "checkpoint",

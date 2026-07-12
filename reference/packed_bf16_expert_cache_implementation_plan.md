@@ -1280,7 +1280,7 @@ Stage 6 完成判断：43 层 cache 完整性、S=1、S=13、S=1024、四 varian
 ### 最终格式收敛（已完成）
 
 - 删除 per-expert 旧格式 reader、manifest 字段、converter 和测试；
-- 正式 converter 收敛为 `serving/convert_expert_cache.py`；
+- 正式磁盘 exporter 收敛为根目录 `export_expert_cache.py`；
 - Reader 只保留 `load_routed_pack()` 与 `copy_selected_into()`；
 - 指定 cache 目录时强制要求当前 manifest schema，未声明层才允许回退 checkpoint；
 - profile 收敛为 `expert_cache.routed_pack` 和 `expert_cache.selected_slice_copy`；
@@ -1306,7 +1306,7 @@ Stage 6 完成判断：43 层 cache 完整性、S=1、S=13、S=1024、四 varian
 ### 11.1 单层转换
 
 ```bash
-python -m serving.convert_expert_cache \
+python export_expert_cache.py \
   --checkpoint /data/wuzhifeng/dsv4_ckpt \
   --output /data/wuzhifeng/dsv4_bf16_packed_expert_cache \
   --layers 0 \
@@ -1316,7 +1316,7 @@ python -m serving.convert_expert_cache \
 ### 11.2 单层验证
 
 ```bash
-python serving/run_model.py -p a2a3 -d {} \
+python smoke_model.py -p a2a3 -d {} \
   --checkpoint /data/wuzhifeng/dsv4_ckpt \
   --expert-cache-dir /data/wuzhifeng/dsv4_bf16_packed_expert_cache \
   --max-layers 1 --no-head -s 1 --decode-steps 3 --profile
@@ -1325,7 +1325,7 @@ python serving/run_model.py -p a2a3 -d {} \
 ### 11.3 五层验证
 
 ```bash
-python serving/run_model.py -p a2a3 -d {} \
+python smoke_model.py -p a2a3 -d {} \
   --checkpoint /data/wuzhifeng/dsv4_ckpt \
   --expert-cache-dir /data/wuzhifeng/dsv4_bf16_packed_expert_cache \
   --max-layers 5 --no-head -s 1 --decode-steps 1 --profile
@@ -1334,7 +1334,7 @@ python serving/run_model.py -p a2a3 -d {} \
 ### 11.4 完整验证
 
 ```bash
-python serving/run_model.py -p a2a3 -d {} \
+python smoke_model.py -p a2a3 -d {} \
   --checkpoint /data/wuzhifeng/dsv4_ckpt \
   --expert-cache-dir /data/wuzhifeng/dsv4_bf16_packed_expert_cache \
   --max-layers 43 --no-head -s 1024 --decode-steps 0 --profile

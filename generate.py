@@ -1,4 +1,4 @@
-"""Text generation entrypoint for DeepSeek V4 Flash PyPTO inference."""
+"""Root text-generation entrypoint for DeepSeek V4 Flash PyPTO inference."""
 
 from __future__ import annotations
 
@@ -204,15 +204,14 @@ def print_stats(result: GenerationResult) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DeepSeek V4 Flash PyPTO text generation.")
-    parser.add_argument("--checkpoint", type=str, default="../deepseek_v4_flash")
+    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--expert-cache-dir", type=str, default=None)
-    parser.add_argument("--prompt")
+    parser.add_argument("--prompt", type=str)
     parser.add_argument("--prompt-file", type=Path)
     parser.add_argument("--thinking-mode", choices=["chat", "thinking"], default="chat")
     parser.add_argument("--max-new-tokens", type=int, default=10)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
-    parser.add_argument("--max-layers", type=int, default=FLASH_CONFIG.n_layers)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--keep-prefill-routed-staging", action="store_true", default=False)
     parser.add_argument("-p", "--platform", type=str, default="a2a3")
@@ -223,7 +222,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-special-tokens", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose-layer-log", action="store_true")
-    parser.add_argument("--stats", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args(argv)
     if args.prompt is None and args.prompt_file is None:
         parser.error("one of --prompt or --prompt-file is required")
@@ -241,8 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run_generation(args)
     print(f"User: \n{result.prompt}")
     print(f"AI: \n{result.text}")
-    if args.stats:
-        print_stats(result)
+    print_stats(result)
     return 0
 
 
@@ -273,7 +270,7 @@ def _create_runner(args: argparse.Namespace, *, checkpoint: Path | None = None) 
             str(checkpoint),
             runtime=runtime,
             max_seq_len=args.max_seq_len,
-            max_layers=args.max_layers,
+            max_layers=FLASH_CONFIG.n_layers,
             run_head=True,
             profile=args.profile,
             verbose_layer_log=args.verbose_layer_log,

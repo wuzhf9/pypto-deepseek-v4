@@ -1,4 +1,4 @@
-"""Convert routed expert weights to the packed BF16 cache format."""
+"""Export routed expert weights as an on-disk packed BF16 cache."""
 
 from __future__ import annotations
 
@@ -99,12 +99,12 @@ def build_packed_layer(
     return tensors
 
 
-def convert_experts(
+def export_experts(
     args: argparse.Namespace,
     *,
     config: DeepSeekV4FlashConfig = FLASH_CONFIG,
 ) -> None:
-    """Convert selected complete layers into the expert-cache directory."""
+    """Export selected complete layers into the expert-cache directory."""
     checkpoint = validate_checkpoint_directory(args.checkpoint)
     output = Path(args.output).expanduser()
     output.mkdir(parents=True, exist_ok=True)
@@ -306,7 +306,9 @@ def _print_profile(loader: DeepSeekV4WeightLoader) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build DeepSeek V4 packed BF16 per-layer routed expert cache.")
+    parser = argparse.ArgumentParser(
+        description="Export DeepSeek V4 routed expert weights as an on-disk packed BF16 cache."
+    )
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--layers", type=str, default=None)
@@ -316,7 +318,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    convert_experts(parse_args(argv))
+    export_experts(parse_args(argv))
     return 0
 
 

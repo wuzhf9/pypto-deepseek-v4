@@ -1,19 +1,22 @@
-"""Smoke entrypoint for the device-runtime-injected DeepSeek V4 runner."""
+"""Root smoke entrypoint for the device-runtime-injected DeepSeek V4 runner."""
 
 import argparse
+from typing import Any
 
 import torch
 
 from models.config import FLASH_CONFIG
 from serving.checkpoint import validate_checkpoint_directory
 from serving.device_runtime import DeviceRuntime
-from serving.runner import DeepSeekV4Runner
 from serving.state import DEFAULT_MAX_SEQ_LEN
+
+
+DeepSeekV4Runner: Any | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepSeek V4 Flash PyPTO runner smoke entrypoint.")
-    parser.add_argument("--checkpoint", type=str, default="../deepseek_v4_flash")
+    parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("-p", "--platform", type=str, default="a2a3")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-s", "--seq-len", type=int, default=1)
@@ -30,6 +33,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global DeepSeekV4Runner
     args = parse_args(argv)
     checkpoint = validate_checkpoint_directory(args.checkpoint)
     if args.decode_steps < 0:
@@ -42,6 +46,10 @@ def main(argv: list[str] | None = None) -> int:
 
     torch.manual_seed(args.seed)
     input_ids = torch.randint(0, FLASH_CONFIG.vocab_size, (1, args.seq_len), dtype=torch.int64)
+    if DeepSeekV4Runner is None:
+        from serving.runner import DeepSeekV4Runner as _DeepSeekV4Runner
+
+        DeepSeekV4Runner = _DeepSeekV4Runner
     runtime = DeviceRuntime(
         platform=args.platform,
         device_id=args.device,

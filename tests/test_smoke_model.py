@@ -1,9 +1,9 @@
-"""Tests for device runtime composition in the runner smoke entrypoint."""
+"""Tests for device runtime composition in the root smoke entrypoint."""
 
 import pytest
 import torch
 
-from serving import run_model
+import smoke_model
 
 
 class _FakeRuntime:
@@ -22,7 +22,7 @@ def _checkpoint(tmp_path):
     return checkpoint
 
 
-def test_run_model_creates_runtime_outside_runner_and_injects_it(monkeypatch, tmp_path) -> None:
+def test_smoke_model_creates_runtime_outside_runner_and_injects_it(monkeypatch, tmp_path) -> None:
     checkpoint = _checkpoint(tmp_path)
     runtime = _FakeRuntime()
     captured = {}
@@ -42,10 +42,10 @@ def test_run_model_creates_runtime_outside_runner_and_injects_it(monkeypatch, tm
         def close(self):
             runtime.close()
 
-    monkeypatch.setattr(run_model, "DeviceRuntime", fake_device_runtime)
-    monkeypatch.setattr(run_model, "DeepSeekV4Runner", FakeRunner)
+    monkeypatch.setattr(smoke_model, "DeviceRuntime", fake_device_runtime)
+    monkeypatch.setattr(smoke_model, "DeepSeekV4Runner", FakeRunner)
 
-    result = run_model.main(
+    result = smoke_model.main(
         [
             "--checkpoint",
             str(checkpoint),
@@ -69,23 +69,28 @@ def test_run_model_creates_runtime_outside_runner_and_injects_it(monkeypatch, tm
     assert runtime.close_calls == 1
 
 
-def test_run_model_closes_runtime_when_runner_initialization_fails(monkeypatch, tmp_path) -> None:
+def test_smoke_model_closes_runtime_when_runner_initialization_fails(monkeypatch, tmp_path) -> None:
     checkpoint = _checkpoint(tmp_path)
     runtime = _FakeRuntime()
-    monkeypatch.setattr(run_model, "DeviceRuntime", lambda **_kwargs: runtime)
+    monkeypatch.setattr(smoke_model, "DeviceRuntime", lambda **_kwargs: runtime)
 
     class FailingRunner:
         def __init__(self, *_args, **_kwargs):
             raise RuntimeError("runner init failed")
 
-    monkeypatch.setattr(run_model, "DeepSeekV4Runner", FailingRunner)
+    monkeypatch.setattr(smoke_model, "DeepSeekV4Runner", FailingRunner)
 
     with pytest.raises(RuntimeError, match="runner init failed"):
-        run_model.main(["--checkpoint", str(checkpoint)])
+        smoke_model.main(["--checkpoint", str(checkpoint)])
 
     assert runtime.close_calls == 1
 
 
-def test_run_model_rejects_weight_index_argument() -> None:
+def test_smoke_model_rejects_weight_index_argument() -> None:
     with pytest.raises(SystemExit):
-        run_model.parse_args(["--weight-index", "index.json"])
+        smoke_model.parse_args(["--checkpoint", "checkpoint", "--weight-index", "index.json"])
+
+
+def test_smoke_model_requires_checkpoint_argument() -> None:
+    with pytest.raises(SystemExit):
+        smoke_model.parse_args([])
