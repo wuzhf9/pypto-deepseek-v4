@@ -1,5 +1,8 @@
 # Packed BF16 Expert Cache 详细实现计划
 
+> 当前实现已经收敛为唯一正式 packed cache 格式。下文 Stage 0–6 中的 V1/V2 名称仅保留为迁移过程和
+> 性能基线记录，不代表当前代码仍提供旧格式接口。磁盘 manifest 的 `version: 2` 只用于 schema 校验。
+
 ## 1. 目标与范围
 
 本计划把 `packed_bf16_expert_cache_plan.md` 细化为可逐阶段实现和验证的修改清单。
@@ -1274,6 +1277,16 @@ Stage 6 完成判断：43 层 cache 完整性、S=1、S=13、S=1024、四 varian
 资源释放和 profile/RSS 均通过；S=1024 未复现 507018。V2 prefill Host pack 和 warm decode 均较 V1 明显
 改善，可以进入 Stage 7，基于新 profile 重新评估 prefetch，而不是沿用 V1 Host load 假设。
 
+### 最终格式收敛（已完成）
+
+- 删除 per-expert 旧格式 reader、manifest 字段、converter 和测试；
+- 正式 converter 收敛为 `serving/convert_expert_cache.py`；
+- Reader 只保留 `load_routed_pack()` 与 `copy_selected_into()`；
+- 指定 cache 目录时强制要求当前 manifest schema，未声明层才允许回退 checkpoint；
+- profile 收敛为 `expert_cache.routed_pack` 和 `expert_cache.selected_slice_copy`；
+- manifest 保留 `version: 2` 以直接消费已完成验证的 516 GiB cache，不重新转换数据；
+- 本地 299 tests 通过；远端 43 层 metadata、单层连续 decode、五层四 variant 通过。
+
 ### Stage 7：重新评估 prefetch
 
 38. 用 v2 数据更新 `prefill_routed_expert_prefetch_plan.md`；
@@ -1288,7 +1301,7 @@ Stage 6 完成判断：43 层 cache 完整性、S=1、S=13、S=1024、四 varian
 ### 11.1 单层转换
 
 ```bash
-python -m serving.convert_packed_expert_cache \
+python -m serving.convert_expert_cache \
   --checkpoint /data/wuzhifeng/dsv4_ckpt \
   --output /data/wuzhifeng/dsv4_bf16_packed_expert_cache \
   --layers 0 \

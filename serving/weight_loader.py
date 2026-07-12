@@ -504,10 +504,6 @@ class DeepSeekV4WeightLoader:
         if not 0 <= expert_id < self.config.n_routed_experts:
             raise ValueError(f"expert_id must be in [0, {self.config.n_routed_experts}), got {expert_id}")
         target = torch.device(device) if device is not None else self.default_device
-        cached = self._load_cached_expert(layer_id, expert_id, device=target)
-        if cached is not None:
-            return cached
-
         prefix = f"{self._layer_prefix(layer_id)}.ffn.experts.{expert_id}"
         return MoERoutedExpertWeights(
             w1_t=self._get_transposed_weight(f"{prefix}.w1.weight", device=target, cache=False).host_tensor,
@@ -583,7 +579,7 @@ class DeepSeekV4WeightLoader:
         del release_each_expert
         target = torch.device(device) if device is not None else self.default_device
 
-        cached_pack = self._expert_cache.load_packed_clone(layer_id, device=target)
+        cached_pack = self._expert_cache.load_routed_pack(layer_id, device=target)
         if cached_pack is not None:
             routed_w1_t, routed_w2_t, routed_w3_t = cached_pack
             return MoERoutedPackWeights(
@@ -724,20 +720,6 @@ class DeepSeekV4WeightLoader:
         start = time.perf_counter()
         out.copy_(tensor)
         self._record_profile("copy_linear_t", start)
-
-    def expert_cache_path(self, layer_id: int) -> Path | None:
-        return self._expert_cache.layer_path(layer_id)
-
-    def _load_cached_expert(self, layer_id: int, expert_id: int, *, device: torch.device) -> MoERoutedExpertWeights | None:
-        tensors = self._expert_cache.load_expert(layer_id, expert_id, device=device)
-        if tensors is None:
-            return None
-        w1_t, w2_t, w3_t = tensors
-        return MoERoutedExpertWeights(
-            w1_t=w1_t,
-            w2_t=w2_t,
-            w3_t=w3_t,
-        )
 
     def _validate_layer_id(self, layer_id: int) -> None:
         if not 0 <= layer_id < self.config.n_layers:

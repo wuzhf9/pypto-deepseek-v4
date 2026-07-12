@@ -1,5 +1,8 @@
 # Packed BF16 Expert Cache 优化方案
 
+> 本文保留格式迁移时的方案与 A/B 推导。当前生产代码已经收敛为唯一 packed cache 格式，不再提供旧格式
+> reader、converter 或兼容接口；manifest 的 `version: 2` 仅作为磁盘 schema 标识。
+
 ## 1. 结论
 
 当前 BF16 expert cache 每层保存 256 个专家、每个专家三组独立 tensor，共 768 个 safetensors key。

@@ -1,4 +1,4 @@
-"""Versioned BF16 routed-expert cache metadata and tensor reader."""
+"""Packed BF16 routed-expert cache metadata and tensor reader."""
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -14,8 +14,7 @@ from models.config import DeepSeekV4FlashConfig
 
 
 EXPERT_CACHE_FORMAT = "dsv4_bf16_layer_experts"
-EXPERT_CACHE_V1 = 1
-EXPERT_CACHE_V2 = 2
+EXPERT_CACHE_VERSION = 2
 
 PACKED_W1 = "routed_w1_t"
 PACKED_W2 = "routed_w2_t"
@@ -30,10 +29,9 @@ def layer_expert_cache_filename(layer_id: int) -> str:
 
 @dataclass(frozen=True)
 class ExpertCacheLayerManifest:
-    """One optional layer entry from an expert-cache manifest."""
+    """One layer entry from an expert-cache manifest."""
 
     file: str
-    experts: tuple[int, ...] | None
 
 
 @dataclass(frozen=True)
@@ -51,16 +49,15 @@ class ExpertCacheManifest:
 
 @dataclass(frozen=True)
 class LayerExpertCacheInfo:
-    """Detected format and keys for one layer cache file."""
+    """Validated keys for one packed layer cache file."""
 
     layer_id: int
     path: Path
-    version: int
     keys: frozenset[str]
 
 
 class ExpertCacheReader:
-    """Read v1 per-expert and v2 packed caches behind one format boundary."""
+    """Read the final packed expert-cache format."""
 
     def __init__(
         self,
@@ -88,15 +85,14 @@ class ExpertCacheReader:
         self._validate_layer_id(layer_id)
         if self.directory is None:
             return None
-        if self._manifest is not None:
-            entry = self._manifest.layers.get(layer_id)
-            if entry is None:
-                return None
-            return self.directory / entry.file
-        return self.directory / layer_expert_cache_filename(layer_id)
+        assert self._manifest is not None
+        entry = self._manifest.layers.get(layer_id)
+        if entry is None:
+            return None
+        return self.directory / entry.file
 
     def inspect_layer(self, layer_id: int) -> LayerExpertCacheInfo | None:
-        """Detect and cache one layer file's format without cloning tensors."""
+        """Validate and cache one packed layer without cloning tensors."""
         self._validate_layer_id(layer_id)
         cached = self._layer_info.get(layer_id)
         if cached is not None:
@@ -106,91 +102,23 @@ class ExpertCacheReader:
         if path is None:
             return None
         if not path.exists():
-            if self._manifest is not None and layer_id in self._manifest.layers:
-                raise FileNotFoundError(f"Expert cache manifest references missing layer file: {path}")
-            return None
+            raise FileNotFoundError(f"Expert cache manifest references missing layer file: {path}")
 
         handle = self._get_handle(path)
         keys = frozenset(str(key) for key in handle.keys())
-        packed_present = frozenset(PACKED_KEYS).intersection(keys)
-        v1_present = frozenset(key for key in keys if key.startswith("expert_"))
-
-        if packed_present:
-            missing = frozenset(PACKED_KEYS).difference(keys)
-            if missing:
-                raise ValueError(f"Incomplete packed expert cache {path}: missing keys {sorted(missing)}")
-            if v1_present:
-                raise ValueError(f"Mixed v1/v2 expert cache keys are not supported: {path}")
-            unexpected = keys.difference(PACKED_KEYS)
-            if unexpected:
-                raise ValueError(f"Packed expert cache {path} has unexpected keys {sorted(unexpected)}")
-            version = EXPERT_CACHE_V2
-            self._validate_packed_metadata(handle, path)
-        else:
-            if not v1_present:
-                raise ValueError(f"Expert cache file has no recognized expert tensors: {path}")
-            version = EXPERT_CACHE_V1
-
-        if self._manifest is not None and self._manifest.version != version:
+        expected_keys = frozenset(PACKED_KEYS)
+        if keys != expected_keys:
+            missing = expected_keys.difference(keys)
+            unexpected = keys.difference(expected_keys)
             raise ValueError(
-                f"Expert cache manifest version {self._manifest.version} does not match "
-                f"layer {layer_id} file version {version}: {path}"
+                f"Packed expert cache {path} keys mismatch: "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
             )
+        self._validate_packed_metadata(handle, path)
 
-        info = LayerExpertCacheInfo(layer_id=layer_id, path=path, version=version, keys=keys)
+        info = LayerExpertCacheInfo(layer_id=layer_id, path=path, keys=keys)
         self._layer_info[layer_id] = info
         return info
-
-    def load_expert(
-        self,
-        layer_id: int,
-        expert_id: int,
-        *,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Load one v1 expert, or return None when it is not cached."""
-        self._validate_expert_id(expert_id)
-        info = self.inspect_layer(layer_id)
-        if info is None:
-            return None
-        if info.version == EXPERT_CACHE_V2:
-            start = time.perf_counter()
-            handle = self._get_handle(info.path)
-            w1_t = self._materialize_tensor(handle.get_slice(PACKED_W1)[expert_id], device)
-            w2_t = self._materialize_tensor(handle.get_slice(PACKED_W2)[expert_id], device)
-            w3_t = self._materialize_tensor(handle.get_slice(PACKED_W3)[expert_id], device)
-            self._record_profile("expert_cache.v2.expert_slice", start)
-            self._validate_expert_tensor("w1_t", w1_t, (self.config.dim, self.config.moe_inter_dim))
-            self._validate_expert_tensor("w2_t", w2_t, (self.config.moe_inter_dim, self.config.dim))
-            self._validate_expert_tensor("w3_t", w3_t, (self.config.dim, self.config.moe_inter_dim))
-            return w1_t.contiguous(), w2_t.contiguous(), w3_t.contiguous()
-
-        prefix = f"expert_{expert_id:03d}"
-        names = (
-            f"{prefix}.w1_t",
-            f"{prefix}.w2_t",
-            f"{prefix}.w3_t",
-        )
-        missing = [name for name in names if name not in info.keys]
-        if missing:
-            if self._manifest_declares_expert(layer_id, expert_id):
-                raise KeyError(
-                    f"Expert cache manifest declares layer {layer_id} expert {expert_id}, "
-                    f"but {info.path} is missing keys {missing}"
-                )
-            return None
-
-        start = time.perf_counter()
-        handle = self._get_handle(info.path)
-        w1_t = self._materialize_tensor(handle.get_tensor(names[0]), device)
-        w2_t = self._materialize_tensor(handle.get_tensor(names[1]), device)
-        w3_t = self._materialize_tensor(handle.get_tensor(names[2]), device)
-        self._record_profile("expert_cache.load", start)
-
-        self._validate_expert_tensor("w1_t", w1_t, (self.config.dim, self.config.moe_inter_dim))
-        self._validate_expert_tensor("w2_t", w2_t, (self.config.moe_inter_dim, self.config.dim))
-        self._validate_expert_tensor("w3_t", w3_t, (self.config.dim, self.config.moe_inter_dim))
-        return w1_t.contiguous(), w2_t.contiguous(), w3_t.contiguous()
 
     def copy_selected_into(
         self,
@@ -201,16 +129,12 @@ class ExpertCacheReader:
         out_w2: torch.Tensor,
         out_w3: torch.Tensor,
     ) -> bool:
-        """Copy selected v2 expert slices into preallocated Host packs.
-
-        Returns False for a missing layer or a v1 file so WeightLoader can
-        preserve its existing per-expert fallback path.
-        """
+        """Copy selected expert slices, returning False for an uncached layer."""
         ids = tuple(int(expert_id) for expert_id in expert_ids)
         for expert_id in ids:
             self._validate_expert_id(expert_id)
         info = self.inspect_layer(layer_id)
-        if info is None or info.version == EXPERT_CACHE_V1:
+        if info is None:
             return False
 
         count = len(ids)
@@ -239,18 +163,18 @@ class ExpertCacheReader:
             out_w1[slot].copy_(w1_t)
             out_w2[slot].copy_(w2_t)
             out_w3[slot].copy_(w3_t)
-        self._record_profile("expert_cache.v2.selected_slice_copy", start)
+        self._record_profile("expert_cache.selected_slice_copy", start)
         return True
 
-    def load_packed_clone(
+    def load_routed_pack(
         self,
         layer_id: int,
         *,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Clone all three v2 packed tensors, or return None for v1/missing layers."""
+        """Clone one complete routed-expert pack for prefill."""
         info = self.inspect_layer(layer_id)
-        if info is None or info.version == EXPERT_CACHE_V1:
+        if info is None:
             return None
 
         start = time.perf_counter()
@@ -258,7 +182,7 @@ class ExpertCacheReader:
         routed_w1_t = self._materialize_tensor(handle.get_tensor(PACKED_W1), device)
         routed_w2_t = self._materialize_tensor(handle.get_tensor(PACKED_W2), device)
         routed_w3_t = self._materialize_tensor(handle.get_tensor(PACKED_W3), device)
-        self._record_profile("expert_cache.v2.packed_clone", start)
+        self._record_profile("expert_cache.routed_pack", start)
         return routed_w1_t, routed_w2_t, routed_w3_t
 
     def close(self) -> None:
@@ -273,14 +197,17 @@ class ExpertCacheReader:
             return None
         path = self.directory / "manifest.json"
         if not path.exists():
-            return None
+            raise FileNotFoundError(f"Expert cache directory requires manifest.json: {path}")
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         if data.get("format") != EXPERT_CACHE_FORMAT:
             raise ValueError(f"Unsupported expert cache format in {path}: {data.get('format')!r}")
         version = int(data.get("version", -1))
-        if version not in {EXPERT_CACHE_V1, EXPERT_CACHE_V2}:
-            raise ValueError(f"Unsupported expert cache version in {path}: {version}")
+        if version != EXPERT_CACHE_VERSION:
+            raise ValueError(
+                f"Unsupported expert cache version in {path}: "
+                f"expected {EXPERT_CACHE_VERSION}, got {version}"
+            )
 
         expected = {
             "n_layers": self.config.n_layers,
@@ -305,12 +232,7 @@ class ExpertCacheReader:
             self._validate_layer_id(layer_id)
             if not isinstance(raw_entry, dict) or not isinstance(raw_entry.get("file"), str):
                 raise ValueError(f"Invalid expert cache layer entry {raw_layer_id!r} in {path}")
-            raw_experts = raw_entry.get("experts")
-            experts = None if raw_experts is None else tuple(int(expert_id) for expert_id in raw_experts)
-            if experts is not None:
-                for expert_id in experts:
-                    self._validate_expert_id(expert_id)
-            layers[layer_id] = ExpertCacheLayerManifest(file=raw_entry["file"], experts=experts)
+            layers[layer_id] = ExpertCacheLayerManifest(file=raw_entry["file"])
 
         return ExpertCacheManifest(
             version=version,
@@ -321,14 +243,6 @@ class ExpertCacheReader:
             dtype=str(data["dtype"]),
             layers=layers,
         )
-
-    def _manifest_declares_expert(self, layer_id: int, expert_id: int) -> bool:
-        if self._manifest is None:
-            return False
-        entry = self._manifest.layers.get(layer_id)
-        if entry is None or entry.experts is None:
-            return self._manifest.version == EXPERT_CACHE_V2
-        return expert_id in entry.experts
 
     def _get_handle(self, path: Path) -> Any:
         path = path.resolve()
@@ -396,8 +310,7 @@ class ExpertCacheReader:
 
 __all__ = [
     "EXPERT_CACHE_FORMAT",
-    "EXPERT_CACHE_V1",
-    "EXPERT_CACHE_V2",
+    "EXPERT_CACHE_VERSION",
     "PACKED_KEYS",
     "PACKED_W1",
     "PACKED_W2",

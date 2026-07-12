@@ -348,14 +348,13 @@ selected-expert；prefill 仍需要 full routed pack，但 full pack 由 per-lay
 
 ## Expert Offline Cache
 
-在线读取 routed experts 的主要耗时来自 fp4 -> bf16 反量化和转置。为了同时支持 prefill
-full routed pack 和 decode selected-expert，离线 cache 采用每层一个 safetensors 文件、
-每个 expert 独立存储的 bf16 布局。
+在线读取 routed experts 的主要耗时来自 fp4 -> bf16 反量化和转置。正式离线 cache 采用每层一个
+safetensors 文件，每层只保存三个连续 packed BF16 tensor。
 
 cache 目录结构：
 
 ```text
-bf16_expert_cache/
+bf16_packed_expert_cache/
 ├── manifest.json
 ├── layer_000_experts.safetensors
 ├── layer_001_experts.safetensors
@@ -365,10 +364,9 @@ bf16_expert_cache/
 每个 `layer_NNN_experts.safetensors` 包含：
 
 ```text
-expert_000.w1_t [4096, 2048] bf16
-expert_000.w2_t [2048, 4096] bf16
-expert_000.w3_t [4096, 2048] bf16
-...
+routed_w1_t [256, 4096, 2048] bf16
+routed_w2_t [256, 2048, 4096] bf16
+routed_w3_t [256, 4096, 2048] bf16
 ```
 
 生成命令：
@@ -376,7 +374,7 @@ expert_000.w3_t [4096, 2048] bf16
 ```bash
 python serving/convert_expert_cache.py \
   --checkpoint ~/dsv4_ckpt \
-  --output ~/dsv4_bf16_expert_cache \
+  --output ~/dsv4_bf16_packed_expert_cache \
   --layers 0 \
   --overwrite \
   --profile
@@ -387,14 +385,14 @@ runner 使用命令：
 ```bash
 python serving/runner.py \
   --checkpoint ~/dsv4_ckpt \
-  --expert-cache-dir ~/dsv4_bf16_expert_cache \
+  --expert-cache-dir ~/dsv4_bf16_packed_expert_cache \
   -p a2a3 -d {} -s 13 --max-layers 1 --no-head --profile
 ```
 
-`DeepSeekV4WeightLoader.get_moe_routed_expert()` 会优先读取 expert cache；如果对应层或
-expert 缺失，则回退到官方 checkpoint 在线 fp4 反量化和转置。
-`get_layer_moe_routed_pack()` 和 `get_layer_moe_selected_experts()` 都复用同一条
-per-expert 加载路径。`release_prefix(...)` 不删除 cache 文件，只清理内存中的 tensor cache。
+`get_layer_moe_routed_pack()` 对完整 packed tensor 各 clone 一次用于 prefill；
+`get_layer_moe_selected_experts()` 只 lazy slice 当前 decode 选中的专家。Manifest 未包含某层时回退到
+官方 checkpoint；已声明文件缺失或损坏则直接报错。`get_moe_routed_expert()` 只读取 checkpoint，供
+converter 使用。
 
 ## MoE Routed Experts: Per-Expert 备选接口
 

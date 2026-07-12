@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,7 @@ import torch
 from safetensors.torch import save_file
 
 from models.config import FLASH_CONFIG
+from serving.expert_cache import EXPERT_CACHE_FORMAT, EXPERT_CACHE_VERSION, layer_expert_cache_filename
 from serving.runtime_types import HostStagingTensor, RuntimeWeight, StagingKind
 from serving.weight_loader import (
     DeepSeekV4WeightLoader,
@@ -32,6 +34,24 @@ def _small_config():
         moe_inter_dim=3,
         vocab_size=8,
     )
+
+
+def _write_expert_manifest(directory, cfg, *, layers=(0,)) -> None:
+    manifest = {
+        "format": EXPERT_CACHE_FORMAT,
+        "version": EXPERT_CACHE_VERSION,
+        "source_checkpoint": "checkpoint",
+        "n_layers": cfg.n_layers,
+        "n_routed_experts": cfg.n_routed_experts,
+        "dim": cfg.dim,
+        "moe_inter_dim": cfg.moe_inter_dim,
+        "dtype": "bfloat16",
+        "layers": {
+            str(layer_id): {"file": layer_expert_cache_filename(layer_id)}
+            for layer_id in layers
+        },
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def _official_checkpoint_path():
@@ -408,7 +428,7 @@ def test_loader_reuses_safetensors_file_handle(tmp_path):
     assert len(loader._file_handles) == 0
 
 
-def test_loader_uses_layer_expert_cache_for_expert_selected_and_pack(tmp_path):
+def test_loader_falls_back_to_checkpoint_when_manifest_omits_layer(tmp_path):
     cfg = _small_config()
     checkpoint = tmp_path / "ckpt"
     checkpoint.mkdir()
@@ -424,46 +444,29 @@ def test_loader_uses_layer_expert_cache_for_expert_selected_and_pack(tmp_path):
         "model.layers.0.mlp.experts.1.up_proj.weight": torch.full((3, 4), -6.0, dtype=torch.bfloat16),
     }
     index = _save_checkpoint(checkpoint, tensors)
-    save_file(
-        {
-            "expert_000.w1_t": torch.full((4, 3), 1.0, dtype=torch.bfloat16),
-            "expert_000.w2_t": torch.full((3, 4), 2.0, dtype=torch.bfloat16),
-            "expert_000.w3_t": torch.full((4, 3), 3.0, dtype=torch.bfloat16),
-            "expert_001.w1_t": torch.full((4, 3), 4.0, dtype=torch.bfloat16),
-            "expert_001.w2_t": torch.full((3, 4), 5.0, dtype=torch.bfloat16),
-            "expert_001.w3_t": torch.full((4, 3), 6.0, dtype=torch.bfloat16),
-        },
-        expert_cache_dir / "layer_000_experts.safetensors",
-    )
+    _write_expert_manifest(expert_cache_dir, cfg, layers=())
 
     loader = DeepSeekV4WeightLoader(checkpoint, index, config=cfg, expert_cache_dir=expert_cache_dir)
     expert = loader.get_moe_routed_expert(0, 1)
-    assert torch.equal(expert.w1_t, torch.full((4, 3), 4.0, dtype=torch.bfloat16))
-    assert torch.equal(expert.w2_t, torch.full((3, 4), 5.0, dtype=torch.bfloat16))
-    assert torch.equal(expert.w3_t, torch.full((4, 3), 6.0, dtype=torch.bfloat16))
+    assert torch.equal(expert.w1_t, torch.full((4, 3), -4.0, dtype=torch.bfloat16))
+    assert torch.equal(expert.w2_t, torch.full((3, 4), -5.0, dtype=torch.bfloat16))
+    assert torch.equal(expert.w3_t, torch.full((4, 3), -6.0, dtype=torch.bfloat16))
 
     selected = loader.get_layer_moe_selected_experts(0, [1, 0])
-    assert torch.equal(_host(selected.selected_w1_t)[0], torch.full((4, 3), 4.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(selected.selected_w2_t)[0], torch.full((3, 4), 5.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(selected.selected_w3_t)[0], torch.full((4, 3), 6.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(selected.selected_w1_t)[1], torch.full((4, 3), 1.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(selected.selected_w2_t)[1], torch.full((3, 4), 2.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(selected.selected_w3_t)[1], torch.full((4, 3), 3.0, dtype=torch.bfloat16))
+    assert torch.equal(_host(selected.selected_w1_t)[0], torch.full((4, 3), -4.0, dtype=torch.bfloat16))
+    assert torch.equal(_host(selected.selected_w2_t)[0], torch.full((3, 4), -5.0, dtype=torch.bfloat16))
+    assert torch.equal(_host(selected.selected_w3_t)[0], torch.full((4, 3), -6.0, dtype=torch.bfloat16))
 
     packed = loader.get_layer_moe_routed_pack(0)
-    assert torch.equal(_host(packed.routed_w1_t)[0], torch.full((4, 3), 1.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(packed.routed_w1_t)[1], torch.full((4, 3), 4.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(packed.routed_w2_t)[0], torch.full((3, 4), 2.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(packed.routed_w2_t)[1], torch.full((3, 4), 5.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(packed.routed_w3_t)[0], torch.full((4, 3), 3.0, dtype=torch.bfloat16))
-    assert torch.equal(_host(packed.routed_w3_t)[1], torch.full((4, 3), 6.0, dtype=torch.bfloat16))
-    assert loader._expert_cache.open_handle_count == 1
+    assert torch.equal(_host(packed.routed_w1_t)[0], torch.full((4, 3), -1.0, dtype=torch.bfloat16))
+    assert torch.equal(_host(packed.routed_w1_t)[1], torch.full((4, 3), -4.0, dtype=torch.bfloat16))
+    assert loader._expert_cache.open_handle_count == 0
 
     loader.close()
     assert loader._expert_cache.open_handle_count == 0
 
 
-def test_loader_uses_v2_lazy_slices_for_selected_experts(tmp_path, monkeypatch):
+def test_loader_uses_lazy_slices_for_selected_experts(tmp_path):
     cfg = _small_config()
     checkpoint = tmp_path / "ckpt"
     checkpoint.mkdir()
@@ -495,6 +498,7 @@ def test_loader_uses_v2_lazy_slices_for_selected_experts(tmp_path, monkeypatch):
         },
         expert_cache_dir / "layer_000_experts.safetensors",
     )
+    _write_expert_manifest(expert_cache_dir, cfg)
     loader = DeepSeekV4WeightLoader(
         checkpoint,
         index,
@@ -503,11 +507,6 @@ def test_loader_uses_v2_lazy_slices_for_selected_experts(tmp_path, monkeypatch):
         profile=True,
     )
 
-    def fail_single_expert(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("v2 selected path must not call load_expert")
-
-    monkeypatch.setattr(loader._expert_cache, "load_expert", fail_single_expert)
     selected = loader.get_layer_moe_selected_experts(0, [1, 0])
 
     assert torch.equal(_host(selected.selected_w1_t), packed_w1[[1, 0]])
@@ -516,12 +515,11 @@ def test_loader_uses_v2_lazy_slices_for_selected_experts(tmp_path, monkeypatch):
     assert selected.selected_w1_t.kind is StagingKind.DECODE_SELECTED
     assert selected.selected_w1_t.slot == "w1_t"
     profile = {name: (count, elapsed_ms) for name, count, elapsed_ms in loader.profile_summary()}
-    assert profile["expert_cache.v2.selected_slice_copy"][0] == 1
+    assert profile["expert_cache.selected_slice_copy"][0] == 1
     assert profile["selected_experts.build"][0] == 1
-    assert "expert_cache.load" not in profile
 
 
-def test_loader_uses_v2_full_clones_for_routed_pack(tmp_path, monkeypatch):
+def test_loader_uses_full_pack_for_prefill(tmp_path):
     cfg = _small_config()
     checkpoint = tmp_path / "ckpt"
     checkpoint.mkdir()
@@ -539,6 +537,7 @@ def test_loader_uses_v2_full_clones_for_routed_pack(tmp_path, monkeypatch):
         },
         expert_cache_dir / "layer_000_experts.safetensors",
     )
+    _write_expert_manifest(expert_cache_dir, cfg)
     loader = DeepSeekV4WeightLoader(
         checkpoint,
         index,
@@ -547,11 +546,6 @@ def test_loader_uses_v2_full_clones_for_routed_pack(tmp_path, monkeypatch):
         profile=True,
     )
 
-    def fail_single_expert(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("v2 routed pack path must not call load_expert")
-
-    monkeypatch.setattr(loader._expert_cache, "load_expert", fail_single_expert)
     packed = loader.get_layer_moe_routed_pack(0)
 
     assert torch.equal(_host(packed.routed_w1_t), packed_w1)
@@ -560,10 +554,7 @@ def test_loader_uses_v2_full_clones_for_routed_pack(tmp_path, monkeypatch):
     assert packed.routed_w1_t.kind is StagingKind.PREFILL_ROUTED
     assert packed.routed_w1_t.slot == "w1_t"
     profile = {name: (count, elapsed_ms) for name, count, elapsed_ms in loader.profile_summary()}
-    assert profile["expert_cache.v2.packed_clone"][0] == 1
-    assert "expert_cache.v2.prefill_mmap_view" not in profile
-    assert "expert_cache.v2.expert_slice" not in profile
-    assert "expert_cache.load" not in profile
+    assert profile["expert_cache.routed_pack"][0] == 1
 
 
 def test_official_lowvram_weight_index_smoke_loads_representative_weights():

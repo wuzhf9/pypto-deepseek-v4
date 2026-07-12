@@ -1,4 +1,4 @@
-"""Tests for the independent packed BF16 expert-cache converter."""
+"""Tests for the packed BF16 expert-cache converter."""
 
 from dataclasses import replace
 import json
@@ -9,11 +9,10 @@ import torch
 from safetensors.torch import safe_open, save_file
 
 from models.config import FLASH_CONFIG
-import serving.convert_packed_expert_cache as converter
+import serving.convert_expert_cache as converter
 from serving.expert_cache import (
     EXPERT_CACHE_FORMAT,
-    EXPERT_CACHE_V1,
-    EXPERT_CACHE_V2,
+    EXPERT_CACHE_VERSION,
     PACKED_KEYS,
     PACKED_W1,
     PACKED_W2,
@@ -98,16 +97,16 @@ def test_build_packed_layer_places_experts_on_first_dimension(tmp_path) -> None:
     loader.close()
 
 
-def test_converter_writes_v2_manifest_and_round_trips_one_layer(tmp_path) -> None:
+def test_converter_writes_manifest_and_round_trips_one_layer(tmp_path) -> None:
     checkpoint, index = _checkpoint(tmp_path)
     output = tmp_path / "packed"
     cfg = _config()
 
-    converter.convert_packed_experts(_args(checkpoint, index, output), config=cfg)
+    converter.convert_experts(_args(checkpoint, index, output), config=cfg)
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["format"] == EXPERT_CACHE_FORMAT
-    assert manifest["version"] == EXPERT_CACHE_V2
+    assert manifest["version"] == EXPERT_CACHE_VERSION
     assert set(manifest["layers"]) == {"0"}
     assert manifest["layers"]["0"]["packed"] is True
     path = output / layer_expert_cache_filename(0)
@@ -116,7 +115,7 @@ def test_converter_writes_v2_manifest_and_round_trips_one_layer(tmp_path) -> Non
         assert torch.equal(handle.get_tensor(PACKED_W1)[1], torch.full((4, 3), 2.0, dtype=torch.bfloat16))
         assert torch.equal(handle.get_tensor(PACKED_W2)[0], torch.full((3, 4), 3.0, dtype=torch.bfloat16))
         assert torch.equal(handle.get_tensor(PACKED_W3)[0], torch.full((4, 3), 5.0, dtype=torch.bfloat16))
-        assert handle.metadata() == {"format": EXPERT_CACHE_FORMAT, "version": str(EXPERT_CACHE_V2)}
+        assert handle.metadata() == {"format": EXPERT_CACHE_FORMAT, "version": str(EXPERT_CACHE_VERSION)}
 
 
 def test_converter_skips_valid_existing_layer_without_overwrite(tmp_path, capsys) -> None:
@@ -124,30 +123,30 @@ def test_converter_skips_valid_existing_layer_without_overwrite(tmp_path, capsys
     output = tmp_path / "packed"
     cfg = _config()
     args = _args(checkpoint, index, output)
-    converter.convert_packed_experts(args, config=cfg)
+    converter.convert_experts(args, config=cfg)
     path = output / layer_expert_cache_filename(0)
     before = path.stat().st_mtime_ns
 
-    converter.convert_packed_experts(args, config=cfg)
+    converter.convert_experts(args, config=cfg)
 
     assert path.stat().st_mtime_ns == before
     assert "skip existing" in capsys.readouterr().out
 
 
-def test_converter_rejects_nonempty_unmanifested_or_v1_output(tmp_path) -> None:
+def test_converter_rejects_nonempty_unmanifested_or_wrong_version_output(tmp_path) -> None:
     checkpoint, index = _checkpoint(tmp_path)
     cfg = _config()
     output = tmp_path / "nonempty"
     output.mkdir()
     (output / "unknown").write_text("x", encoding="utf-8")
     with pytest.raises(ValueError, match="non-empty but has no manifest"):
-        converter.convert_packed_experts(_args(checkpoint, index, output), config=cfg)
+        converter.convert_experts(_args(checkpoint, index, output), config=cfg)
 
-    output = tmp_path / "v1"
+    output = tmp_path / "wrong_version"
     output.mkdir()
     manifest = {
         "format": EXPERT_CACHE_FORMAT,
-        "version": EXPERT_CACHE_V1,
+        "version": EXPERT_CACHE_VERSION - 1,
         "source_checkpoint": str(checkpoint.resolve()),
         "n_layers": cfg.n_layers,
         "n_routed_experts": cfg.n_routed_experts,
@@ -158,7 +157,7 @@ def test_converter_rejects_nonempty_unmanifested_or_v1_output(tmp_path) -> None:
     }
     (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="version mismatch"):
-        converter.convert_packed_experts(_args(checkpoint, index, output), config=cfg)
+        converter.convert_experts(_args(checkpoint, index, output), config=cfg)
 
 
 def test_atomic_layer_write_preserves_existing_file_when_validation_fails(tmp_path, monkeypatch) -> None:
