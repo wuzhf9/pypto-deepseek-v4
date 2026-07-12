@@ -21,6 +21,7 @@ import torch
 from safetensors.torch import safe_open
 
 from models.config import DeepSeekV4FlashConfig, FLASH_CONFIG
+from serving.expert_cache import ExpertCacheReader
 from serving.runtime_types import HostStagingTensor, RuntimeWeight, RuntimeWeightKey, StagingKind
 
 
@@ -246,6 +247,11 @@ class DeepSeekV4WeightLoader:
         self._layout_cache_bytes = 0
         self._file_handles: dict[Path, Any] = {}
         self._profile_stats: OrderedDict[str, dict[str, float | int]] = OrderedDict()
+        self._expert_cache = ExpertCacheReader(
+            self.expert_cache_dir,
+            config=self.config,
+            profile_callback=self._record_profile,
+        )
 
     @property
     def layout_cache_bytes(self) -> int:
@@ -541,11 +547,19 @@ class DeepSeekV4WeightLoader:
         )
 
         start = time.perf_counter()
-        for slot, expert_id in enumerate(ids):
-            expert = self.get_moe_routed_expert(layer_id, expert_id, device=target)
-            selected_w1_t[slot].copy_(expert.w1_t)
-            selected_w2_t[slot].copy_(expert.w2_t)
-            selected_w3_t[slot].copy_(expert.w3_t)
+        cache_hit = self._expert_cache.copy_selected_into(
+            layer_id,
+            ids,
+            out_w1=selected_w1_t,
+            out_w2=selected_w2_t,
+            out_w3=selected_w3_t,
+        )
+        if not cache_hit:
+            for slot, expert_id in enumerate(ids):
+                expert = self.get_moe_routed_expert(layer_id, expert_id, device=target)
+                selected_w1_t[slot].copy_(expert.w1_t)
+                selected_w2_t[slot].copy_(expert.w2_t)
+                selected_w3_t[slot].copy_(expert.w3_t)
         self._record_profile("selected_experts.build", start)
         return MoESelectedExpertWeights(
             selected_w1_t=HostStagingTensor(
@@ -568,6 +582,15 @@ class DeepSeekV4WeightLoader:
     ) -> MoERoutedPackWeights:
         del release_each_expert
         target = torch.device(device) if device is not None else self.default_device
+
+        cached_pack = self._expert_cache.load_packed_clone(layer_id, device=target)
+        if cached_pack is not None:
+            routed_w1_t, routed_w2_t, routed_w3_t = cached_pack
+            return MoERoutedPackWeights(
+                routed_w1_t=HostStagingTensor(routed_w1_t, StagingKind.PREFILL_ROUTED, "w1_t"),
+                routed_w2_t=HostStagingTensor(routed_w2_t, StagingKind.PREFILL_ROUTED, "w2_t"),
+                routed_w3_t=HostStagingTensor(routed_w3_t, StagingKind.PREFILL_ROUTED, "w3_t"),
+            )
 
         routed_w1_t = torch.empty(
             self.config.n_routed_experts,
@@ -607,6 +630,7 @@ class DeepSeekV4WeightLoader:
         if name is None:
             self._layout_cache.clear()
             self._layout_cache_bytes = 0
+            self._expert_cache.close()
             self._close_file_handles()
             return
         self._release_layout_keys(key for key in self._layout_cache if key[0].name == name)
@@ -702,58 +726,22 @@ class DeepSeekV4WeightLoader:
         self._record_profile("copy_linear_t", start)
 
     def expert_cache_path(self, layer_id: int) -> Path | None:
-        self._validate_layer_id(layer_id)
-        if self.expert_cache_dir is None:
-            return None
-        return self.expert_cache_dir / f"layer_{layer_id:03d}_experts.safetensors"
+        return self._expert_cache.layer_path(layer_id)
 
     def _load_cached_expert(self, layer_id: int, expert_id: int, *, device: torch.device) -> MoERoutedExpertWeights | None:
-        path = self.expert_cache_path(layer_id)
-        if path is None or not path.exists():
+        tensors = self._expert_cache.load_expert(layer_id, expert_id, device=device)
+        if tensors is None:
             return None
-
-        prefix = f"expert_{expert_id:03d}"
-        names = {
-            "w1_t": f"{prefix}.w1_t",
-            "w2_t": f"{prefix}.w2_t",
-            "w3_t": f"{prefix}.w3_t",
-        }
-        start = time.perf_counter()
-        handle = self._get_file_handle(path)
-        keys = set(handle.keys())
-        if any(name not in keys for name in names.values()):
-            return None
-
-        w1_t = self._materialize_cached_tensor(handle.get_tensor(names["w1_t"]), device)
-        w2_t = self._materialize_cached_tensor(handle.get_tensor(names["w2_t"]), device)
-        w3_t = self._materialize_cached_tensor(handle.get_tensor(names["w3_t"]), device)
-        self._record_profile("expert_cache.load", start)
-
-        self._validate_expert_tensor("w1_t", w1_t, (self.config.dim, self.config.moe_inter_dim))
-        self._validate_expert_tensor("w2_t", w2_t, (self.config.moe_inter_dim, self.config.dim))
-        self._validate_expert_tensor("w3_t", w3_t, (self.config.dim, self.config.moe_inter_dim))
+        w1_t, w2_t, w3_t = tensors
         return MoERoutedExpertWeights(
-            w1_t=w1_t.contiguous(),
-            w2_t=w2_t.contiguous(),
-            w3_t=w3_t.contiguous(),
+            w1_t=w1_t,
+            w2_t=w2_t,
+            w3_t=w3_t,
         )
 
     def _validate_layer_id(self, layer_id: int) -> None:
         if not 0 <= layer_id < self.config.n_layers:
             raise ValueError(f"layer_id must be in [0, {self.config.n_layers}), got {layer_id}")
-
-    @staticmethod
-    def _validate_expert_tensor(name: str, tensor: torch.Tensor, shape: tuple[int, ...]) -> None:
-        if tuple(tensor.shape) != shape:
-            raise ValueError(f"{name} expert cache shape mismatch: expected {shape}, got {tuple(tensor.shape)}")
-        if tensor.dtype is not torch.bfloat16:
-            raise TypeError(f"{name} expert cache dtype mismatch: expected torch.bfloat16, got {tensor.dtype}")
-
-    @staticmethod
-    def _materialize_cached_tensor(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-        if device.type == "cpu":
-            return tensor.clone().contiguous()
-        return tensor.to(device).contiguous()
 
     def _load_index(self, weight_index: str | os.PathLike[str] | dict[str, Any] | None) -> dict[str, dict[str, Any]]:
         if weight_index is None:

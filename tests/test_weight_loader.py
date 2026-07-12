@@ -457,6 +457,113 @@ def test_loader_uses_layer_expert_cache_for_expert_selected_and_pack(tmp_path):
     assert torch.equal(_host(packed.routed_w2_t)[1], torch.full((3, 4), 5.0, dtype=torch.bfloat16))
     assert torch.equal(_host(packed.routed_w3_t)[0], torch.full((4, 3), 3.0, dtype=torch.bfloat16))
     assert torch.equal(_host(packed.routed_w3_t)[1], torch.full((4, 3), 6.0, dtype=torch.bfloat16))
+    assert loader._expert_cache.open_handle_count == 1
+
+    loader.close()
+    assert loader._expert_cache.open_handle_count == 0
+
+
+def test_loader_uses_v2_lazy_slices_for_selected_experts(tmp_path, monkeypatch):
+    cfg = _small_config()
+    checkpoint = tmp_path / "ckpt"
+    checkpoint.mkdir()
+    expert_cache_dir = tmp_path / "expert_cache"
+    expert_cache_dir.mkdir()
+    tensors = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": torch.full((3, 4), -1.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.0.down_proj.weight": torch.full((4, 3), -2.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.0.up_proj.weight": torch.full((3, 4), -3.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.gate_proj.weight": torch.full((3, 4), -4.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.down_proj.weight": torch.full((4, 3), -5.0, dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.1.up_proj.weight": torch.full((3, 4), -6.0, dtype=torch.bfloat16),
+    }
+    index = _save_checkpoint(checkpoint, tensors)
+    packed_w1 = torch.stack(
+        [torch.full((4, 3), 1.0, dtype=torch.bfloat16), torch.full((4, 3), 4.0, dtype=torch.bfloat16)]
+    )
+    packed_w2 = torch.stack(
+        [torch.full((3, 4), 2.0, dtype=torch.bfloat16), torch.full((3, 4), 5.0, dtype=torch.bfloat16)]
+    )
+    packed_w3 = torch.stack(
+        [torch.full((4, 3), 3.0, dtype=torch.bfloat16), torch.full((4, 3), 6.0, dtype=torch.bfloat16)]
+    )
+    save_file(
+        {
+            "routed_w1_t": packed_w1,
+            "routed_w2_t": packed_w2,
+            "routed_w3_t": packed_w3,
+        },
+        expert_cache_dir / "layer_000_experts.safetensors",
+    )
+    loader = DeepSeekV4WeightLoader(
+        checkpoint,
+        index,
+        config=cfg,
+        expert_cache_dir=expert_cache_dir,
+        profile=True,
+    )
+
+    def fail_single_expert(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("v2 selected path must not call load_expert")
+
+    monkeypatch.setattr(loader._expert_cache, "load_expert", fail_single_expert)
+    selected = loader.get_layer_moe_selected_experts(0, [1, 0])
+
+    assert torch.equal(_host(selected.selected_w1_t), packed_w1[[1, 0]])
+    assert torch.equal(_host(selected.selected_w2_t), packed_w2[[1, 0]])
+    assert torch.equal(_host(selected.selected_w3_t), packed_w3[[1, 0]])
+    assert selected.selected_w1_t.kind is StagingKind.DECODE_SELECTED
+    assert selected.selected_w1_t.slot == "w1_t"
+    profile = {name: (count, elapsed_ms) for name, count, elapsed_ms in loader.profile_summary()}
+    assert profile["expert_cache.v2.selected_slice_copy"][0] == 1
+    assert profile["selected_experts.build"][0] == 1
+    assert "expert_cache.load" not in profile
+
+
+def test_loader_uses_v2_full_clones_for_routed_pack(tmp_path, monkeypatch):
+    cfg = _small_config()
+    checkpoint = tmp_path / "ckpt"
+    checkpoint.mkdir()
+    expert_cache_dir = tmp_path / "expert_cache"
+    expert_cache_dir.mkdir()
+    index = _save_checkpoint(checkpoint, {})
+    packed_w1 = torch.arange(2 * 4 * 3, dtype=torch.bfloat16).reshape(2, 4, 3)
+    packed_w2 = torch.arange(2 * 3 * 4, dtype=torch.bfloat16).reshape(2, 3, 4) + 100
+    packed_w3 = torch.arange(2 * 4 * 3, dtype=torch.bfloat16).reshape(2, 4, 3) + 200
+    save_file(
+        {
+            "routed_w1_t": packed_w1,
+            "routed_w2_t": packed_w2,
+            "routed_w3_t": packed_w3,
+        },
+        expert_cache_dir / "layer_000_experts.safetensors",
+    )
+    loader = DeepSeekV4WeightLoader(
+        checkpoint,
+        index,
+        config=cfg,
+        expert_cache_dir=expert_cache_dir,
+        profile=True,
+    )
+
+    def fail_single_expert(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("v2 routed pack path must not call load_expert")
+
+    monkeypatch.setattr(loader._expert_cache, "load_expert", fail_single_expert)
+    packed = loader.get_layer_moe_routed_pack(0)
+
+    assert torch.equal(_host(packed.routed_w1_t), packed_w1)
+    assert torch.equal(_host(packed.routed_w2_t), packed_w2)
+    assert torch.equal(_host(packed.routed_w3_t), packed_w3)
+    assert packed.routed_w1_t.kind is StagingKind.PREFILL_ROUTED
+    assert packed.routed_w1_t.slot == "w1_t"
+    profile = {name: (count, elapsed_ms) for name, count, elapsed_ms in loader.profile_summary()}
+    assert profile["expert_cache.v2.packed_clone"][0] == 1
+    assert "expert_cache.v2.prefill_mmap_view" not in profile
+    assert "expert_cache.v2.expert_slice" not in profile
+    assert "expert_cache.load" not in profile
 
 
 def test_official_lowvram_weight_index_smoke_loads_representative_weights():
