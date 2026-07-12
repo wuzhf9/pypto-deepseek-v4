@@ -99,18 +99,13 @@ def test_parse_args_requires_a_prompt_source_and_prefers_literal_prompt(tmp_path
 
     literal_args = generate.parse_args(["--prompt", "literal"])
     file_args = generate.parse_args(["--prompt-file", str(prompt_file)])
-    worker_args = generate.parse_args(["--prompt", "literal", "--backend", "worker"])
 
     assert literal_args.prompt == "literal"
     assert literal_args.prompt_file is None
-    assert literal_args.backend == "worker"
     assert file_args.prompt is None
     assert file_args.prompt_file == prompt_file
-    assert worker_args.backend == "worker"
     with pytest.raises(SystemExit):
         generate.parse_args([])
-    with pytest.raises(SystemExit):
-        generate.parse_args(["--prompt", "literal", "--backend", "direct"])
     both_args = generate.parse_args(["--prompt", "literal", "--prompt-file", str(prompt_file)])
     assert both_args.prompt == "literal"
     assert both_args.prompt_file == prompt_file
@@ -210,7 +205,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
             [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0]],
         ]
     )
-    fake_backend = object()
+    fake_runtime = object()
     captured = {}
 
     class FakeAutoTokenizer:
@@ -233,19 +228,18 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         def close(self):
             fake_runner.close()
 
-    def fake_create_backend(name, *, platform, device_id, runtime_cfg, keep_prefill_routed_staging):
-        captured["backend_factory"] = (
-            name,
+    def fake_device_runtime(*, platform, device_id, runtime_cfg, keep_prefill_routed_staging):
+        captured["runtime"] = (
             platform,
             device_id,
             runtime_cfg,
             keep_prefill_routed_staging,
         )
-        return fake_backend
+        return fake_runtime
 
     monkeypatch.setattr(generate, "AutoTokenizer", FakeAutoTokenizer)
     monkeypatch.setattr(generate, "DeepSeekV4Runner", FakeRunnerClass)
-    monkeypatch.setattr(generate, "create_backend", fake_create_backend)
+    monkeypatch.setattr(generate, "DeviceRuntime", fake_device_runtime)
     monkeypatch.setattr(generate, "load_encoding_helpers", lambda *_args, **_kwargs: _helpers())
 
     args = SimpleNamespace(
@@ -261,7 +255,6 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         temperature=0.0,
         max_seq_len=16,
         max_layers=43,
-        backend="worker",
         platform="a2a3",
         device=0,
         seed=1,
@@ -277,14 +270,13 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
 
     assert captured["tokenizer_path"] == checkpoint
     assert captured["runner_args"] == (str(checkpoint),)
-    assert captured["backend_factory"] == (
-        "worker",
+    assert captured["runtime"] == (
         "a2a3",
         0,
         {"enable_l2_swimlane": False},
         False,
     )
-    assert captured["runner_kwargs"]["backend"] is fake_backend
+    assert captured["runner_kwargs"]["runtime"] is fake_runtime
     assert "platform" not in captured["runner_kwargs"]
     assert "device_id" not in captured["runner_kwargs"]
     assert captured["runner_kwargs"]["expert_cache_dir"] == "cache"
@@ -297,21 +289,21 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
     assert fake_runner.closed is True
 
 
-def test_create_runner_closes_backend_when_runner_initialization_fails(monkeypatch):
-    class FakeBackend:
+def test_create_runner_closes_runtime_when_runner_initialization_fails(monkeypatch):
+    class FakeRuntime:
         def __init__(self):
             self.closed = False
 
         def close(self):
             self.closed = True
 
-    backend = FakeBackend()
+    runtime = FakeRuntime()
 
     class FailingRunner:
         def __init__(self, *_args, **_kwargs):
             raise RuntimeError("runner init failed")
 
-    monkeypatch.setattr(generate, "create_backend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(generate, "DeviceRuntime", lambda **_kwargs: runtime)
     monkeypatch.setattr(generate, "DeepSeekV4Runner", FailingRunner)
     args = SimpleNamespace(
         checkpoint="checkpoint",
@@ -319,7 +311,6 @@ def test_create_runner_closes_backend_when_runner_initialization_fails(monkeypat
         expert_cache_dir=None,
         max_seq_len=16,
         max_layers=1,
-        backend="worker",
         platform="a2a3",
         device=0,
         profile=False,
@@ -329,4 +320,4 @@ def test_create_runner_closes_backend_when_runner_initialization_fails(monkeypat
     with pytest.raises(RuntimeError, match="runner init failed"):
         generate._create_runner(args)
 
-    assert backend.closed is True
+    assert runtime.closed is True

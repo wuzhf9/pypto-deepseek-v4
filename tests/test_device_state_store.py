@@ -4,8 +4,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from serving.backends.device_pool import AllocationCategory, DeviceBufferPool
-from serving.backends.worker_state_store import WorkerStateStore
+from serving.device_pool import AllocationCategory, DeviceBufferPool
+from serving.device_state_store import DeviceStateStore
 from serving.state import DeepSeekV4StatePlan, LayerSpec, LayerStateSchema, StateTensorSpec
 
 
@@ -93,7 +93,7 @@ def _tensor_spec(
 def test_prepare_allocates_initialized_current_and_distinct_next_buffers() -> None:
     worker = _FakeChipWorker()
     pool = DeviceBufferPool(worker)
-    store = WorkerStateStore(pool)
+    store = DeviceStateStore(pool)
     spec = _tensor_spec(init_value=-7)
 
     store.prepare([_schema(spec)])
@@ -109,7 +109,7 @@ def test_prepare_allocates_initialized_current_and_distinct_next_buffers() -> No
 
 def test_commit_validates_all_outputs_before_atomic_swap() -> None:
     pool = DeviceBufferPool(_FakeChipWorker())
-    store = WorkerStateStore(pool)
+    store = DeviceStateStore(pool)
     first = _tensor_spec()
     second = _tensor_spec("scores", input_name="scores", output_name="scores_out")
     store.prepare([_schema(first, second)])
@@ -140,7 +140,7 @@ def test_commit_validates_all_outputs_before_atomic_swap() -> None:
 
 def test_multiple_commits_swap_the_same_two_device_buffers() -> None:
     pool = DeviceBufferPool(_FakeChipWorker())
-    store = WorkerStateStore(pool)
+    store = DeviceStateStore(pool)
     store.prepare([_schema(_tensor_spec())])
     first_current = store.inputs(0)["cache"]
     first_next = store.outputs(0)["cache_out"]
@@ -155,7 +155,7 @@ def test_multiple_commits_swap_the_same_two_device_buffers() -> None:
 
 def test_real_state_plan_ratio_schemas_allocate_expected_pairs_and_initial_values() -> None:
     pool = DeviceBufferPool(_FakeChipWorker())
-    store = WorkerStateStore(pool)
+    store = DeviceStateStore(pool)
     plan = DeepSeekV4StatePlan()
     schemas = [
         plan.layer_state_schema(0),
@@ -200,7 +200,7 @@ def test_prepare_rejects_duplicate_schema_names_before_allocation(
     message: str,
 ) -> None:
     pool = DeviceBufferPool(_FakeChipWorker())
-    store = WorkerStateStore(pool)
+    store = DeviceStateStore(pool)
 
     with pytest.raises(ValueError, match=message):
         store.prepare(schemas)
@@ -210,7 +210,7 @@ def test_prepare_rejects_duplicate_schema_names_before_allocation(
 
 def test_prepare_rejects_second_prepare_and_unknown_layer() -> None:
     pool = DeviceBufferPool(_FakeChipWorker())
-    store = WorkerStateStore(pool)
+    store = DeviceStateStore(pool)
     schema = _schema(_tensor_spec())
     store.prepare([schema])
 
@@ -223,7 +223,7 @@ def test_prepare_rejects_second_prepare_and_unknown_layer() -> None:
 def test_close_frees_state_only_is_idempotent_and_allows_reprepare() -> None:
     worker = _FakeChipWorker()
     pool = DeviceBufferPool(worker)
-    store = WorkerStateStore(pool)
+    store = DeviceStateStore(pool)
     scratch = pool.acquire((3,), torch.float32, category=AllocationCategory.SCRATCH)
     store.prepare([_schema(_tensor_spec())])
 

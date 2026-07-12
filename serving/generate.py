@@ -14,7 +14,7 @@ from typing import Any, Callable, Literal
 import torch
 
 from models.config import FLASH_CONFIG
-from serving.backends.factory import create_backend
+from serving.device_runtime import DeviceRuntime
 from serving.state import DEFAULT_MAX_SEQ_LEN
 
 
@@ -232,7 +232,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     parser.add_argument("--max-layers", type=int, default=FLASH_CONFIG.n_layers)
-    parser.add_argument("--backend", choices=["worker"], default="worker")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--keep-prefill-routed-staging", action="store_true", default=False)
     parser.add_argument("-p", "--platform", type=str, default="a2a3")
@@ -317,8 +316,7 @@ def _create_runner(args: argparse.Namespace) -> Any:
         from serving.runner import DeepSeekV4Runner as _DeepSeekV4Runner
 
         DeepSeekV4Runner = _DeepSeekV4Runner
-    backend = create_backend(
-        args.backend,
+    runtime = DeviceRuntime(
         platform=args.platform,
         device_id=args.device,
         runtime_cfg={"enable_l2_swimlane": getattr(args, "enable_l2_swimlane", False)},
@@ -327,7 +325,7 @@ def _create_runner(args: argparse.Namespace) -> Any:
     try:
         return DeepSeekV4Runner(
             args.checkpoint,
-            backend=backend,
+            runtime=runtime,
             weight_index=args.weight_index,
             max_seq_len=args.max_seq_len,
             max_layers=args.max_layers,
@@ -337,7 +335,7 @@ def _create_runner(args: argparse.Namespace) -> Any:
             expert_cache_dir=args.expert_cache_dir,
         )
     except BaseException:
-        backend.close()
+        runtime.close()
         raise
 
 

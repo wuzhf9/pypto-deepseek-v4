@@ -1287,12 +1287,17 @@ Stage 6 完成判断：43 层 cache 完整性、S=1、S=13、S=1024、四 varian
 - manifest 保留 `version: 2` 以直接消费已完成验证的 516 GiB cache，不重新转换数据；
 - 本地 299 tests 通过；远端 43 层 metadata、单层连续 decode、五层四 variant 通过。
 
-### Stage 7：重新评估 prefetch
+### Stage 7：重新评估 prefetch（已完成）
 
-38. 用 v2 数据更新 `prefill_routed_expert_prefetch_plan.md`；
+38. 用最终 packed cache 数据更新 `prefill_routed_expert_prefetch_plan.md`；
 39. 重新计算 Host load、materialize、kernel overlap；
-40. 只有 v2 后仍有足够 Host exposed time，才开始 V1 prefetch；
-41. format v1 删除和旧 cache 清理由后续独立决策处理。
+40. 判断剩余 Host exposed time 是否值得实现 prefetch；
+41. 记录最终实现决策。
+
+实际结果：S=1/S=1024 cold 理论上限分别为 13.12%/9.01%；考虑 Host clone 与 H2D 的内存带宽竞争，
+现实收益预计约为 4%–9%/2%–6%。Depth=1 会增加约 12 GiB Host anonymous peak，使完整模型最坏 RSS
+从约 549 GiB 上升到约 561 GiB。综合收益、内存和线程/ownership复杂度，当前不实现 Host prefetch；只有
+业务明确需要继续争取约 5% TTFT 时才作为独立优化重启。
 
 ## 11. 远端命令顺序
 

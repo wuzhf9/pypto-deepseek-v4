@@ -1,11 +1,11 @@
-"""Smoke entrypoint for the backend-injected DeepSeek V4 runner."""
+"""Smoke entrypoint for the device-runtime-injected DeepSeek V4 runner."""
 
 import argparse
 
 import torch
 
 from models.config import FLASH_CONFIG
-from serving.backends.factory import create_backend
+from serving.device_runtime import DeviceRuntime
 from serving.runner import DeepSeekV4Runner
 from serving.state import DEFAULT_MAX_SEQ_LEN
 
@@ -18,7 +18,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-s", "--seq-len", type=int, default=1)
     parser.add_argument("--max-layers", type=int, default=1)
-    parser.add_argument("--backend", choices=["worker"], default="worker")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--keep-prefill-routed-staging", action="store_true", default=False)
     parser.add_argument("--no-head", action="store_true", default=False)
@@ -42,8 +41,7 @@ def main(argv: list[str] | None = None) -> int:
 
     torch.manual_seed(args.seed)
     input_ids = torch.randint(0, FLASH_CONFIG.vocab_size, (1, args.seq_len), dtype=torch.int64)
-    backend = create_backend(
-        args.backend,
+    runtime = DeviceRuntime(
         platform=args.platform,
         device_id=args.device,
         runtime_cfg={"enable_l2_swimlane": args.enable_l2_swimlane},
@@ -52,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         runner = DeepSeekV4Runner(
             args.checkpoint,
-            backend=backend,
+            runtime=runtime,
             weight_index=args.weight_index,
             max_layers=args.max_layers,
             run_head=not args.no_head,
@@ -61,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
             expert_cache_dir=args.expert_cache_dir,
         )
     except BaseException:
-        backend.close()
+        runtime.close()
         raise
 
     try:

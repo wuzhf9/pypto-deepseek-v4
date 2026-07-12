@@ -2,17 +2,28 @@
 
 ## 1. 结论
 
-完整 43 层 prefill 中，每层都会构建并上传全部 256 个 routed experts。单层三组 BF16 权重总计
-12 GiB，43 层累计处理约 516 GiB Host pack 和 H2D 数据，是当前 prefill 的主要开销之一。
+Stage 7 已基于最终 packed cache 的 43 层实测 profile 重新评估。每层 Host routed pack 已从旧格式的
+约 3.5–3.8 秒降至约 365–366 毫秒，完整 43 层只剩约 15.7 秒 Host pack 时间。
 
-该路径适合预取，因为第 `L+1` 层的完整 routed expert pack 不依赖第 `L` 层的激活值或路由结果。
-当前实施范围明确收敛为 V1：
+Depth=1 Host-only prefetch 的新理论上限：
 
-1. 实现单后台线程预取下一层 Host routed pack，与当前层 H2D/kernel 重叠；当前仓库可以直接完成。
-2. 不实现 device staging 双缓冲和异步 H2D；该能力受限于当前 PyPTO 同步接口，留作未来方案。
+```text
+S=1 cold       最多节省 15.400 s，prefill 降低 13.12%
+S=1024 cold    最多节省 15.392 s，prefill 降低  9.01%
+```
 
-V1 只能掩盖磁盘读取、tensor materialize 和 Host pack build，不能掩盖同步 H2D。本轮性能目标和验收
-口径均以 V1 能覆盖的 Host load/build exposed time 为准，不把 H2D/kernel overlap 作为完成条件。
+考虑下一层 12 GiB clone 与当前层 12 GiB H2D 的 Host 内存带宽竞争，现实收益预计约为：
+
+```text
+S=1       4%–9%
+S=1024    2%–6%
+```
+
+同时 Host anonymous peak 增加一份 12 GiB pack，完整模型最坏 RSS 会从约 549 GiB 上升到约 561 GiB。
+因此 Stage 7 的最终决策是：**当前不默认实现 Host prefetch**。它仍是一个可行但收益有限的可选优化，只有
+在业务明确需要继续降低约 5% TTFT、服务器 Host 内存有足够余量，并接受专门的多轮 A/B 时才值得实施。
+
+下文 V1/V2 名称保留为 packed cache 完成前的历史方案；以 8.8 节的 Stage 7 数据和第 12 节最终决策为准。
 
 ## 2. 当前串行路径
 
@@ -20,8 +31,8 @@ V1 只能掩盖磁盘读取、tensor materialize 和 Host pack build，不能掩
 
 ```text
 get_layer_moe_routed_pack(layer L)
-  → 读取/clone 256 个专家
-  → 构建 w1_t/w2_t/w3_t Host pack
+  → 从三个 packed mmap tensor 各 clone 一次
+  → 得到 w1_t/w2_t/w3_t Host pack
   → WorkerBackend.materialize()
   → 同步 H2D 到三块 staging buffer
   → ChipWorker.run()
@@ -286,10 +297,10 @@ workspace、allocator 碎片和异步重叠使用。静态预算可行，但必�
 
 ### 8.1 当前 profile 口径
 
-V1 实现前已在远端完成无 L2 swimlane 的 5 层和完整 43 层基线采集。当前已有指标：
+最终 packed cache 已完成无 L2 swimlane 的完整 43 层基线采集。当前指标：
 
 - `layer.values.routed_pack`：完整 Host routed pack load/build 时间；
-- `expert_cache.load`：其中 256 个 expert tensor 从 safetensors cache materialize 的累计时间；
+- `expert_cache.routed_pack`：三个完整 packed tensor 的 clone 时间；
 - `layer.materialize`：当前层所有 device materialize 时间；
 - `layer.kernel`：分别报告 compile、run 和 cache hit；
 - `prefill.total`：完整 prefill wall time。
@@ -298,6 +309,9 @@ V1 实现前已在远端完成无 L2 swimlane 的 5 层和完整 43 层基线采
 H2D 的保守时间上界，不是纯 `STAGING_ROUTED` copy 时间。S=1/S=1024 的 materialize 平均值接近，且
 每层 routed pack 固定为 12 GiB，因此当前数据已足够估算 V1 可利用的流水窗口；实现 V1 时再补充按
 allocation category 细分的 copy profile。
+
+8.2–8.7 节保留 packed cache 完成前的旧基线、旧收益模型与未来异步 H2D 背景，不再作为当前实现决策；
+当前结论以 8.8 节为准。
 
 后续目标指标：
 
@@ -463,6 +477,78 @@ V1 核心验收：
 - S=1、S=13、S=1024、S=4096 和完整 43 层均通过；
 - 异常路径、event wait、slot swap 和 close 不泄漏 allocation。
 
+### 8.8 Stage 7：最终 packed cache 重新评估
+
+数据来源：
+
+```text
+S=1     task_20260712_030300_63703418429
+S=1024  task_20260712_031200_72525616419
+43 layers, no-head, decode-steps=0, profile, no L2 swimlane
+```
+
+实测分解：
+
+| 指标 | S=1 | S=1024 |
+|---|---:|---:|
+| prefill total | 117.360 s | 170.903 s |
+| Host routed pack 总计 | 15.746 s | 15.714 s |
+| Host routed pack 平均/层 | 366.182 ms | 365.437 ms |
+| Host routed pack min–max | 309.071–442.611 ms | 314.262–430.283 ms |
+| materialize 总计 | 27.393 s | 29.670 s |
+| materialize 平均/层 | 637.042 ms | 690.009 ms |
+| materialize min–max | 409.249–1,351.169 ms | 590.568–1,455.770 ms |
+| kernel elapsed 总计 | 36.293 s | 92.586 s |
+| kernel run 总计 | 19.376 s | 73.574 s |
+| compile 总计 | 16.912 s | 19.004 s |
+
+沿用 depth=1 公式：
+
+```text
+saving[L] = min(host_pack[L + 1], materialize[L] + kernel[L])
+```
+
+结果中 42/42 个后续 Host pack 都能在理想模型中被当前层 materialize 单独完全覆盖，不需要额外依赖 kernel
+窗口。第一层 Host pack 不可隐藏，因此最大节省恰好接近 layer 1–42 Host pack 之和：
+
+| 场景 | Baseline | 最大节省 | Ideal | 降低 | 加速比 |
+|---|---:|---:|---:|---:|---:|
+| S=1 cold | 117.360 s | 15.400 s | 101.960 s | 13.12% | 1.151x |
+| S=1 去 compile | 100.448 s | 15.400 s | 85.049 s | 15.33% | 1.181x |
+| S=1024 cold | 170.903 s | 15.392 s | 155.512 s | 9.01% | 1.099x |
+| S=1024 去 compile | 151.899 s | 15.392 s | 136.508 s | 10.13% | 1.113x |
+
+该上限明显低于旧 per-expert cache 阶段 S=1024 的 26%–28%，不能继续使用旧目标作为实现依据。
+
+#### Host 带宽竞争敏感性
+
+当前 12 GiB packed clone 的等效 Host 带宽约为 32.8 GiB/s；materialize 的 12 GiB routed H2D 上界对应
+约 17–19 GiB/s。两者重叠会同时读取 Host 内存，且 clone 还写入 12 GiB anonymous output，因此不能假设
+后台 clone 对 materialize 完全无影响。
+
+假设 prefetch 完全隐藏 Host pack，但使 materialize 总时间增加一定比例，净收益为：
+
+| materialize 变慢 | S=1 净降低 | S=1024 净降低 |
+|---:|---:|---:|
+| 10% | 10.84% | 7.31% |
+| 20% | 8.56% | 5.61% |
+| 30% | 6.27% | 3.92% |
+| 40% | 3.99% | 2.22% |
+| 50% | 1.71% | 0.53% |
+
+S=1/S=1024 的理论 break-even materialize slowdown 分别约为 57.5%/53.1%。因此实现大概率不会负收益，
+但在敏感性分析假设的 20%–40% 带宽干扰范围内，S=1024 只剩约 2%–6% 收益。
+
+#### 内存与工程成本
+
+- 当前层完成同步 H2D 前仍持有 12 GiB Host pack；同时预取下一层必然把 anonymous peak 增加到约 24 GiB；
+- 43 层 file-backed pages、固定 Host layout 和 runtime 不变，实测约 549 GiB RSS 上再增加约 12 GiB；
+- 需要独立 Reader/file handles、bounded future、异常传播、Runner values 拆分以及 close 测试；
+- H2D bytes 仍为 516 GiB，device staging 和 kernel 时间不减少；
+- decode selected expert 无法跨层提前确定，不受该优化影响。
+
+综合收益、内存和实现复杂度，Host prefetch 从“推荐实现”降级为“有明确 TTFT 需求时再实现”。
+
 ## 9. 测试计划
 
 ### 9.1 本地 Fake 测试
@@ -492,13 +578,15 @@ V1 核心验收：
 
 ## 10. 实施顺序
 
-### Phase 1：补齐 profile（基线已完成）
+### Phase 1：旧格式 profile（历史基线已完成）
 
 1. 已采集未预取的 5 层、43 层 S=1 和 43 层 S=1024 基线；
 2. 已确认 Host routed pack 是主要 exposed time，S=1024 V1 理论上限约 26%–28%；
 3. V1 实现时补充 Host pack build、prefetch wait 和按 category H2D 指标。
 
-### Phase 2：V1 Host prefetch
+### Phase 2：Host prefetch（Stage 7 决定暂不启动）
+
+以下仅作为未来重启时的实施清单：
 
 4. 新增 bounded `RoutedExpertPrefetcher`；
 5. 为 routed expert path 建立线程安全或独立 file-handle 边界；
@@ -531,8 +619,15 @@ V1 核心验收：
 
 ## 12. 推荐决策
 
-当前只实现 V1 Host prefetch，并用 profile 判断其覆盖比例。这一阶段改动可控、不依赖 PyPTO 新接口，
-且能直接验证 256-expert Host load/build 是否能被当前层 kernel 掩盖。
+当前不实现 Host routed pack prefetch，Stage 7 以完成收益重估和记录决策结束。原因：
 
-V1 完成后即结束本轮优化。即使 H2D 仍是主要瓶颈，也只记录 profile 结果，不在当前仓库继续实现 V2。
-当前同步 ChipWorker API 下，禁止用普通 Python 线程并发调用 `copy_to()` 和 `run()` 来伪造异步流水。
+1. S=1024 cold 理论上限只有 9.01%，现实预计约 2%–6%；
+2. S=1 理论上限 13.12%，现实预计约 4%–9%；
+3. 增加约 12 GiB Host anonymous peak，完整模型最坏 RSS 接近 561 GiB；
+4. 需要新的线程、Reader ownership、future 异常与 Runner 调度边界，复杂度与收益不再匹配。
+
+如果未来业务确认 5% 左右 TTFT 也具有足够价值，可把本方案作为独立优化重新启动，并必须先做 5 层
+memory-bandwidth A/B；只有 materialize slowdown 小于约 30% 且完整 wall time 符合预期，才扩大到 43 层。
+
+异步 H2D 仍受限于 PyPTO 接口。当前同步 ChipWorker API 下，禁止用普通 Python 线程并发调用
+`copy_to()` 和 `run()` 来伪造设备 copy/compute overlap。

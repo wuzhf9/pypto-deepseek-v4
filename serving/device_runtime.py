@@ -1,4 +1,4 @@
-"""ChipWorker serving backend with device-resident runtime values."""
+"""Device-resident serving runtime backed by one ChipWorker."""
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -8,17 +8,17 @@ from typing import Any
 import torch
 
 from models.golden import TensorSpec
-from serving.backends.base import KernelBindings, KernelCase
-from serving.backends.device_pool import AllocationCategory, DeviceBufferPool, DeviceLease
-from serving.backends.worker_state_store import WorkerStateStore
-from serving.runtime_types import HostStagingTensor, RuntimeWeight, RuntimeWeightKey, StagingKind, StepContext
+from serving.device_pool import AllocationCategory, DeviceBufferPool, DeviceLease
+from serving.device_state_store import DeviceStateStore
+from serving.runtime_types import HostStagingTensor, KernelCase, RuntimeWeight, RuntimeWeightKey, StagingKind, StepContext
 from serving.state import LayerStateSchema
 
 
 @dataclass
-class WorkerKernelBindings(KernelBindings):
-    """Worker bindings plus the leases owned by this dispatch."""
+class KernelBindings:
+    """Device tensors and leases owned by one kernel dispatch."""
 
+    tensors: Mapping[str, Any]
     scratch_leases: tuple[DeviceLease, ...] = ()
     transient_leases: tuple[DeviceLease, ...] = ()
     consumed_leases: tuple[DeviceLease, ...] = ()
@@ -26,8 +26,8 @@ class WorkerKernelBindings(KernelBindings):
     consumed: bool = False
 
 
-class WorkerBackend:
-    """Execute kernels through one long-lived ChipWorker."""
+class DeviceRuntime:
+    """Execute serving kernels through one long-lived ChipWorker."""
 
     def __init__(
         self,
@@ -52,7 +52,7 @@ class WorkerBackend:
         )
         self._worker = worker_factory(self._run_config)
         self._pool = DeviceBufferPool(self._worker)
-        self._state_store = WorkerStateStore(self._pool)
+        self._state_store = DeviceStateStore(self._pool)
         self._compiled: dict[tuple[str, tuple[tuple[int, ...], ...], tuple[torch.dtype, ...]], Any] = {}
         self._fixed_weights: dict[RuntimeWeightKey, DeviceLease] = {}
         self._owned_leases: dict[int, DeviceLease] = {}
@@ -74,7 +74,7 @@ class WorkerBackend:
         self,
         specs: list[TensorSpec],
         values: Mapping[str, Any],
-    ) -> WorkerKernelBindings:
+    ) -> KernelBindings:
         self._require_active_step()
         tensors: dict[str, Any] = {}
         scratch_leases: list[DeviceLease] = []
@@ -111,11 +111,11 @@ class WorkerBackend:
             else:
                 missing_required.append(spec.name)
         if missing_required:
-            raise KeyError(f"Missing backend tensors for required inputs: {missing_required}")
+            raise KeyError(f"Missing runtime tensors for required inputs: {missing_required}")
         for spec in specs:
             if spec.is_output and spec.name not in output_tensors:
                 output_tensors[spec.name] = tensors[spec.name]
-        return WorkerKernelBindings(
+        return KernelBindings(
             tensors=tensors,
             scratch_leases=tuple(scratch_leases),
             transient_leases=tuple(transient_leases),
@@ -130,10 +130,10 @@ class WorkerBackend:
         bindings: KernelBindings,
     ) -> dict[str, Any]:
         self._require_active_step()
-        if not isinstance(bindings, WorkerKernelBindings):
-            raise TypeError(f"WorkerBackend requires WorkerKernelBindings, got {type(bindings)!r}")
+        if not isinstance(bindings, KernelBindings):
+            raise TypeError(f"DeviceRuntime requires KernelBindings, got {type(bindings)!r}")
         if bindings.consumed:
-            raise RuntimeError("WorkerKernelBindings have already been consumed")
+            raise RuntimeError("KernelBindings have already been consumed")
         bindings.consumed = True
 
         start = time.perf_counter()
@@ -152,13 +152,13 @@ class WorkerBackend:
     def begin_step(self, context: StepContext) -> None:
         self._require_open()
         if self._active_step is not None:
-            raise RuntimeError(f"backend step already active: {self._active_step.kind.value}")
+            raise RuntimeError(f"runtime step already active: {self._active_step.kind.value}")
         self._active_step = context
 
     def end_step(self) -> None:
         self._require_open()
         if self._active_step is None:
-            raise RuntimeError("backend step is not active")
+            raise RuntimeError("runtime step is not active")
         self._cleanup_step()
 
     def read_control(self, tensor: Any) -> torch.Tensor:
@@ -288,7 +288,7 @@ class WorkerBackend:
         self._require_active_step()
         lease = self._owned_leases.get(id(tensor))
         if lease is None or lease.tensor is not tensor:
-            raise ValueError("tensor is not owned by this WorkerBackend")
+            raise ValueError("tensor is not owned by this DeviceRuntime")
         return self._pool.copy_from(lease)
 
     def _release_tensor_if_step_owned(self, tensor: Any) -> None:
@@ -348,12 +348,12 @@ class WorkerBackend:
 
     def _require_open(self) -> None:
         if self._closed:
-            raise RuntimeError("WorkerBackend is closed")
+            raise RuntimeError("DeviceRuntime is closed")
 
     def _require_active_step(self) -> None:
         self._require_open()
         if self._active_step is None:
-            raise RuntimeError("backend step is not active")
+            raise RuntimeError("runtime step is not active")
 
     @staticmethod
     def _validate_host_tensor(
@@ -393,4 +393,4 @@ class WorkerBackend:
             raise TypeError(f"{spec.name} dtype mismatch: expected {spec.dtype}, got {dtype}")
 
 
-__all__ = ["WorkerBackend", "WorkerKernelBindings"]
+__all__ = ["DeviceRuntime", "KernelBindings"]

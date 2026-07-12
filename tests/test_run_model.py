@@ -1,4 +1,4 @@
-"""Tests for the backend composition in the runner smoke entrypoint."""
+"""Tests for device runtime composition in the runner smoke entrypoint."""
 
 import pytest
 import torch
@@ -6,7 +6,7 @@ import torch
 from serving import run_model
 
 
-class _FakeBackend:
+class _FakeRuntime:
     def __init__(self) -> None:
         self.close_calls = 0
 
@@ -14,13 +14,13 @@ class _FakeBackend:
         self.close_calls += 1
 
 
-def test_run_model_creates_backend_outside_runner_and_injects_it(monkeypatch) -> None:
-    backend = _FakeBackend()
+def test_run_model_creates_runtime_outside_runner_and_injects_it(monkeypatch) -> None:
+    runtime = _FakeRuntime()
     captured = {}
 
-    def fake_create_backend(name, *, platform, device_id, runtime_cfg, keep_prefill_routed_staging):
-        captured["factory"] = (name, platform, device_id, runtime_cfg, keep_prefill_routed_staging)
-        return backend
+    def fake_device_runtime(*, platform, device_id, runtime_cfg, keep_prefill_routed_staging):
+        captured["runtime"] = (platform, device_id, runtime_cfg, keep_prefill_routed_staging)
+        return runtime
 
     class FakeRunner:
         def __init__(self, *args, **kwargs):
@@ -31,9 +31,9 @@ def test_run_model_creates_backend_outside_runner_and_injects_it(monkeypatch) ->
             return torch.zeros(1, 1, 4, 8, dtype=torch.bfloat16)
 
         def close(self):
-            backend.close()
+            runtime.close()
 
-    monkeypatch.setattr(run_model, "create_backend", fake_create_backend)
+    monkeypatch.setattr(run_model, "DeviceRuntime", fake_device_runtime)
     monkeypatch.setattr(run_model, "DeepSeekV4Runner", FakeRunner)
 
     result = run_model.main(
@@ -52,17 +52,17 @@ def test_run_model_creates_backend_outside_runner_and_injects_it(monkeypatch) ->
     )
 
     assert result == 0
-    assert captured["factory"] == ("worker", "a2a3", 2, {"enable_l2_swimlane": True}, False)
+    assert captured["runtime"] == ("a2a3", 2, {"enable_l2_swimlane": True}, False)
     assert captured["runner_args"] == ("checkpoint",)
-    assert captured["runner_kwargs"]["backend"] is backend
+    assert captured["runner_kwargs"]["runtime"] is runtime
     assert "platform" not in captured["runner_kwargs"]
     assert "device_id" not in captured["runner_kwargs"]
-    assert backend.close_calls == 1
+    assert runtime.close_calls == 1
 
 
-def test_run_model_closes_backend_when_runner_initialization_fails(monkeypatch) -> None:
-    backend = _FakeBackend()
-    monkeypatch.setattr(run_model, "create_backend", lambda *_args, **_kwargs: backend)
+def test_run_model_closes_runtime_when_runner_initialization_fails(monkeypatch) -> None:
+    runtime = _FakeRuntime()
+    monkeypatch.setattr(run_model, "DeviceRuntime", lambda **_kwargs: runtime)
 
     class FailingRunner:
         def __init__(self, *_args, **_kwargs):
@@ -73,9 +73,4 @@ def test_run_model_closes_backend_when_runner_initialization_fails(monkeypatch) 
     with pytest.raises(RuntimeError, match="runner init failed"):
         run_model.main(["--checkpoint", "checkpoint"])
 
-    assert backend.close_calls == 1
-
-
-def test_run_model_rejects_removed_direct_backend() -> None:
-    with pytest.raises(SystemExit):
-        run_model.parse_args(["--backend", "direct"])
+    assert runtime.close_calls == 1

@@ -6,11 +6,11 @@ import pytest
 import torch
 
 from models.golden import TensorSpec
-from serving.backends.base import KernelCase
-from serving.backends.device_pool import AllocationCategory
-from serving.backends.worker_backend import WorkerBackend, WorkerKernelBindings
+from serving.device_pool import AllocationCategory
+from serving.device_runtime import DeviceRuntime, KernelBindings
 from serving.runtime_types import (
     HostStagingTensor,
+    KernelCase,
     RuntimeWeight,
     RuntimeWeightKey,
     StagingKind,
@@ -107,7 +107,7 @@ class _EmbeddingJitFn:
         return compiled
 
 
-def _backend(*, keep_prefill_routed_staging: bool = False) -> tuple[WorkerBackend, _FakeChipWorker, dict[str, Any]]:
+def _runtime(*, keep_prefill_routed_staging: bool = False) -> tuple[DeviceRuntime, _FakeChipWorker, dict[str, Any]]:
     runtime_config: dict[str, Any] = {}
     worker_holder: dict[str, _FakeChipWorker] = {}
 
@@ -120,7 +120,7 @@ def _backend(*, keep_prefill_routed_staging: bool = False) -> tuple[WorkerBacken
         worker_holder["worker"] = worker
         return worker
 
-    backend = WorkerBackend(
+    runtime = DeviceRuntime(
         platform="test",
         device_id=3,
         runtime_cfg={"enable_l2_swimlane": True},
@@ -128,7 +128,7 @@ def _backend(*, keep_prefill_routed_staging: bool = False) -> tuple[WorkerBacken
         worker_factory=worker_factory,
         run_config_factory=run_config_factory,
     )
-    return backend, worker_holder["worker"], runtime_config
+    return runtime, worker_holder["worker"], runtime_config
 
 
 def _embedding_specs(seq_len: int = 2) -> list[TensorSpec]:
@@ -145,32 +145,32 @@ def _weight() -> RuntimeWeight:
 
 
 def _run_embedding_step(
-    backend: WorkerBackend,
+    runtime: DeviceRuntime,
     case: KernelCase,
     input_ids: torch.Tensor,
     weight: RuntimeWeight,
     *,
     start_pos: int,
 ) -> torch.Tensor:
-    backend.begin_step(StepContext(StepKind.PREFILL, input_ids.shape[1], start_pos))
+    runtime.begin_step(StepContext(StepKind.PREFILL, input_ids.shape[1], start_pos))
     try:
         specs = _embedding_specs(input_ids.shape[1])
-        bindings = backend.materialize(specs, {"input_ids": input_ids, "weight": weight})
-        outputs = backend.run(case, specs, bindings)
-        return backend.export_output(outputs["out"])
+        bindings = runtime.materialize(specs, {"input_ids": input_ids, "weight": weight})
+        outputs = runtime.run(case, specs, bindings)
+        return runtime.export_output(outputs["out"])
     finally:
-        backend.end_step()
+        runtime.end_step()
 
 
 def test_embedding_slice_reuses_fixed_weight_compile_and_step_buffers() -> None:
-    backend, worker, runtime_config = _backend()
+    runtime, worker, runtime_config = _runtime()
     jit_fn = _EmbeddingJitFn()
     case = KernelCase("embedding", jit_fn, _embedding_specs)
     weight = _weight()
 
-    first = _run_embedding_step(backend, case, torch.tensor([[1, 3]]), weight, start_pos=0)
-    first_stats = backend.pool_stats
-    second = _run_embedding_step(backend, case, torch.tensor([[2, 0]]), weight, start_pos=2)
+    first = _run_embedding_step(runtime, case, torch.tensor([[1, 3]]), weight, start_pos=0)
+    first_stats = runtime.pool_stats
+    second = _run_embedding_step(runtime, case, torch.tensor([[2, 0]]), weight, start_pos=2)
 
     torch.testing.assert_close(first, weight.host_tensor[torch.tensor([[1, 3]])].unsqueeze(2))
     torch.testing.assert_close(second, weight.host_tensor[torch.tensor([[2, 0]])].unsqueeze(2))
@@ -178,48 +178,48 @@ def test_embedding_slice_reuses_fixed_weight_compile_and_step_buffers() -> None:
     assert worker.config is runtime_config
     assert len(jit_fn.compile_calls) == 1
     assert len(worker.run_calls) == 2
-    assert backend.last_compile_cache_hit is True
+    assert runtime.last_compile_cache_hit is True
     assert first_stats.category_bytes[AllocationCategory.FIXED_WEIGHT] == weight.host_tensor.numel() * 4
-    assert backend.pool_stats.category_bytes[AllocationCategory.FIXED_WEIGHT] == weight.host_tensor.numel() * 4
-    assert backend.pool_stats.reuse_count == 2
-    assert backend.pool_stats.in_use_count == 1
+    assert runtime.pool_stats.category_bytes[AllocationCategory.FIXED_WEIGHT] == weight.host_tensor.numel() * 4
+    assert runtime.pool_stats.reuse_count == 2
+    assert runtime.pool_stats.in_use_count == 1
 
 
 def test_materialize_reuses_same_raw_host_tensor_within_step() -> None:
-    backend, _, _ = _backend()
+    runtime, _, _ = _runtime()
     host = torch.tensor([1.0, 2.0])
     specs = [
         TensorSpec("left", [2], torch.float32, init_value=torch.zeros(2)),
         TensorSpec("right", [2], torch.float32, init_value=torch.zeros(2)),
     ]
-    backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+    runtime.begin_step(StepContext(StepKind.PREFILL, 1, 0))
 
-    bindings = backend.materialize(specs, {"left": host, "right": host})
+    bindings = runtime.materialize(specs, {"left": host, "right": host})
 
     assert bindings.tensors["left"] is bindings.tensors["right"]
-    backend.end_step()
+    runtime.end_step()
 
 
 def test_materialize_validates_required_host_values() -> None:
-    backend, _, _ = _backend()
+    runtime, _, _ = _runtime()
     required = TensorSpec("required", [2], torch.float32, init_value=torch.ones(2))
-    backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+    runtime.begin_step(StepContext(StepKind.PREFILL, 1, 0))
     try:
-        with pytest.raises(KeyError, match="Missing backend tensors.*required"):
-            backend.materialize([required], {})
+        with pytest.raises(KeyError, match="Missing runtime tensors.*required"):
+            runtime.materialize([required], {})
         with pytest.raises(ValueError, match="required shape mismatch"):
-            backend.materialize([required], {"required": torch.zeros(3)})
+            runtime.materialize([required], {"required": torch.zeros(3)})
         with pytest.raises(TypeError, match="Host tensor or DeviceTensor-compatible"):
-            backend.materialize([required], {"required": object()})
+            runtime.materialize([required], {"required": object()})
     finally:
-        backend.end_step()
+        runtime.end_step()
 
 
 def test_prefill_staging_reuses_within_step_and_frees_at_step_end() -> None:
-    backend, worker, _ = _backend()
+    runtime, worker, _ = _runtime()
     spec = TensorSpec("weight", [2], torch.float32, init_value=torch.zeros(2))
     staging = HostStagingTensor(torch.ones(2), StagingKind.PREFILL_ROUTED, "w1_t")
-    backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+    runtime.begin_step(StepContext(StepKind.PREFILL, 1, 0))
 
     class JitFn:
         def compile(self, *args: torch.Tensor, config: Any) -> Any:
@@ -231,38 +231,38 @@ def test_prefill_staging_reuses_within_step_and_frees_at_step_end() -> None:
             return compiled
 
     case = KernelCase("staging", JitFn(), lambda: [spec])
-    first = backend.materialize([spec], {"weight": staging})
+    first = runtime.materialize([spec], {"weight": staging})
     first_tensor = first.tensors["weight"]
-    backend.run(case, [spec], first)
-    second = backend.materialize([spec], {"weight": staging})
-    backend.run(case, [spec], second)
+    runtime.run(case, [spec], first)
+    second = runtime.materialize([spec], {"weight": staging})
+    runtime.run(case, [spec], second)
 
     assert second.tensors["weight"] is first_tensor
-    assert backend.pool_stats.reuse_count == 1
-    assert backend.pool_stats.category_bytes[AllocationCategory.STAGING_ROUTED] == staging.host_tensor.numel() * 4
-    backend.end_step()
-    assert AllocationCategory.STAGING_ROUTED not in backend.pool_stats.category_bytes
+    assert runtime.pool_stats.reuse_count == 1
+    assert runtime.pool_stats.category_bytes[AllocationCategory.STAGING_ROUTED] == staging.host_tensor.numel() * 4
+    runtime.end_step()
+    assert AllocationCategory.STAGING_ROUTED not in runtime.pool_stats.category_bytes
     assert first_tensor.data_ptr not in worker.allocated
 
 
 def test_prefill_staging_can_be_kept_idle_across_steps() -> None:
-    backend, worker, _ = _backend(keep_prefill_routed_staging=True)
+    runtime, worker, _ = _runtime(keep_prefill_routed_staging=True)
     spec = TensorSpec("weight", [2], torch.float32, init_value=torch.zeros(2))
     staging = HostStagingTensor(torch.ones(2), StagingKind.PREFILL_ROUTED, "w1_t")
-    backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
-    bindings = backend.materialize([spec], {"weight": staging})
+    runtime.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+    bindings = runtime.materialize([spec], {"weight": staging})
     device_tensor = bindings.tensors["weight"]
-    backend.end_step()
+    runtime.end_step()
 
-    assert backend.pool_stats.category_bytes[AllocationCategory.STAGING_ROUTED] == staging.host_tensor.numel() * 4
+    assert runtime.pool_stats.category_bytes[AllocationCategory.STAGING_ROUTED] == staging.host_tensor.numel() * 4
     assert device_tensor.data_ptr in worker.allocated
-    backend.close()
+    runtime.close()
     assert worker.allocated == {}
 
 
 def test_block_dispatch_returns_prebound_outputs_and_releases_consumed_intermediate() -> None:
-    backend, _, _ = _backend()
-    backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+    runtime, _, _ = _runtime()
+    runtime.begin_step(StepContext(StepKind.PREFILL, 1, 0))
 
     class ProducerJit:
         def compile(self, *args: torch.Tensor, config: Any) -> Any:
@@ -275,8 +275,8 @@ def test_block_dispatch_returns_prebound_outputs_and_releases_consumed_intermedi
             return compiled
 
     producer_specs = [TensorSpec("out", [2], torch.float32, is_output=True)]
-    producer_bindings = backend.materialize(producer_specs, {})
-    hidden = backend.run(KernelCase("producer", ProducerJit(), lambda: producer_specs), producer_specs, producer_bindings)[
+    producer_bindings = runtime.materialize(producer_specs, {})
+    hidden = runtime.run(KernelCase("producer", ProducerJit(), lambda: producer_specs), producer_specs, producer_bindings)[
         "out"
     ]
     state_out = _FakeDeviceTensor(torch.zeros(2, dtype=torch.float32))
@@ -308,22 +308,22 @@ def test_block_dispatch_returns_prebound_outputs_and_releases_consumed_intermedi
         TensorSpec("cache_out", [2], torch.float32, is_output=True),
         TensorSpec("out", [2], torch.float32, is_output=True),
     ]
-    block_bindings = backend.materialize(
+    block_bindings = runtime.materialize(
         block_specs,
         {"x": hidden, "routed_w1_t": routed, "cache_out": state_out},
     )
-    outputs = backend.run(KernelCase("block", BlockJit(), lambda: block_specs), block_specs, block_bindings)
+    outputs = runtime.run(KernelCase("block", BlockJit(), lambda: block_specs), block_specs, block_bindings)
 
     assert outputs["cache_out"] is state_out
     assert torch.equal(state_out.backing, torch.full((2,), 2.0))
-    torch.testing.assert_close(backend.export_output(outputs["out"]), torch.full((2,), 3.0))
-    assert backend.pool_stats.in_use_count == 0
-    backend.end_step()
-    assert AllocationCategory.STAGING_ROUTED not in backend.pool_stats.category_bytes
+    torch.testing.assert_close(runtime.export_output(outputs["out"]), torch.full((2,), 3.0))
+    assert runtime.pool_stats.in_use_count == 0
+    runtime.end_step()
+    assert AllocationCategory.STAGING_ROUTED not in runtime.pool_stats.category_bytes
 
 
 def test_selected_decode_reads_control_and_keeps_pre_post_intermediates_on_device() -> None:
-    backend, _, _ = _backend()
+    runtime, _, _ = _runtime()
 
     class PreJit:
         def compile(self, *args: torch.Tensor, config: Any) -> Any:
@@ -377,18 +377,18 @@ def test_selected_decode_reads_control_and_keeps_pre_post_intermediates_on_devic
     post_case = KernelCase("selected_post", PostJit(), lambda: post_specs)
 
     def run_step(value: float, start_pos: int) -> torch.Tensor:
-        backend.begin_step(StepContext(StepKind.DECODE, 1, start_pos))
+        runtime.begin_step(StepContext(StepKind.DECODE, 1, start_pos))
         try:
-            pre_bindings = backend.materialize(pre_specs, {"x": torch.full((2,), value)})
-            pre_outputs = backend.run(pre_case, pre_specs, pre_bindings)
-            indices = backend.read_control(pre_outputs["indices"])
+            pre_bindings = runtime.materialize(pre_specs, {"x": torch.full((2,), value)})
+            pre_outputs = runtime.run(pre_case, pre_specs, pre_bindings)
+            indices = runtime.read_control(pre_outputs["indices"])
             assert torch.equal(indices, torch.tensor([1, 0], dtype=torch.int32))
             selected = HostStagingTensor(
                 torch.full((2,), value + 1),
                 StagingKind.DECODE_SELECTED,
                 "w1_t",
             )
-            post_bindings = backend.materialize(
+            post_bindings = runtime.materialize(
                 post_specs,
                 {
                     "ffn_normed": pre_outputs["ffn_normed"],
@@ -396,28 +396,28 @@ def test_selected_decode_reads_control_and_keeps_pre_post_intermediates_on_devic
                     "selected_w1_t": selected,
                 },
             )
-            post_outputs = backend.run(post_case, post_specs, post_bindings)
+            post_outputs = runtime.run(post_case, post_specs, post_bindings)
             # The final output and the step-scoped raw input remain active.
-            assert backend.pool_stats.in_use_count == 2
-            return backend.export_output(post_outputs["out"])
+            assert runtime.pool_stats.in_use_count == 2
+            return runtime.export_output(post_outputs["out"])
         finally:
-            backend.end_step()
+            runtime.end_step()
 
     first = run_step(2.0, 1)
-    reuse_after_first = backend.pool_stats.reuse_count
+    reuse_after_first = runtime.pool_stats.reuse_count
     second = run_step(4.0, 2)
 
     torch.testing.assert_close(first, torch.full((2,), 5.25))
     torch.testing.assert_close(second, torch.full((2,), 9.25))
-    assert backend.pool_stats.reuse_count > reuse_after_first
-    assert backend.pool_stats.category_bytes[AllocationCategory.STAGING_SELECTED] == 2 * 4
-    assert backend.pool_stats.in_use_count == 0
+    assert runtime.pool_stats.reuse_count > reuse_after_first
+    assert runtime.pool_stats.category_bytes[AllocationCategory.STAGING_SELECTED] == 2 * 4
+    assert runtime.pool_stats.in_use_count == 0
     expected_d2h = 2 * ((2 * 4) + (2 * 4))
-    assert backend.pool_stats.d2h_bytes == expected_d2h
+    assert runtime.pool_stats.d2h_bytes == expected_d2h
 
 
 def test_worker_bindings_are_single_use_and_scratch_is_released() -> None:
-    backend, _, _ = _backend()
+    runtime, _, _ = _runtime()
 
     class JitFn:
         def compile(self, *args: torch.Tensor, config: Any) -> Any:
@@ -432,32 +432,32 @@ def test_worker_bindings_are_single_use_and_scratch_is_released() -> None:
         TensorSpec("scratch", [2], torch.float32),
         TensorSpec("out", [2], torch.float32, is_output=True),
     ]
-    backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
-    bindings = backend.materialize(specs, {})
-    assert isinstance(bindings, WorkerKernelBindings)
+    runtime.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+    bindings = runtime.materialize(specs, {})
+    assert isinstance(bindings, KernelBindings)
 
-    backend.run(KernelCase("scratch", JitFn(), lambda: specs), specs, bindings)
+    runtime.run(KernelCase("scratch", JitFn(), lambda: specs), specs, bindings)
     with pytest.raises(RuntimeError, match="already been consumed"):
-        backend.run(KernelCase("scratch", JitFn(), lambda: specs), specs, bindings)
-    assert backend.pool_stats.in_use_count == 1
-    backend.end_step()
-    assert backend.pool_stats.in_use_count == 0
+        runtime.run(KernelCase("scratch", JitFn(), lambda: specs), specs, bindings)
+    assert runtime.pool_stats.in_use_count == 1
+    runtime.end_step()
+    assert runtime.pool_stats.in_use_count == 0
 
 
 def test_close_cleans_active_step_state_and_worker_once() -> None:
-    backend, worker, _ = _backend()
-    backend.prepare_state([])
-    backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
-    backend.materialize(
+    runtime, worker, _ = _runtime()
+    runtime.prepare_state([])
+    runtime.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+    runtime.materialize(
         [TensorSpec("input", [1], torch.float32, init_value=torch.zeros(1))],
         {"input": torch.ones(1)},
     )
 
-    backend.close()
-    backend.close()
+    runtime.close()
+    runtime.close()
 
     assert worker.allocated == {}
     assert worker.close_calls == 1
-    assert backend.pool_stats.current_bytes == 0
+    assert runtime.pool_stats.current_bytes == 0
     with pytest.raises(RuntimeError, match="closed"):
-        backend.begin_step(StepContext(StepKind.PREFILL, 1, 0))
+        runtime.begin_step(StepContext(StepKind.PREFILL, 1, 0))

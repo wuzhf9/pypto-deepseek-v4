@@ -1,4 +1,4 @@
-"""Tests for the backend contract and runner orchestration."""
+"""Tests for the device runtime contract and runner orchestration."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -7,10 +7,9 @@ import pytest
 import torch
 
 from models.golden import TensorSpec
-from serving.backends.base import KernelBindings, KernelCase
-from serving.backends.factory import create_backend
+from serving.device_runtime import KernelBindings
 from serving.profiler import ProfileRecorder
-from serving.runtime_types import StepContext, StepKind
+from serving.runtime_types import KernelCase, StepContext, StepKind
 from serving.runner import DeepSeekV4Runner
 from serving.state import LayerSpec
 
@@ -19,7 +18,7 @@ class _OpaqueTensor:
     pass
 
 
-class _DelegatingBackend:
+class _FakeRuntime:
     def __init__(self) -> None:
         self.output = _OpaqueTensor()
         self.state_input = _OpaqueTensor()
@@ -64,62 +63,62 @@ class _DelegatingBackend:
 
 def test_runner_delegates_embedding_materialize_and_keeps_opaque_output() -> None:
     runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
-    backend = _DelegatingBackend()
+    runtime = _FakeRuntime()
     weight = object()
-    runner.backend = backend
+    runner.runtime = runtime
     runner.profiler = ProfileRecorder(enabled=False)
     runner.weight_loader = SimpleNamespace(get_embedding_weight=lambda: weight)
     input_ids = torch.tensor([[1]], dtype=torch.int64)
 
     output = runner._run_embedding(input_ids)
 
-    assert output is backend.output
-    assert len(backend.materialize_calls) == 1
-    _, values = backend.materialize_calls[0]
+    assert output is runtime.output
+    assert len(runtime.materialize_calls) == 1
+    _, values = runtime.materialize_calls[0]
     assert values == {"input_ids": input_ids, "weight": weight}
-    assert len(backend.run_bindings) == 1
-    assert isinstance(backend.run_bindings[0], KernelBindings)
+    assert len(runtime.run_bindings) == 1
+    assert isinstance(runtime.run_bindings[0], KernelBindings)
 
 
 def test_runner_exports_only_at_public_output_boundary(monkeypatch) -> None:
     runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
-    backend = _DelegatingBackend()
-    runner.backend = backend
+    runtime = _FakeRuntime()
+    runner.runtime = runtime
     runner.state_plan = SimpleNamespace(max_seq_len=8)
     runner.profiler = ProfileRecorder(enabled=False)
     runner.max_layers = 0
     runner.run_head = False
-    monkeypatch.setattr(runner, "_run_embedding", lambda _input_ids: backend.output)
+    monkeypatch.setattr(runner, "_run_embedding", lambda _input_ids: runtime.output)
 
     output = runner.prefill(torch.tensor([[1]], dtype=torch.int64))
 
     torch.testing.assert_close(output, torch.tensor([7.0]))
-    assert backend.export_calls == [backend.output]
-    assert backend.begin_step_calls == [StepContext(kind=StepKind.PREFILL, seq_len=1, start_pos=0)]
-    assert backend.end_step_calls == 1
+    assert runtime.export_calls == [runtime.output]
+    assert runtime.begin_step_calls == [StepContext(kind=StepKind.PREFILL, seq_len=1, start_pos=0)]
+    assert runtime.end_step_calls == 1
 
 
-def test_runner_wraps_decode_in_backend_step(monkeypatch) -> None:
+def test_runner_wraps_decode_in_runtime_step(monkeypatch) -> None:
     runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
-    backend = _DelegatingBackend()
-    runner.backend = backend
+    runtime = _FakeRuntime()
+    runner.runtime = runtime
     runner.state_plan = SimpleNamespace(max_seq_len=8)
     runner.profiler = ProfileRecorder(enabled=False)
     runner.max_layers = 0
     runner.run_head = False
-    monkeypatch.setattr(runner, "_run_embedding", lambda _input_ids: backend.output)
+    monkeypatch.setattr(runner, "_run_embedding", lambda _input_ids: runtime.output)
 
     output = runner.decode(torch.tensor([[1]], dtype=torch.int64), start_pos=3)
 
     torch.testing.assert_close(output, torch.tensor([7.0]))
-    assert backend.begin_step_calls == [StepContext(kind=StepKind.DECODE, seq_len=1, start_pos=3)]
-    assert backend.end_step_calls == 1
+    assert runtime.begin_step_calls == [StepContext(kind=StepKind.DECODE, seq_len=1, start_pos=3)]
+    assert runtime.end_step_calls == 1
 
 
 def test_runner_ends_step_when_execution_fails(monkeypatch) -> None:
     runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
-    backend = _DelegatingBackend()
-    runner.backend = backend
+    runtime = _FakeRuntime()
+    runner.runtime = runtime
     runner.state_plan = SimpleNamespace(max_seq_len=8)
     runner.profiler = ProfileRecorder(enabled=False)
     runner.max_layers = 0
@@ -133,29 +132,29 @@ def test_runner_ends_step_when_execution_fails(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="embedding failed"):
         runner.prefill(torch.tensor([[1]], dtype=torch.int64))
 
-    assert len(backend.begin_step_calls) == 1
-    assert backend.end_step_calls == 1
+    assert len(runtime.begin_step_calls) == 1
+    assert runtime.end_step_calls == 1
 
 
 def test_runner_does_not_end_step_when_begin_fails(monkeypatch) -> None:
     runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
-    backend = _DelegatingBackend()
-    backend.fail_begin = True
-    runner.backend = backend
+    runtime = _FakeRuntime()
+    runtime.fail_begin = True
+    runner.runtime = runtime
     runner.state_plan = SimpleNamespace(max_seq_len=8)
     runner.profiler = ProfileRecorder(enabled=False)
     runner.max_layers = 0
     runner.run_head = False
-    monkeypatch.setattr(runner, "_run_embedding", lambda _input_ids: backend.output)
+    monkeypatch.setattr(runner, "_run_embedding", lambda _input_ids: runtime.output)
 
     with pytest.raises(RuntimeError, match="begin failed"):
         runner.prefill(torch.tensor([[1]], dtype=torch.int64))
 
-    assert backend.begin_step_calls == []
-    assert backend.end_step_calls == 0
+    assert runtime.begin_step_calls == []
+    assert runtime.end_step_calls == 0
 
 
-def test_runner_reads_selected_expert_indices_through_backend() -> None:
+def test_runner_reads_selected_expert_indices_through_runtime() -> None:
     runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
     device_indices = _OpaqueTensor()
     host_indices = torch.tensor([[[1, 3, 5, 7, 9, 11]]], dtype=torch.int32)
@@ -167,7 +166,7 @@ def test_runner_reads_selected_expert_indices_through_backend() -> None:
         selected_calls.append((layer_id, indices))
         return selected
 
-    runner.backend = SimpleNamespace(read_control=lambda tensor: host_indices if tensor is device_indices else None)
+    runner.runtime = SimpleNamespace(read_control=lambda tensor: host_indices if tensor is device_indices else None)
     runner.weight_loader = SimpleNamespace(
         get_layer_moe_shared=lambda _layer_id: shared,
         get_layer_moe_selected_experts=get_selected,
@@ -188,13 +187,13 @@ def test_runner_reads_selected_expert_indices_through_backend() -> None:
     assert values["selected_w1_t"] is selected.selected_w1_t
 
 
-def test_runner_adds_backend_state_bindings_to_prefill_and_decode_values(monkeypatch) -> None:
+def test_runner_adds_runtime_state_bindings_to_prefill_and_decode_values(monkeypatch) -> None:
     runner = DeepSeekV4Runner.__new__(DeepSeekV4Runner)
-    backend = _DelegatingBackend()
+    runtime = _FakeRuntime()
     layer_spec = LayerSpec(layer_id=0, ratio=0, hash_route=True)
     shared = SimpleNamespace(shared_w1_t=object(), shared_w2_t=object(), shared_w3_t=object())
     routed = SimpleNamespace(routed_w1_t=object(), routed_w2_t=object(), routed_w3_t=object())
-    runner.backend = backend
+    runner.runtime = runtime
     runner.profiler = ProfileRecorder(enabled=False)
     runner.state_plan = SimpleNamespace(
         layer_spec=lambda _layer_id: layer_spec,
@@ -216,46 +215,9 @@ def test_runner_adds_backend_state_bindings_to_prefill_and_decode_values(monkeyp
     prefill_values = runner._prefill_block_values(0, hidden, input_ids=input_ids)
     decode_values = runner._decode_pre_moe_values(0, hidden, input_ids=input_ids, start_pos=1)
 
-    assert prefill_values["cache_out"] is backend.state_output
+    assert prefill_values["cache_out"] is runtime.state_output
     assert "cache" not in prefill_values
-    assert decode_values["cache"] is backend.state_input
-    assert decode_values["cache_out"] is backend.state_output
-    assert backend.state_input_calls == [0]
-    assert backend.state_output_calls == [0, 0]
-
-
-def test_factory_creates_worker_backend(monkeypatch) -> None:
-    import serving.backends.worker_backend as worker_backend
-
-    captured: dict[str, Any] = {}
-
-    class FakeWorkerBackend:
-        def __init__(self, **kwargs: Any) -> None:
-            captured.update(kwargs)
-
-    monkeypatch.setattr(worker_backend, "WorkerBackend", FakeWorkerBackend)
-
-    backend = create_backend(
-        "worker",
-        platform="a2a3",
-        device_id=1,
-        runtime_cfg={"enable_l2_swimlane": True},
-    )
-
-    assert isinstance(backend, FakeWorkerBackend)
-    assert captured == {
-        "platform": "a2a3",
-        "device_id": 1,
-        "runtime_cfg": {"enable_l2_swimlane": True},
-        "keep_prefill_routed_staging": False,
-    }
-
-
-def test_factory_rejects_unknown_backend() -> None:
-    with pytest.raises(ValueError, match="unsupported backend: 'unknown'"):
-        create_backend("unknown", platform="a2a3", device_id=0)  # type: ignore[arg-type]
-
-
-def test_factory_rejects_removed_direct_backend() -> None:
-    with pytest.raises(ValueError, match="unsupported backend: 'direct'"):
-        create_backend("direct", platform="a2a3", device_id=0)  # type: ignore[arg-type]
+    assert decode_values["cache"] is runtime.state_input
+    assert decode_values["cache_out"] is runtime.state_output
+    assert runtime.state_input_calls == [0]
+    assert runtime.state_output_calls == [0, 0]

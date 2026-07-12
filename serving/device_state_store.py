@@ -1,15 +1,15 @@
-"""Device-resident mutable state storage for the worker backend."""
+"""Device-resident mutable state storage for serving execution."""
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from serving.backends.device_pool import AllocationCategory, DeviceBufferPool, DeviceLease
+from serving.device_pool import AllocationCategory, DeviceBufferPool, DeviceLease
 from serving.state import LayerStateSchema, StateTensorSpec
 
 
 @dataclass
-class WorkerStatePair:
+class DeviceStatePair:
     """One mutable state tensor backed by swappable device leases."""
 
     spec: StateTensorSpec
@@ -17,24 +17,24 @@ class WorkerStatePair:
     next: DeviceLease
 
 
-class WorkerStateStore:
+class DeviceStateStore:
     """Own per-layer device state as current/next allocation pairs."""
 
     def __init__(self, pool: DeviceBufferPool) -> None:
         self._pool = pool
-        self._layers: dict[int, dict[str, WorkerStatePair]] = {}
+        self._layers: dict[int, dict[str, DeviceStatePair]] = {}
         self._prepared = False
 
     def prepare(self, schemas: Sequence[LayerStateSchema]) -> None:
         if self._prepared:
-            raise RuntimeError("WorkerStateStore is already prepared")
+            raise RuntimeError("DeviceStateStore is already prepared")
         self._validate_schemas(schemas)
 
-        layers: dict[int, dict[str, WorkerStatePair]] = {}
+        layers: dict[int, dict[str, DeviceStatePair]] = {}
         allocated: list[DeviceLease] = []
         try:
             for schema in schemas:
-                pairs: dict[str, WorkerStatePair] = {}
+                pairs: dict[str, DeviceStatePair] = {}
                 for tensor_spec in schema.tensors:
                     current = self._pool.allocate_persistent(
                         tensor_spec.shape,
@@ -49,7 +49,7 @@ class WorkerStateStore:
                         category=AllocationCategory.STATE,
                     )
                     allocated.append(next_buffer)
-                    pairs[tensor_spec.name] = WorkerStatePair(
+                    pairs[tensor_spec.name] = DeviceStatePair(
                         spec=tensor_spec,
                         current=current,
                         next=next_buffer,
@@ -114,13 +114,13 @@ class WorkerStateStore:
                 input_names.add(tensor_spec.input_name)
                 output_names.add(tensor_spec.output_name)
 
-    def _layer(self, layer_id: int) -> dict[str, WorkerStatePair]:
+    def _layer(self, layer_id: int) -> dict[str, DeviceStatePair]:
         if not self._prepared:
-            raise RuntimeError("WorkerStateStore is not prepared")
+            raise RuntimeError("DeviceStateStore is not prepared")
         try:
             return self._layers[layer_id]
         except KeyError as exc:
             raise ValueError(f"No state schema for layer {layer_id}") from exc
 
 
-__all__ = ["WorkerStatePair", "WorkerStateStore"]
+__all__ = ["DeviceStatePair", "DeviceStateStore"]

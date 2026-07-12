@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 import torch
 
-from serving.backends.device_pool import AllocationCategory, DeviceBufferPool
+from serving.device_pool import AllocationCategory, DeviceBufferPool
 
 
 @dataclass(eq=False)

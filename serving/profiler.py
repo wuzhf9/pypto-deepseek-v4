@@ -49,7 +49,7 @@ class ProfileRecorder:
             self._record(name, start, **fields)
 
     @contextmanager
-    def backend_timer(self, name: str, backend: Any, **fields: Any) -> Iterator[None]:
+    def runtime_timer(self, name: str, runtime: Any, **fields: Any) -> Iterator[None]:
         if not self.enabled:
             yield
             return
@@ -57,7 +57,7 @@ class ProfileRecorder:
         try:
             yield
         finally:
-            self._record_backend(name, start, backend, **fields)
+            self._record_runtime(name, start, runtime, **fields)
 
     def record_weight_loader(self, name: str, weight_loader: Any, **fields: Any) -> None:
         if not self.enabled:
@@ -74,11 +74,11 @@ class ProfileRecorder:
         suffix = f" {details}" if details else ""
         print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms{suffix}", flush=True)
 
-    def _record_backend(self, name: str, start: float, backend: Any, **fields: Any) -> None:
+    def _record_runtime(self, name: str, start: float, runtime: Any, **fields: Any) -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        compile_ms = getattr(backend, "last_compile_seconds", 0.0) * 1000.0
-        run_ms = getattr(backend, "last_run_seconds", 0.0) * 1000.0
-        cache_hit = getattr(backend, "last_compile_cache_hit", False)
+        compile_ms = getattr(runtime, "last_compile_seconds", 0.0) * 1000.0
+        run_ms = getattr(runtime, "last_run_seconds", 0.0) * 1000.0
+        cache_hit = getattr(runtime, "last_compile_cache_hit", False)
         details = _format_fields(
             {
                 **fields,

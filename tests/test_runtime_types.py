@@ -5,12 +5,25 @@ import torch
 
 from serving.runtime_types import (
     HostStagingTensor,
+    KernelCase,
     RuntimeWeight,
     RuntimeWeightKey,
     StagingKind,
     StepContext,
     StepKind,
 )
+
+
+def test_kernel_case_preserves_entrypoint_and_spec_builder() -> None:
+    fn = object()
+    spec_builder = object()
+    case = KernelCase("block", fn, spec_builder)
+
+    assert case.name == "block"
+    assert case.fn is fn
+    assert case.spec_builder is spec_builder
+    with pytest.raises(FrozenInstanceError):
+        case.name = "other"
 
 
 def test_runtime_weight_key_separates_layout_metadata() -> None:
@@ -42,7 +55,7 @@ def test_runtime_values_preserve_host_tensor_identity_and_are_frozen() -> None:
         weight.key = key
 
 
-def test_step_context_is_backend_neutral_value() -> None:
+def test_step_context_preserves_runtime_lifetime_fields() -> None:
     context = StepContext(kind=StepKind.DECODE, seq_len=1, start_pos=7)
 
     assert context.kind is StepKind.DECODE

@@ -11,7 +11,7 @@ import torch
 
 
 class AllocationCategory(Enum):
-    """Lifetime category for a WorkerBackend-owned device allocation."""
+    """Lifetime category for a DeviceRuntime-owned device allocation."""
 
     FIXED_WEIGHT = "fixed_weight"
     STATE = "state"
@@ -71,7 +71,7 @@ class _AllocationRecord:
 class DeviceBufferPool:
     """Own and reuse DeviceTensors allocated by one ChipWorker.
 
-    The pool never closes the worker itself.  The owning WorkerBackend must
+    The pool never closes the worker itself.  The owning DeviceRuntime must
     close this pool before calling ``ChipWorker.close()``.
     """
 
