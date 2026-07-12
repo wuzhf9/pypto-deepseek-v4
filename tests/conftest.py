@@ -1,9 +1,11 @@
 """Shared host-only stubs and helpers for importing kernel modules in tests."""
 
+import os
 import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -11,6 +13,31 @@ import torch.nn.functional as F
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def pytest_addoption(parser) -> None:
+    parser.addoption(
+        "--official-checkpoint",
+        action="store",
+        default=os.environ.get("DSV4_OFFICIAL_CHECKPOINT"),
+        help=(
+            "Path to the official DeepSeek V4 checkpoint. Defaults to "
+            "$DSV4_OFFICIAL_CHECKPOINT or ../deepseek_v4_flash."
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
+def official_checkpoint_path(request) -> Path:
+    configured = request.config.getoption("--official-checkpoint")
+    path = Path(configured).expanduser() if configured else REPO_ROOT.parent / "deepseek_v4_flash"
+    index = path / "model.safetensors.index.json"
+    if not index.is_file():
+        pytest.skip(
+            f"Official checkpoint is not available at {path}; "
+            "pass --official-checkpoint or set DSV4_OFFICIAL_CHECKPOINT"
+        )
+    return path
 
 
 def pytest_configure():

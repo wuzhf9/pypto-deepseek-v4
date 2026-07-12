@@ -1,6 +1,5 @@
 from dataclasses import replace
 import json
-from pathlib import Path
 
 import pytest
 import torch
@@ -52,13 +51,6 @@ def _write_expert_manifest(directory, cfg, *, layers=(0,)) -> None:
         },
     }
     (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-
-
-def _official_checkpoint_path():
-    path = Path(__file__).resolve().parents[2] / "deepseek_v4_flash"
-    if not (path / "model.safetensors.index.json").exists():
-        pytest.skip(f"Official checkpoint is not available at {path}")
-    return path
 
 
 def _host(value: RuntimeWeight | HostStagingTensor) -> torch.Tensor:
@@ -557,13 +549,9 @@ def test_loader_uses_full_pack_for_prefill(tmp_path):
     assert profile["expert_cache.routed_pack"][0] == 1
 
 
-def test_official_lowvram_weight_index_smoke_loads_representative_weights():
-    checkpoint = _official_checkpoint_path()
-    weight_index = checkpoint / "bf16_lowvram_cache" / "weight_index.json"
-    if not weight_index.exists():
-        pytest.skip(f"Official low-vram weight index is not available at {weight_index}")
-
-    loader = DeepSeekV4WeightLoader(checkpoint, weight_index)
+def test_official_checkpoint_smoke_loads_representative_weights(official_checkpoint_path):
+    checkpoint = official_checkpoint_path
+    loader = DeepSeekV4WeightLoader(checkpoint)
 
     hc = loader.get_layer_hc(0)
     assert _host(hc.attn_hc_fn_t).shape == (FLASH_CONFIG.hc_dim, FLASH_CONFIG.mix_hc_dim)
@@ -631,8 +619,8 @@ def test_official_lowvram_weight_index_smoke_loads_representative_weights():
     assert _host(selected.selected_w1_t).dtype is torch.bfloat16
 
 
-def test_official_raw_safetensors_index_infers_quantized_weight_kind():
-    checkpoint = _official_checkpoint_path()
+def test_official_raw_safetensors_index_infers_quantized_weight_kind(official_checkpoint_path):
+    checkpoint = official_checkpoint_path
     loader = DeepSeekV4WeightLoader(checkpoint, checkpoint / "model.safetensors.index.json")
 
     q_a_t = _host(loader._get_transposed_weight("layers.0.attn.wq_a.weight", cache=False))

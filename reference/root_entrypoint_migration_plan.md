@@ -54,6 +54,10 @@ state 和 expert cache 实现。
 │   ├── state.py
 │   └── weight_loader.py
 └── tests/
+    ├── conftest.py
+    ├── models/
+    ├── serving/
+    └── cli/
 ```
 
 迁移后的命令为：
@@ -91,9 +95,9 @@ python -m serving.convert_expert_cache ...
 
 | 文件 | 修改内容 |
 |---|---|
-| `tests/test_generate.py` | `from serving import generate` 改为 `import generate` |
-| `tests/test_run_model.py` | 移动为 `tests/test_smoke_model.py`，并改为 `import smoke_model` |
-| `tests/test_convert_expert_cache.py` | 移动为 `tests/test_export_expert_cache.py`，并改为 `import export_expert_cache as exporter` |
+| `tests/test_generate.py` | 移动为 `tests/cli/test_generate.py`，并改为 `import generate` |
+| `tests/test_run_model.py` | 移动为 `tests/cli/test_smoke_model.py`，并改为 `import smoke_model` |
+| `tests/test_convert_expert_cache.py` | 移动为 `tests/cli/test_export_expert_cache.py`，并改为 `import export_expert_cache as exporter` |
 
 ### 3.3 可能更新的活跃文档
 
@@ -188,7 +192,7 @@ from serving.weight_loader import DeepSeekV4WeightLoader, tensor_nbytes
 - cache format/version、packed keys 和 manifest schema 不变；
 - 不触碰已有 cache 数据格式。
 
-### 4.4 `tests/test_generate.py`
+### 4.4 `tests/cli/test_generate.py`
 
 只切换被测模块 import：
 
@@ -212,7 +216,7 @@ monkeypatch 目标继续使用根模块属性，例如：
 monkeypatch.setattr(generate, "DeviceRuntime", ...)
 ```
 
-### 4.5 `tests/test_smoke_model.py`
+### 4.5 `tests/cli/test_smoke_model.py`
 
 import 改为：
 
@@ -222,7 +226,7 @@ import smoke_model
 
 保留 runtime 构造、Runner 注入、checkpoint 校验前置和异常关闭测试。所有 monkeypatch 目标改为根模块。
 
-### 4.6 `tests/test_export_expert_cache.py`
+### 4.6 `tests/cli/test_export_expert_cache.py`
 
 import 改为：
 
@@ -252,23 +256,23 @@ import export_expert_cache as exporter
 ### Stage 1：迁移 generate 入口
 
 1. 将 `serving/generate.py` 移动到根目录 `generate.py`；
-2. 修改 `tests/test_generate.py` import；
-3. 运行 `tests/test_generate.py`；
+2. 将测试移动为 `tests/cli/test_generate.py` 并修改 import；
+3. 运行 `tests/cli/test_generate.py`；
 4. 运行 `python generate.py --help`；
 5. 搜索 `serving.generate` 和 `serving/generate.py` 的生产代码/测试残留。
 
 ### Stage 2：迁移并重命名 smoke_model 入口
 
 6. 将 `serving/run_model.py` 移动并重命名为根目录 `smoke_model.py`；
-7. 将 `tests/test_run_model.py` 移动为 `tests/test_smoke_model.py`，并修改 import；
-8. 运行 `tests/test_smoke_model.py`；
+7. 将 `tests/test_run_model.py` 移动为 `tests/cli/test_smoke_model.py`，并修改 import；
+8. 运行 `tests/cli/test_smoke_model.py`；
 9. 运行 `python smoke_model.py --help`；
 10. 搜索 `serving.run_model` 和 `serving/run_model.py` 的生产代码/测试残留。
 
 ### Stage 3：迁移并重命名 expert cache exporter 入口
 
 11. 将 `serving/convert_expert_cache.py` 移动并重命名为根目录 `export_expert_cache.py`；
-12. 将 `tests/test_convert_expert_cache.py` 移动为 `tests/test_export_expert_cache.py`，并修改 import；
+12. 将 `tests/test_convert_expert_cache.py` 移动为 `tests/cli/test_export_expert_cache.py`，并修改 import；
 13. 运行 exporter 单元测试；
 14. 运行 `python export_expert_cache.py --help`；
 15. 搜索 `serving.convert_expert_cache` 和 `serving/convert_expert_cache.py` 残留。
@@ -310,18 +314,18 @@ python -m compileall -q \
   generate.py \
   smoke_model.py \
   export_expert_cache.py \
-  tests/test_generate.py \
-  tests/test_smoke_model.py \
-  tests/test_export_expert_cache.py
+  tests/cli/test_generate.py \
+  tests/cli/test_smoke_model.py \
+  tests/cli/test_export_expert_cache.py
 ```
 
 ### 7.2 定向测试
 
 ```bash
 pytest -q \
-  tests/test_generate.py \
-  tests/test_smoke_model.py \
-  tests/test_export_expert_cache.py
+  tests/cli/test_generate.py \
+  tests/cli/test_smoke_model.py \
+  tests/cli/test_export_expert_cache.py
 ```
 
 ### 7.3 完整测试
