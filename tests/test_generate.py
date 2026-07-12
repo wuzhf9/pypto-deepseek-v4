@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from official import encoding_dsv4
 from serving import generate
 
 
@@ -91,6 +92,14 @@ def test_resolve_prompt_text_reports_missing_file(tmp_path):
     with pytest.raises(ValueError, match="one of"):
         generate.resolve_prompt_text(None, None)
     assert generate.resolve_prompt_text("literal", tmp_path / "missing.txt") == "literal"
+
+
+def test_load_encoding_helpers_defaults_to_official_module() -> None:
+    helpers = generate.load_encoding_helpers()
+
+    assert helpers.encode_messages is encoding_dsv4.encode_messages
+    assert helpers.eos_token == encoding_dsv4.eos_token
+    assert helpers.parse_message_from_completion_text is encoding_dsv4.parse_message_from_completion_text
 
 
 def test_parse_args_requires_a_prompt_source_and_prefers_literal_prompt(tmp_path, capsys):
@@ -246,7 +255,6 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         checkpoint=str(checkpoint),
         weight_index=None,
         tokenizer_path=None,
-        encoding_path=None,
         expert_cache_dir="cache",
         prompt="hello",
         prompt_file=None,

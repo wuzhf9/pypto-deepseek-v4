@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import importlib.util
 from pathlib import Path
 import sys
 import time
-from types import ModuleType
 from typing import Any, Callable, Literal
 
 import torch
 
 from models.config import FLASH_CONFIG
+from official.encoding_dsv4 import (
+    encode_messages as official_encode_messages,
+    eos_token as official_eos_token,
+    parse_message_from_completion_text as official_parse_message_from_completion_text,
+)
 from serving.device_runtime import DeviceRuntime
 from serving.state import DEFAULT_MAX_SEQ_LEN
 
@@ -61,16 +64,11 @@ def resolve_tokenizer_path(checkpoint_path: str | Path, tokenizer_path: str | Pa
     )
 
 
-def load_encoding_helpers(
-    checkpoint_path: str | Path,
-    *,
-    encoding_path: str | Path | None = None,
-) -> EncodingHelpers:
-    module = _load_encoding_module(checkpoint_path, encoding_path=encoding_path)
+def load_encoding_helpers() -> EncodingHelpers:
     return EncodingHelpers(
-        encode_messages=module.encode_messages,
-        eos_token=module.eos_token,
-        parse_message_from_completion_text=module.parse_message_from_completion_text,
+        encode_messages=official_encode_messages,
+        eos_token=official_eos_token,
+        parse_message_from_completion_text=official_parse_message_from_completion_text,
     )
 
 
@@ -165,7 +163,7 @@ def generate_ids(
 
 def run_generation(args: argparse.Namespace) -> GenerationResult:
     tokenizer = _load_tokenizer(resolve_tokenizer_path(args.checkpoint, args.tokenizer_path))
-    helpers = load_encoding_helpers(args.checkpoint, encoding_path=args.encoding_path)
+    helpers = load_encoding_helpers()
     prompt = resolve_prompt_text(args.prompt, args.prompt_file)
     prompt_ids, prompt_text = encode_prompt(
         tokenizer,
@@ -223,7 +221,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, default="../deepseek_v4_flash")
     parser.add_argument("--weight-index", type=str, default=None)
     parser.add_argument("--tokenizer-path", type=str, default=None)
-    parser.add_argument("--encoding-path", type=str, default=None)
     parser.add_argument("--expert-cache-dir", type=str, default=None)
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file", type=Path)
@@ -263,42 +260,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.stats:
         print_stats(result)
     return 0
-
-
-def _load_encoding_module(
-    checkpoint_path: str | Path,
-    *,
-    encoding_path: str | Path | None,
-) -> ModuleType:
-    candidates = _encoding_candidates(checkpoint_path, encoding_path)
-    for candidate in candidates:
-        module_path = candidate / "encoding_dsv4.py" if candidate.is_dir() else candidate
-        if module_path.exists():
-            spec = importlib.util.spec_from_file_location("dsv4_encoding_dsv4", module_path)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"Could not load encoding module from {module_path}")
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
-    searched = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"Could not find encoding_dsv4.py; searched: {searched}")
-
-
-def _encoding_candidates(
-    checkpoint_path: str | Path,
-    encoding_path: str | Path | None,
-) -> list[Path]:
-    if encoding_path is not None:
-        return [Path(encoding_path)]
-
-    checkpoint = Path(checkpoint_path)
-    repo_root = Path(__file__).resolve().parents[1]
-    return [
-        checkpoint / "encoding",
-        checkpoint,
-        repo_root.parent / "deepseek_v4_flash" / "encoding",
-        Path.cwd().parent / "deepseek_v4_flash" / "encoding",
-    ]
 
 
 def _load_tokenizer(tokenizer_path: Path) -> Any:
