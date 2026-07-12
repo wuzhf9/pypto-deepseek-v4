@@ -45,13 +45,15 @@ def _checkpoint(tmp_path):
             tensors[f"{prefix}.down_proj.weight"] = torch.full((4, 3), base + 2, dtype=torch.bfloat16)
             tensors[f"{prefix}.up_proj.weight"] = torch.full((3, 4), base + 4, dtype=torch.bfloat16)
     save_file(tensors, checkpoint / "model.safetensors")
-    return checkpoint, {"weight_map": {name: "model.safetensors" for name in tensors}}
+    index = {"weight_map": {name: "model.safetensors" for name in tensors}}
+    (checkpoint / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+    (checkpoint / "tokenizer.json").write_text("{}", encoding="utf-8")
+    return checkpoint, index
 
 
-def _args(checkpoint, index, output, **overrides):
+def _args(checkpoint, output, **overrides):
     values = {
         "checkpoint": str(checkpoint),
-        "weight_index": index,
         "output": str(output),
         "layers": "0",
         "overwrite": False,
@@ -98,11 +100,11 @@ def test_build_packed_layer_places_experts_on_first_dimension(tmp_path) -> None:
 
 
 def test_converter_writes_manifest_and_round_trips_one_layer(tmp_path) -> None:
-    checkpoint, index = _checkpoint(tmp_path)
+    checkpoint, _ = _checkpoint(tmp_path)
     output = tmp_path / "packed"
     cfg = _config()
 
-    converter.convert_experts(_args(checkpoint, index, output), config=cfg)
+    converter.convert_experts(_args(checkpoint, output), config=cfg)
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["format"] == EXPERT_CACHE_FORMAT
@@ -119,10 +121,10 @@ def test_converter_writes_manifest_and_round_trips_one_layer(tmp_path) -> None:
 
 
 def test_converter_skips_valid_existing_layer_without_overwrite(tmp_path, capsys) -> None:
-    checkpoint, index = _checkpoint(tmp_path)
+    checkpoint, _ = _checkpoint(tmp_path)
     output = tmp_path / "packed"
     cfg = _config()
-    args = _args(checkpoint, index, output)
+    args = _args(checkpoint, output)
     converter.convert_experts(args, config=cfg)
     path = output / layer_expert_cache_filename(0)
     before = path.stat().st_mtime_ns
@@ -134,13 +136,13 @@ def test_converter_skips_valid_existing_layer_without_overwrite(tmp_path, capsys
 
 
 def test_converter_rejects_nonempty_unmanifested_or_wrong_version_output(tmp_path) -> None:
-    checkpoint, index = _checkpoint(tmp_path)
+    checkpoint, _ = _checkpoint(tmp_path)
     cfg = _config()
     output = tmp_path / "nonempty"
     output.mkdir()
     (output / "unknown").write_text("x", encoding="utf-8")
     with pytest.raises(ValueError, match="non-empty but has no manifest"):
-        converter.convert_experts(_args(checkpoint, index, output), config=cfg)
+        converter.convert_experts(_args(checkpoint, output), config=cfg)
 
     output = tmp_path / "wrong_version"
     output.mkdir()
@@ -157,7 +159,7 @@ def test_converter_rejects_nonempty_unmanifested_or_wrong_version_output(tmp_pat
     }
     (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="version mismatch"):
-        converter.convert_experts(_args(checkpoint, index, output), config=cfg)
+        converter.convert_experts(_args(checkpoint, output), config=cfg)
 
 
 def test_atomic_layer_write_preserves_existing_file_when_validation_fails(tmp_path, monkeypatch) -> None:
@@ -188,5 +190,19 @@ def test_cli_does_not_accept_partial_experts_argument() -> None:
                 "output",
                 "--experts",
                 "0",
+            ]
+        )
+
+
+def test_cli_does_not_accept_weight_index_argument() -> None:
+    with pytest.raises(SystemExit):
+        converter.parse_args(
+            [
+                "--checkpoint",
+                "checkpoint",
+                "--output",
+                "output",
+                "--weight-index",
+                "index.json",
             ]
         )

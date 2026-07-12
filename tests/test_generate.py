@@ -115,6 +115,10 @@ def test_parse_args_requires_a_prompt_source_and_prefers_literal_prompt(tmp_path
     assert file_args.prompt_file == prompt_file
     with pytest.raises(SystemExit):
         generate.parse_args([])
+    with pytest.raises(SystemExit):
+        generate.parse_args(["--prompt", "literal", "--weight-index", "index.json"])
+    with pytest.raises(SystemExit):
+        generate.parse_args(["--prompt", "literal", "--tokenizer-path", "tokenizer"])
     both_args = generate.parse_args(["--prompt", "literal", "--prompt-file", str(prompt_file)])
     assert both_args.prompt == "literal"
     assert both_args.prompt_file == prompt_file
@@ -206,6 +210,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
     (checkpoint / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
 
     fake_tokenizer = FakeTokenizer()
     fake_runner = FakeRunner(
@@ -220,7 +225,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
     class FakeAutoTokenizer:
         @staticmethod
         def from_pretrained(path):
-            captured["tokenizer_path"] = path
+            captured["checkpoint_path"] = path
             return fake_tokenizer
 
     class FakeRunnerClass:
@@ -253,8 +258,6 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
 
     args = SimpleNamespace(
         checkpoint=str(checkpoint),
-        weight_index=None,
-        tokenizer_path=None,
         expert_cache_dir="cache",
         prompt="hello",
         prompt_file=None,
@@ -276,7 +279,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
 
     result = generate.run_generation(args)
 
-    assert captured["tokenizer_path"] == checkpoint
+    assert captured["checkpoint_path"] == checkpoint
     assert captured["runner_args"] == (str(checkpoint),)
     assert captured["runtime"] == (
         "a2a3",
@@ -297,7 +300,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
     assert fake_runner.closed is True
 
 
-def test_create_runner_closes_runtime_when_runner_initialization_fails(monkeypatch):
+def test_create_runner_closes_runtime_when_runner_initialization_fails(monkeypatch, tmp_path):
     class FakeRuntime:
         def __init__(self):
             self.closed = False
@@ -313,9 +316,10 @@ def test_create_runner_closes_runtime_when_runner_initialization_fails(monkeypat
 
     monkeypatch.setattr(generate, "DeviceRuntime", lambda **_kwargs: runtime)
     monkeypatch.setattr(generate, "DeepSeekV4Runner", FailingRunner)
+    (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
     args = SimpleNamespace(
-        checkpoint="checkpoint",
-        weight_index=None,
+        checkpoint=str(tmp_path),
         expert_cache_dir=None,
         max_seq_len=16,
         max_layers=1,

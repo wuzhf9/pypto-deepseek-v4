@@ -727,13 +727,9 @@ class DeepSeekV4WeightLoader:
 
     def _load_index(self, weight_index: str | os.PathLike[str] | dict[str, Any] | None) -> dict[str, dict[str, Any]]:
         if weight_index is None:
-            candidates = [self.checkpoint_path / "weight_index.json", self.checkpoint_path / "model.safetensors.index.json"]
-            for candidate in candidates:
-                if candidate.exists():
-                    weight_index = candidate
-                    break
-            if weight_index is None:
-                raise FileNotFoundError(f"No weight index found under {self.checkpoint_path}")
+            weight_index = self.checkpoint_path / "model.safetensors.index.json"
+            if not weight_index.is_file():
+                raise FileNotFoundError(f"Checkpoint requires weight index: {weight_index}")
 
         if isinstance(weight_index, (str, os.PathLike)):
             with open(weight_index, "r", encoding="utf-8") as handle:

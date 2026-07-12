@@ -30,7 +30,6 @@ class DeepSeekV4Runner:
         checkpoint_path: str,
         *,
         runtime: DeviceRuntime,
-        weight_index: str | dict[str, Any] | None = None,
         config: DeepSeekV4FlashConfig = FLASH_CONFIG,
         max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
         max_layers: int | None = 1,
@@ -49,7 +48,6 @@ class DeepSeekV4Runner:
         self.verbose_layer_log = bool(verbose_layer_log)
         self.weight_loader = DeepSeekV4WeightLoader(
             checkpoint_path,
-            weight_index=weight_index,
             config=config,
             default_device="cpu",
             profile=self.profiler.enabled,

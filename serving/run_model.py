@@ -5,6 +5,7 @@ import argparse
 import torch
 
 from models.config import FLASH_CONFIG
+from serving.checkpoint import validate_checkpoint_directory
 from serving.device_runtime import DeviceRuntime
 from serving.runner import DeepSeekV4Runner
 from serving.state import DEFAULT_MAX_SEQ_LEN
@@ -13,7 +14,6 @@ from serving.state import DEFAULT_MAX_SEQ_LEN
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeepSeek V4 Flash PyPTO runner smoke entrypoint.")
     parser.add_argument("--checkpoint", type=str, default="../deepseek_v4_flash")
-    parser.add_argument("--weight-index", type=str, default=None)
     parser.add_argument("-p", "--platform", type=str, default="a2a3")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-s", "--seq-len", type=int, default=1)
@@ -31,6 +31,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    checkpoint = validate_checkpoint_directory(args.checkpoint)
     if args.decode_steps < 0:
         raise ValueError(f"decode steps must be non-negative, got {args.decode_steps}")
     if args.seq_len + args.decode_steps > DEFAULT_MAX_SEQ_LEN:
@@ -49,9 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         runner = DeepSeekV4Runner(
-            args.checkpoint,
+            str(checkpoint),
             runtime=runtime,
-            weight_index=args.weight_index,
             max_layers=args.max_layers,
             run_head=not args.no_head,
             profile=args.profile,

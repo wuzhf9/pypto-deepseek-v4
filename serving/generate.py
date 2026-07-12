@@ -17,6 +17,7 @@ from official.encoding_dsv4 import (
     eos_token as official_eos_token,
     parse_message_from_completion_text as official_parse_message_from_completion_text,
 )
+from serving.checkpoint import validate_checkpoint_directory
 from serving.device_runtime import DeviceRuntime
 from serving.state import DEFAULT_MAX_SEQ_LEN
 
@@ -46,22 +47,6 @@ class GenerationResult:
     @property
     def output_tps(self) -> float:
         return self.generated_tokens / self.elapsed_s if self.elapsed_s > 0 else 0.0
-
-
-def resolve_tokenizer_path(checkpoint_path: str | Path, tokenizer_path: str | Path | None = None) -> Path:
-    if tokenizer_path is not None:
-        return Path(tokenizer_path)
-
-    checkpoint = Path(checkpoint_path)
-    if (checkpoint / "tokenizer.json").exists():
-        return checkpoint
-    low_vram_cache = checkpoint / "bf16_lowvram_cache"
-    if (low_vram_cache / "tokenizer.json").exists():
-        return low_vram_cache
-    raise FileNotFoundError(
-        f"Could not find tokenizer.json under {checkpoint} or {low_vram_cache}; "
-        "pass --tokenizer-path explicitly."
-    )
 
 
 def load_encoding_helpers() -> EncodingHelpers:
@@ -162,7 +147,8 @@ def generate_ids(
 
 
 def run_generation(args: argparse.Namespace) -> GenerationResult:
-    tokenizer = _load_tokenizer(resolve_tokenizer_path(args.checkpoint, args.tokenizer_path))
+    checkpoint = validate_checkpoint_directory(args.checkpoint)
+    tokenizer = _load_tokenizer(checkpoint)
     helpers = load_encoding_helpers()
     prompt = resolve_prompt_text(args.prompt, args.prompt_file)
     prompt_ids, prompt_text = encode_prompt(
@@ -172,7 +158,7 @@ def run_generation(args: argparse.Namespace) -> GenerationResult:
         helpers=helpers,
     )
     torch.manual_seed(args.seed)
-    runner = _create_runner(args)
+    runner = _create_runner(args, checkpoint=checkpoint)
     try:
         start = time.perf_counter()
         generated = generate_ids(
@@ -219,8 +205,6 @@ def print_stats(result: GenerationResult) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DeepSeek V4 Flash PyPTO text generation.")
     parser.add_argument("--checkpoint", type=str, default="../deepseek_v4_flash")
-    parser.add_argument("--weight-index", type=str, default=None)
-    parser.add_argument("--tokenizer-path", type=str, default=None)
     parser.add_argument("--expert-cache-dir", type=str, default=None)
     parser.add_argument("--prompt")
     parser.add_argument("--prompt-file", type=Path)
@@ -262,17 +246,18 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _load_tokenizer(tokenizer_path: Path) -> Any:
+def _load_tokenizer(checkpoint: Path) -> Any:
     global AutoTokenizer
     if AutoTokenizer is None:
         from transformers import AutoTokenizer as _AutoTokenizer
 
         AutoTokenizer = _AutoTokenizer
-    return AutoTokenizer.from_pretrained(tokenizer_path)
+    return AutoTokenizer.from_pretrained(checkpoint)
 
 
-def _create_runner(args: argparse.Namespace) -> Any:
+def _create_runner(args: argparse.Namespace, *, checkpoint: Path | None = None) -> Any:
     global DeepSeekV4Runner
+    checkpoint = validate_checkpoint_directory(args.checkpoint) if checkpoint is None else checkpoint
     if DeepSeekV4Runner is None:
         from serving.runner import DeepSeekV4Runner as _DeepSeekV4Runner
 
@@ -285,9 +270,8 @@ def _create_runner(args: argparse.Namespace) -> Any:
     )
     try:
         return DeepSeekV4Runner(
-            args.checkpoint,
+            str(checkpoint),
             runtime=runtime,
-            weight_index=args.weight_index,
             max_seq_len=args.max_seq_len,
             max_layers=args.max_layers,
             run_head=True,

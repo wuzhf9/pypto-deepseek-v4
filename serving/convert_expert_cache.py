@@ -14,6 +14,7 @@ import torch
 from safetensors.torch import safe_open, save_file
 
 from models.config import DeepSeekV4FlashConfig, FLASH_CONFIG
+from serving.checkpoint import validate_checkpoint_directory
 from serving.expert_cache import (
     EXPERT_CACHE_FORMAT,
     EXPERT_CACHE_VERSION,
@@ -104,15 +105,15 @@ def convert_experts(
     config: DeepSeekV4FlashConfig = FLASH_CONFIG,
 ) -> None:
     """Convert selected complete layers into the expert-cache directory."""
+    checkpoint = validate_checkpoint_directory(args.checkpoint)
     output = Path(args.output).expanduser()
     output.mkdir(parents=True, exist_ok=True)
-    manifest = _load_or_create_manifest(output, args.checkpoint, config=config)
+    manifest = _load_or_create_manifest(output, checkpoint, config=config)
     _write_manifest_atomic(output, manifest)
     layers = parse_layer_ids(args.layers, count=config.n_layers)
 
     loader = DeepSeekV4WeightLoader(
-        args.checkpoint,
-        weight_index=args.weight_index,
+        checkpoint,
         config=config,
         default_device="cpu",
         profile=args.profile,
@@ -307,7 +308,6 @@ def _print_profile(loader: DeepSeekV4WeightLoader) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build DeepSeek V4 packed BF16 per-layer routed expert cache.")
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--weight-index", type=str, default=None)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--layers", type=str, default=None)
     parser.add_argument("--overwrite", action="store_true", default=False)
