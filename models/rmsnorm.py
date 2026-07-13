@@ -263,10 +263,6 @@ def rmsnorm_128_test(
     return out
 
 
-hidden_rmsnorm = rmsnorm_4096
-hidden_rmsnorm_test = rmsnorm_4096_test
-
-
 def golden_rmsnorm(tensors):
     import torch
 
@@ -274,9 +270,6 @@ def golden_rmsnorm(tensors):
     norm_w = tensors["norm_w"].float()
     inv_rms = torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
     tensors["out"][:] = (x * inv_rms * norm_w).to(torch.bfloat16)
-
-
-golden_hidden_rmsnorm = golden_rmsnorm
 
 
 def _build_tensor_specs(dim: int, seq_len: int):
@@ -387,14 +380,11 @@ __all__ = [
     "rmsnorm_1024",
     "rmsnorm_512",
     "rmsnorm_128",
-    "hidden_rmsnorm",
     "rmsnorm_4096_test",
     "rmsnorm_1024_test",
     "rmsnorm_512_test",
     "rmsnorm_128_test",
-    "hidden_rmsnorm_test",
     "golden_rmsnorm",
-    "golden_hidden_rmsnorm",
     "build_4096_specs",
     "build_1024_specs",
     "build_512_specs",

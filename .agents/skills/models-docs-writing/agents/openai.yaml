@@ -1,0 +1,4 @@
+interface:
+  display_name: "Models Docs Writing"
+  short_description: "Write code-backed DeepSeek V4 model documentation"
+  default_prompt: "Use $models-docs-writing to create or update a code-backed document under docs/models."
