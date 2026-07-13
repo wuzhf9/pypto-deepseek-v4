@@ -1,0 +1,4 @@
+interface:
+  display_name: "Serving Docs Writing"
+  short_description: "Write code-backed DeepSeek serving documentation"
+  default_prompt: "Use $serving-docs-writing to create or update a code-backed serving document."
