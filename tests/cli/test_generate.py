@@ -126,6 +126,8 @@ def test_parse_args_requires_a_prompt_source_and_prefers_literal_prompt(tmp_path
     with pytest.raises(SystemExit):
         generate.parse_args(["--checkpoint", "checkpoint", "--prompt", "literal", "--max-layers", "1"])
     with pytest.raises(SystemExit):
+        generate.parse_args(["--checkpoint", "checkpoint", "--prompt", "literal", "--max-seq-len", "2048"])
+    with pytest.raises(SystemExit):
         generate.parse_args(["--checkpoint", "checkpoint", "--prompt", "literal", "--no-stats"])
     with pytest.raises(SystemExit):
         generate.parse_args(["--checkpoint", "checkpoint", "--prompt", "literal", "--stats"])
@@ -298,7 +300,6 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         thinking_mode="chat",
         max_new_tokens=2,
         temperature=0.0,
-        max_seq_len=16,
         platform="a2a3",
         device=0,
         seed=1,
@@ -321,6 +322,7 @@ def test_run_generation_wires_tokenizer_encoding_runner_and_decode(monkeypatch, 
         False,
     )
     assert captured["runner_kwargs"]["runtime"] is fake_runtime
+    assert captured["runner_kwargs"]["max_seq_len"] == generate.DEFAULT_MAX_SEQ_LEN
     assert captured["runner_kwargs"]["max_layers"] == generate.FLASH_CONFIG.n_layers
     assert "platform" not in captured["runner_kwargs"]
     assert "device_id" not in captured["runner_kwargs"]
@@ -355,7 +357,6 @@ def test_create_runner_closes_runtime_when_runner_initialization_fails(monkeypat
     args = SimpleNamespace(
         checkpoint=str(tmp_path),
         expert_cache_dir=None,
-        max_seq_len=16,
         platform="a2a3",
         device=0,
         profile=False,

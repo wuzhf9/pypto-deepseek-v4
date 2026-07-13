@@ -168,7 +168,6 @@ def run_generation(args: argparse.Namespace) -> GenerationResult:
             eos_id=tokenizer.eos_token_id,
             temperature=args.temperature,
             include_eos=args.include_eos or args.parse_eos,
-            max_seq_len=args.max_seq_len,
         )
         elapsed_s = time.perf_counter() - start
     finally:
@@ -211,7 +210,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--thinking-mode", choices=["chat", "thinking"], default="chat")
     parser.add_argument("--max-new-tokens", type=int, default=10)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-seq-len", type=int, default=DEFAULT_MAX_SEQ_LEN)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--keep-prefill-routed-staging", action="store_true", default=False)
     parser.add_argument("-p", "--platform", type=str, default="a2a3")
@@ -269,7 +267,7 @@ def _create_runner(args: argparse.Namespace, *, checkpoint: Path | None = None) 
         return DeepSeekV4Runner(
             str(checkpoint),
             runtime=runtime,
-            max_seq_len=args.max_seq_len,
+            max_seq_len=DEFAULT_MAX_SEQ_LEN,
             max_layers=FLASH_CONFIG.n_layers,
             run_head=True,
             profile=args.profile,
