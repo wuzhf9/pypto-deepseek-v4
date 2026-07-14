@@ -11,11 +11,12 @@ FFN normalized input x [1,S,4096], BF16
   -> Gate
        -> indices [1,S,6], INT32
        -> weights [1,S,6], FP32
-  ├─ 6 routed Expert routes
-  │    -> route_y [1,S,6,4096], BF16
+  ├─ expert-major route packing
+  │    -> 16-row routed Expert tiles
+  │    -> packed_y [28416,4096], BF16 scratch
   └─ 1 shared Expert
        -> shared_y [1,S,4096], BF16
-  -> FP32 route aggregation
+  -> inverse-map FP32 route aggregation
   -> out [1,S,4096], BF16
 ```
 
@@ -65,9 +66,11 @@ routed-expert weight。当前实现使用单卡 BF16 路径，不执行这些分
 
 | 符号 | 类型 | 职责 |
 |---|---|---|
-| `_run_route_major_routed_experts` | `@pl.jit.inline` | 根据 indices 从 256-expert packed weights 计算 6 条 route outputs |
+| `_pack_routes_by_expert` | `@pl.jit.inline` | 统计 expert count，并构造 16 行对齐的 expert-major route 元数据 |
+| `_run_expert_major_routed_experts` | `@pl.jit.inline` | 每个 expert 以最多 16 条 route 为一组执行多行 routed Expert 计算 |
 | `_run_selected_experts_decode` | `@pl.jit.inline` | 使用按 route slot 排列的 6 组 selected weights 计算 routed outputs |
-| `_combine_route_major` | `@pl.jit.inline` | 在 FP32 中合并 6 条 routed outputs 与 shared output |
+| `_combine_expert_major` | `@pl.jit.inline` | 根据 inverse route map 合并 prefill packed outputs 与 shared output |
+| `_combine_route_major` | `@pl.jit.inline` | 合并 selected-decode 的 6 条 route outputs 与 shared output |
 | `moe_hash_fwd` | `@pl.jit.inline` | Hash Gate + full routed experts + shared expert + aggregation |
 | `moe_topk_fwd` | `@pl.jit.inline` | Top-K Gate + full routed experts + shared expert + aggregation |
 | `moe_selected_decode_experts_fwd` | `@pl.jit.inline` | 已知 Gate weights 后执行 selected routed experts、shared expert 与聚合 |
@@ -95,13 +98,13 @@ routed-expert weight。当前实现使用单卡 BF16 路径，不执行这些分
 | 官方计算 | 当前实现 | 关系/状态 |
 |---|---|---|
 | `self.gate(x, input_ids)` | `gate_hash_fwd` / `gate_topk_fwd` | Full-expert MoE 直接调用 |
-| 按 `indices` dispatch token | `_run_route_major_routed_experts` | 融合内联；按 route slot/token 读取 expert id |
-| `expert(x[idx], weights[idx,top,None])` | Routed kernel 内的 `w1/w3 → SwiGLU → weight → w2` | 融合内联、语义等价 |
+| 按 `indices` dispatch token | `_pack_routes_by_expert` | 融合内联；仅打包 token id、route weight 和 inverse map |
+| `expert(x[idx], weights[idx,top,None])` | `_run_expert_major_routed_experts` 内的 `w1/w3 → SwiGLU → weight → w2` | 融合内联、语义等价 |
 | Decode 只执行 selected experts | `_run_selected_experts_decode` | 语义等价；weight 已按 route slot 排列 |
 | `self.shared_experts(x)` | `expert_shared_fwd` | 直接调用 |
-| FP32 routed accumulator | `_combine_route_major` | 语义等价；shared output 作为初始 accumulator |
-| Output 转回输入 dtype | `_combine_route_major` 的 BF16 `rint` | 直接对应 |
-| 官方 expert-major accumulation | 当前 route-slot-major aggregation | 计算顺序差异；使用精度阈值验收 |
+| FP32 routed accumulator | `_combine_expert_major` / `_combine_route_major` | 语义等价；shared output 作为初始 accumulator |
+| Output 转回输入 dtype | 两个 combine kernel 的 BF16 `rint` | 直接对应 |
+| 官方 expert-major accumulation | Prefill expert-major compute + inverse-map aggregation | 调度语义等价；最终加法仍按 token 的 route slot 顺序 |
 | Expert Parallel expert shard | 无 | 不支持或未执行；当前固定单卡 256 experts |
 | Routed output `all_reduce` | 无 | 不支持或未执行；当前单卡无需通信 |
 | FP4 routed Expert runtime | 无 | 不支持或未执行；host 侧提供 BF16 runtime weights |
@@ -120,9 +123,9 @@ shared_w3_t:   [4096,2048], BF16
 out:           [1,S,4096], BF16
 ```
 
-Batch 固定为 1。Full-expert hash/Top-K 路径的 `S` 是动态 sequence 维；selected decode
-的 standalone spec 和完整 runtime 固定 `S=1`。`x` 是 FFN normalized hidden state，
-MoE output 尚未经过 FFN Hyper-Connection post。
+Batch 固定为 1。Full-expert hash/Top-K 路径的 `S` 是动态 sequence 维，并限制在
+`1..4096`；selected decode 的 standalone spec 和完整 runtime 固定 `S=1`。`x` 是 FFN
+normalized hidden state，MoE output 尚未经过 FFN Hyper-Connection post。
 
 所有 Expert weights 均使用 checkpoint weight 的转置 BF16 runtime layout。Shared
 expert 不接收 routing weight。
@@ -155,14 +158,21 @@ gate_bias: [256],      FP32
 Gate 在 full-expert MoE 内生成以下 scratch：
 
 ```text
-indices:  [1,S,6],      INT32
-weights:  [1,S,6],      FP32
-route_y:  [1,S,6,4096], BF16
-shared_y: [1,S,4096],   BF16
+indices:          [1,S,6],       INT32
+weights:          [1,S,6],       FP32
+expert_counts:    [256,1],       INT32
+expert_bases:     [256,1],       INT32
+packed_token_ids: [28416,8],     INT32
+packed_weights:   [1,28416],     FP32
+route_to_packed:  [24576,8],     INT32
+packed_y:         [28416,4096],  BF16
+shared_y:         [1,S,4096],    BF16
 ```
 
-`route_y[b,s,k,:]` 保存 route slot `k` 的已加权 Expert output；它不是最终的 routed
-accumulator。
+`MAX_ROUTES=4096*6=24576`。`packed_y` 为每个 expert 预留 16 行对齐的连续区间，额外
+`256*(16-1)` 行覆盖所有 expert 都产生尾块时的最坏 padding。实际计算只遍历
+`expert_counts` 指定的 route；`route_to_packed` 把原始 `(token,route slot)` 映射回 packed
+row。Scratch 使用静态最大 shape，但不是跨层或跨 step 的持久 state。
 
 ### Selected decode weights
 
@@ -213,19 +223,25 @@ pool，后续 decode step 可以复用相同 staging allocation。
 
 ## 实现方式
 
-### Full-expert route-major 执行
+### Full-expert expert-major 执行
 
 `moe_hash_fwd` / `moe_topk_fwd` 先执行对应 Gate，生成 route-slot 顺序的 indices 和
-weights。`_run_route_major_routed_experts` 随后按 `k=0..5`、token 顺序处理每条 route：
+weights。`_pack_routes_by_expert` 在一个 metadata task 中执行两遍 route 扫描：第一遍统计
+256 个 expert 的 route count 并生成 16 行对齐的 prefix base，第二遍写入 packed token id、
+route weight 和 inverse map。它不会复制 `[route,4096]` activation。
 
-1. 读取 `indices[t,k]`，计算该 expert 在三组 flattened packed weights 中的起点；
-2. 用 BF16 activation/weight、FP32 accumulation 同时执行 `w1` 和 `w3` projection；
+`_run_expert_major_routed_experts` 再按 expert 和 16-row tile 调度：
+
+1. 根据 packed token id 把最多 16 条原始 `x` row gather 到一个 BF16 tile；
+2. 对该 tile 复用同一 expert 权重，用 BF16 activation/weight、FP32 accumulation 同时
+   执行 `w1` 和 `w3` projection；
 3. 把 gate/up projection 转为 BF16 snapshot，再在 FP32 中执行 clamp 和 SwiGLU；
-4. 在 hidden BF16 rounding 之前乘 `weights[t,k]`；
-5. 执行 `w2` FP32 accumulation，把 BF16 route output 写入 `route_y[t,k,:]`。
+4. 在 hidden BF16 rounding 之前按 row 乘对应 `packed_weights`；
+5. 执行 `w2` FP32 accumulation，把 BF16 output 写入该 expert 的连续 `packed_y` rows。
 
 该实现融合了单 routed Expert 的完整数学计算。每次只计算 Gate 选出的 6 条 routes，
-但 full-expert weight tensor 仍包含全部 256 个 experts。
+但 full-expert weight tensor 仍包含全部 256 个 experts。同一个 expert 在 tile 中命中多条
+route 时，三组权重由多行 matmul 共享读取。
 
 ### Selected-expert decode
 
@@ -240,9 +256,11 @@ weight selection 后消费，不进入 post-MoE kernel。
 
 ### Shared Expert 与 route aggregation
 
-三种路径都直接调用 `expert_shared_fwd` 生成 BF16 `shared_y`。`_combine_route_major`
-逐 token 把 shared output 转成 FP32 accumulator，再按 route slot 0 到 5 依次加上
-BF16 `route_y`，最后以 `rint` 转成 BF16 `out`。
+三种路径都直接调用 `expert_shared_fwd` 生成 BF16 `shared_y`。Prefill 使用
+`_combine_expert_major`，逐 token 通过 `route_to_packed` 读取 6 条 BF16 packed rows；
+selected decode 使用 `_combine_route_major` 读取 `[1,1,6,4096]` `route_y`。两者都先把
+shared output 转成 FP32 accumulator，按 route slot 0 到 5 累加，最后以 `rint` 转成 BF16
+`out`。
 
 因此 routing weight 已经在每条 routed Expert 内部生效，aggregation 阶段不再乘
 weight。`route_y`、`shared_y` 和最终 `out` 的舍入边界与单 Expert 的内部 hidden
@@ -252,14 +270,14 @@ rounding 是不同层次的边界。
 
 - 当前只支持 `B=1`、hidden 4096、intermediate 2048、256 routed experts、Top-K 6
   和 1 个 shared expert；
-- Full-expert 路径支持动态 `S`，selected decode 的 spec 和完整 runtime 固定 `S=1`；
+- Full-expert 路径支持动态 `S=1..4096`，selected decode 的 spec 和完整 runtime 固定 `S=1`；
 - Hash routing 固定用于 layer 0、1、2，其他 40 层使用 biased Top-K routing；
 - Full-expert MoE 只计算每个 token 被选中的 6 条 routes，但接口仍要求提供一层全部
   256 个 routed-expert weights；
 - Selected decode 要求 6 组 weights 已按 Gate route slot 排列，kernel 不验证其全局
   expert id；
-- 当前按 route slot 顺序聚合 routed outputs，官方按 expert id 顺序累加；两者数学
-  等价，但 FP32 浮点加法顺序不同；
+- Prefill 按 expert-major tile 执行 routed Expert，但最终仍按 token 的 route slot 顺序聚合；
+  官方按 expert id 顺序累加，两者数学等价但 FP32 浮点加法顺序不同；
 - 当前不实现 Expert Parallel、expert shard、跨 rank 通信或 `all_reduce`；
 - 当前不执行 FP4/FP8 Expert kernel；routed/shared Expert runtime weights 均为 BF16；
 - MoE 不包含持久模型 state；serving 中的 packed cache 和 staging 是权重生命周期，

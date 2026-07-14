@@ -318,8 +318,12 @@ def topk_indices_by_score(
 
 def _prepare_tensors(
     specs: list[TensorSpec],
+    *,
+    snapshot_inputs: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     tensors = {spec.name: spec.create_tensor() for spec in specs}
+    if not snapshot_inputs:
+        return tensors, {}
     input_snapshot = {
         spec.name: tensors[spec.name].clone()
         for spec in specs
@@ -533,7 +537,10 @@ def _run_jit_impl(
             return RunResult(True, execution_time=total, work_dir=work_dir)
 
         with _Stage("generate inputs"):
-            tensors, input_snapshot = _prepare_tensors(specs)
+            tensors, input_snapshot = _prepare_tensors(
+                specs,
+                snapshot_inputs=golden_fn is not None,
+            )
 
         golden_outputs = None
         if golden_fn is not None:
